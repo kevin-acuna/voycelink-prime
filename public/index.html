@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voycelink Prime - Video Conference</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <h1><i data-lucide="globe" class="header-icon"></i> Voycelink Prime</h1>
+            <span class="connection-status" id="connectionStatus">Disconnected</span>
+        </header>
+
+        <!-- Join Form -->
+        <div class="join-container" id="joinContainer">
+            <!-- Video Preview Section -->
+            <div class="preview-section">
+                <div class="preview-video-container">
+                    <div class="preview-avatar" id="previewAvatar">
+                        <div class="preview-avatar-circle" id="previewAvatarInitial">?</div>
+                    </div>
+                    <video id="previewVideo" autoplay playsinline muted></video>
+                    <div class="preview-controls">
+                        <button type="button" class="btn-preview-control" id="previewToggleMic" title="Toggle Microphone">
+                            <i data-lucide="mic"></i>
+                        </button>
+                        <button type="button" class="btn-preview-control" id="previewToggleVideo" title="Toggle Camera">
+                            <i data-lucide="video"></i>
+                        </button>
+                    </div>
+                </div>
+                <div class="device-selectors">
+                    <div class="device-selector">
+                        <i data-lucide="mic" class="device-icon"></i>
+                        <span class="device-selector-label" id="microphoneLabel">Loading...</span>
+                        <select id="microphoneSelect">
+                            <option value="">Loading microphones...</option>
+                        </select>
+                        <i data-lucide="chevron-down" class="select-arrow"></i>
+                    </div>
+                    <div class="device-selector">
+                        <i data-lucide="volume-2" class="device-icon"></i>
+                        <span class="device-selector-label" id="speakerLabel">Loading...</span>
+                        <select id="speakerSelect">
+                            <option value="">Loading speakers...</option>
+                        </select>
+                        <i data-lucide="chevron-down" class="select-arrow"></i>
+                    </div>
+                    <div class="device-selector">
+                        <i data-lucide="video" class="device-icon"></i>
+                        <span class="device-selector-label" id="cameraLabel">Loading...</span>
+                        <select id="cameraSelect">
+                            <option value="">Loading cameras...</option>
+                        </select>
+                        <i data-lucide="chevron-down" class="select-arrow"></i>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Home Card (shown on homepage) -->
+            <div class="join-card" id="homeCard">
+                <h2>Start a Meeting</h2>
+                <p class="card-description">Create a new meeting room and invite others to join.</p>
+                <button type="button" class="btn btn-primary btn-large" id="createMeetingBtn">
+                    <i data-lucide="video"></i>
+                    New Meeting
+                </button>
+                <p class="join-hint">
+                    Or enter a meeting link in your browser to join an existing room.
+                </p>
+            </div>
+
+            <!-- Join Form Card (shown when on room URL) -->
+            <div class="join-card" id="joinCard" style="display: none;">
+                <h2>Join Meeting</h2>
+                <p class="room-id-display" id="roomIdDisplay"></p>
+                <form id="joinForm">
+                    <input type="hidden" id="sessionId">
+                    <div class="form-group">
+                        <label for="nickname">Your Name</label>
+                        <input 
+                            type="text" 
+                            id="nickname" 
+                            placeholder="e.g., John Doe" 
+                            required
+                            autocomplete="off"
+                        >
+                    </div>
+                    <div class="form-group">
+                        <label for="preferredLanguage">Your Language</label>
+                        <select id="preferredLanguage">
+                            <option value="en">English</option>
+                            <option value="es">Spanish</option>
+                            <option value="fr">French</option>
+                            <option value="de">German</option>
+                            <option value="it">Italian</option>
+                            <option value="pt">Portuguese</option>
+                            <option value="zh">Chinese</option>
+                            <option value="ja">Japanese</option>
+                            <option value="ko">Korean</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-primary">
+                        Join Room
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Video Conference Room -->
+        <div class="conference-container" id="conferenceContainer" style="display: none;">
+            <!-- Local Video -->
+            <div class="video-grid" id="videoGrid">
+                <div class="video-wrapper local-video" id="localVideoWrapper">
+                    <div class="video-avatar" id="localAvatar">
+                        <div class="avatar-circle" id="localAvatarInitial">Y</div>
+                    </div>
+                    <video id="localVideo" autoplay playsinline muted></video>
+                    <div class="video-label">
+                        <div class="video-label-left">
+                            <span class="speaking-indicator" id="localSpeakingIndicator"></span>
+                            <span id="localNickname">You</span>
+                        </div>
+                        <span class="language-badge" id="localLanguage">EN</span>
+                    </div>
+                </div>
+                <!-- Remote videos will be dynamically added here -->
+            </div>
+
+            <!-- Controls -->
+            <div class="controls-bar">
+                <button class="btn btn-control" id="toggleAudio" title="Toggle Microphone">
+                    <i data-lucide="mic"></i>
+                </button>
+                <button class="btn btn-control" id="toggleVideo" title="Toggle Camera">
+                    <i data-lucide="video"></i>
+                </button>
+                <button class="btn btn-control" id="toggleScreenShare" title="Share Screen">
+                    <i data-lucide="monitor-up"></i>
+                </button>
+                <button class="btn btn-control btn-share" id="shareMeetingBtn" title="Copy meeting link">
+                    <i data-lucide="link"></i>
+                </button>
+                <button class="btn btn-ai" id="toggleInterpreter" title="Toggle AI Interpretation" disabled>
+                    <i data-lucide="languages"></i>
+                    <span>AI Interpreter</span>
+                </button>
+                <button class="btn btn-captions" id="toggleTranscription" title="Toggle Live Transcription" disabled>
+                    <i data-lucide="subtitles"></i>
+                    <span>Subtitles</span>
+                </button>
+                <button class="btn btn-chat" id="toggleChat" title="Toggle Chat">
+                    <i data-lucide="message-circle"></i>
+                    <span>Chat</span>
+                    <span class="chat-badge" id="chatBadge" style="display: none;">0</span>
+                </button>
+                <button class="btn btn-danger" id="leaveSession" title="Leave Call">
+                    <i data-lucide="phone-off"></i>
+                    <span>Leave</span>
+                </button>
+            </div>
+            
+            <!-- AI Interpreter Status -->
+            <div class="interpreter-status" id="interpreterStatus" style="display: none;">
+                <div class="interpreter-indicator">
+                    <span class="pulse"></span>
+                    <span>AI Interpreter Active</span>
+                </div>
+                <div class="interpreter-transcripts">
+                    <div class="transcript-box">
+                        <label>Original:</label>
+                        <span id="transcriptOriginal">-</span>
+                    </div>
+                    <div class="transcript-box">
+                        <label>Translation:</label>
+                        <span id="transcriptTranslation">-</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Session Info -->
+            <div class="session-info">
+                <span>Room: <strong id="currentSessionId"></strong></span>
+                <span>Participants: <strong id="participantCount">1</strong></span>
+            </div>
+
+            <!-- Chat Panel -->
+            <div class="chat-panel" id="chatPanel" style="display: none;">
+                <div class="chat-header">
+                    <div class="chat-header-left">
+                        <h3><i data-lucide="message-circle"></i> Chat</h3>
+                    </div>
+                    <div class="chat-header-right">
+                        <label class="translate-toggle" title="Toggle auto-translation">
+                            <input type="checkbox" id="chatTranslateToggle" checked>
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label"><i data-lucide="languages"></i></span>
+                        </label>
+                        <button class="btn-close-chat" id="closeChatBtn" title="Close chat">
+                            <i data-lucide="x"></i>
+                        </button>
+                    </div>
+                </div>
+                <div class="chat-messages" id="chatMessages">
+                    <div class="chat-empty">
+                        <i data-lucide="message-square-dashed"></i>
+                        <p>No messages yet</p>
+                        <span>Messages will be translated to your language</span>
+                    </div>
+                </div>
+                <div class="chat-input-container">
+                    <input type="text" 
+                           id="chatInput" 
+                           class="chat-input" 
+                           placeholder="Type a message..." 
+                           autocomplete="off">
+                    <button class="btn-send" id="sendChatBtn" title="Send message">
+                        <i data-lucide="send"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Debug Panel (for development) -->
+        <div class="debug-panel" id="debugPanel">
+            <h3>🔧 Debug Panel</h3>
+            <div class="debug-content">
+                <div class="debug-section">
+                    <h4>Remote Audio Tracks (for AI Processing)</h4>
+                    <ul id="audioTracksList"></ul>
+                </div>
+                <div class="debug-section">
+                    <h4>Event Log</h4>
+                    <div id="eventLog" class="event-log"></div>
+                </div>
+            </div>
+            <button class="btn btn-small" id="toggleDebug">Toggle Debug</button>
+        </div>
+    </div>
+
+    <!-- OpenVidu Browser Library (via CDN) -->
+    <script src="https://cdn.jsdelivr.net/npm/openvidu-browser@2.29.0/static/js/openvidu-browser-2.29.0.min.js"></script>
+    
+    <!-- Azure Speech SDK -->
+    <script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
+    
+    <!-- Application Scripts -->
+    <script src="config.js"></script>
+    <script src="openvidu-client.js"></script>
+    <script src="audio-processor.js"></script>
+    <script src="interpreter-manager.js"></script>
+    <script src="transcription-manager.js"></script>
+    <script src="chat-manager.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
