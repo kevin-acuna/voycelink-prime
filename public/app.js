@@ -154,7 +154,11 @@ const elements = {
     sendChatBtn: document.getElementById('sendChatBtn'),
     closeChatBtn: document.getElementById('closeChatBtn'),
     chatBadge: document.getElementById('chatBadge'),
-    chatTranslateToggle: document.getElementById('chatTranslateToggle')
+    chatTranslateToggle: document.getElementById('chatTranslateToggle'),
+    // Whiteboard elements
+    toggleWhiteboardBtn: document.getElementById('toggleWhiteboard'),
+    whiteboardWrapper: document.getElementById('whiteboardWrapper'),
+    closeWhiteboardBtn: document.getElementById('closeWhiteboardBtn')
 };
 
 // Preview state
@@ -1859,6 +1863,9 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         // Initialize chat
         initializeChat(openviduClient.session);
         
+        // Initialize whiteboard
+        whiteboardManager.initialize(openviduClient.session);
+        
         // Initialize interpreter signals
         initializeInterpreterSignals(openviduClient.session);
         
@@ -2195,6 +2202,9 @@ elements.chatInput.addEventListener('keydown', (e) => {
     }
 });
 elements.chatTranslateToggle.addEventListener('change', toggleChatTranslation);
+
+// Whiteboard controls
+elements.toggleWhiteboardBtn.addEventListener('click', () => whiteboardManager.toggle());
 
 // Clean up on page unload
 window.addEventListener('beforeunload', () => {

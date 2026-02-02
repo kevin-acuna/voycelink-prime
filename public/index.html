@@ -115,6 +115,76 @@
         <div class="conference-container" id="conferenceContainer" style="display: none;">
             <!-- Local Video -->
             <div class="video-grid" id="videoGrid">
+                <!-- Whiteboard (embedded like screen share) -->
+                <div class="whiteboard-wrapper" id="whiteboardWrapper" style="display: none;">
+                    <div class="whiteboard-toolbar">
+                        <div class="toolbar-group">
+                            <button class="toolbar-btn active" id="toolPencil" title="Pencil">
+                                <i data-lucide="pencil"></i>
+                            </button>
+                            <button class="toolbar-btn" id="toolRectangle" title="Rectangle">
+                                <i data-lucide="square"></i>
+                            </button>
+                            <button class="toolbar-btn" id="toolCircle" title="Circle">
+                                <i data-lucide="circle"></i>
+                            </button>
+                            <button class="toolbar-btn" id="toolLine" title="Line">
+                                <i data-lucide="minus"></i>
+                            </button>
+                            <button class="toolbar-btn" id="toolText" title="Text">
+                                <i data-lucide="type"></i>
+                            </button>
+                            <button class="toolbar-btn" id="toolEraser" title="Eraser">
+                                <i data-lucide="eraser"></i>
+                            </button>
+                            <button class="toolbar-btn" id="toolSelect" title="Select">
+                                <i data-lucide="mouse-pointer-2"></i>
+                            </button>
+                        </div>
+                        <div class="toolbar-divider"></div>
+                        <div class="toolbar-group colors">
+                            <button class="color-btn active" data-color="#ffffff" style="background: #ffffff;" title="White"></button>
+                            <button class="color-btn" data-color="#ef4444" style="background: #ef4444;" title="Red"></button>
+                            <button class="color-btn" data-color="#22c55e" style="background: #22c55e;" title="Green"></button>
+                            <button class="color-btn" data-color="#3b82f6" style="background: #3b82f6;" title="Blue"></button>
+                            <button class="color-btn" data-color="#eab308" style="background: #eab308;" title="Yellow"></button>
+                            <button class="color-btn" data-color="#a855f7" style="background: #a855f7;" title="Purple"></button>
+                        </div>
+                        <div class="toolbar-divider"></div>
+                        <div class="toolbar-group">
+                            <label class="stroke-width-label">
+                                <i data-lucide="minus"></i>
+                                <input type="range" id="strokeWidth" min="1" max="20" value="3">
+                                <i data-lucide="equal"></i>
+                            </label>
+                        </div>
+                        <div class="toolbar-divider"></div>
+                        <div class="toolbar-group">
+                            <button class="toolbar-btn" id="toolUndo" title="Undo">
+                                <i data-lucide="undo-2"></i>
+                            </button>
+                            <button class="toolbar-btn" id="toolRedo" title="Redo">
+                                <i data-lucide="redo-2"></i>
+                            </button>
+                            <button class="toolbar-btn danger" id="toolClear" title="Clear All">
+                                <i data-lucide="trash-2"></i>
+                            </button>
+                        </div>
+                        <div class="toolbar-divider"></div>
+                        <button class="toolbar-btn danger" id="closeWhiteboardBtn" title="Close Whiteboard">
+                            <i data-lucide="x"></i>
+                            <span>Close</span>
+                        </button>
+                    </div>
+                    <div class="whiteboard-canvas-container">
+                        <canvas id="whiteboardCanvas"></canvas>
+                    </div>
+                    <div class="whiteboard-label">
+                        <span class="whiteboard-badge">WHITEBOARD</span>
+                        <span id="whiteboardStatus">Drawing</span>
+                    </div>
+                </div>
+                
                 <div class="video-wrapper local-video" id="localVideoWrapper">
                     <div class="video-avatar" id="localAvatar">
                         <div class="avatar-circle" id="localAvatarInitial">Y</div>
@@ -160,6 +230,10 @@
                     <i data-lucide="message-circle"></i>
                     <span>Chat</span>
                     <span class="chat-badge" id="chatBadge" style="display: none;">0</span>
+                </button>
+                <button class="btn btn-whiteboard" id="toggleWhiteboard" title="Toggle Whiteboard">
+                    <i data-lucide="pencil-ruler"></i>
+                    <span>Whiteboard</span>
                 </button>
                 <button class="btn btn-danger" id="leaveSession" title="Leave Call">
                     <i data-lucide="phone-off"></i>
@@ -208,6 +282,7 @@
                     </button>
                 </div>
             </div>
+
         </div>
 
         <!-- Debug Panel (for development) -->
@@ -233,6 +308,9 @@
     <!-- Azure Speech SDK (using reliable CDN) -->
     <script src="https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@latest/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js"></script>
     
+    <!-- Fabric.js for Whiteboard -->
+    <script src="https://cdn.jsdelivr.net/npm/fabric@5.3.0/dist/fabric.min.js"></script>
+    
     <!-- Application Scripts -->
     <script src="config.js"></script>
     <script src="openvidu-client.js"></script>
@@ -240,6 +318,7 @@
     <script src="interpreter-manager.js"></script>
     <script src="transcription-manager.js"></script>
     <script src="chat-manager.js"></script>
+    <script src="whiteboard-manager.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

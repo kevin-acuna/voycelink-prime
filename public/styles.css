@@ -1628,3 +1628,286 @@ body {
         max-height: calc(100vh - 160px);
     }
 }
+
+/* =============================================================================
+   Whiteboard (Embedded like Screen Share)
+   ============================================================================= */
+
+.btn-whiteboard {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+    color: white;
+    border: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-whiteboard:hover {
+    background: linear-gradient(135deg, #d97706 0%, #b45309 100%);
+    transform: translateY(-1px);
+}
+
+.btn-whiteboard.active {
+    background: linear-gradient(135deg, #b45309 0%, #92400e 100%);
+    box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.4);
+}
+
+.btn-whiteboard svg {
+    width: 18px;
+    height: 18px;
+}
+
+/* Whiteboard wrapper - similar to screen share */
+.whiteboard-wrapper {
+    position: relative;
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+    border: 2px solid #f59e0b;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Whiteboard mode - same as presentation mode */
+.video-grid.whiteboard-mode {
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    align-content: stretch;
+    gap: 0.5rem;
+}
+
+.video-grid.whiteboard-mode .whiteboard-wrapper {
+    flex: 1;
+    min-width: 0;
+    max-height: none;
+    height: 100%;
+    order: 1;
+}
+
+/* Participants sidebar in whiteboard mode */
+.video-grid.whiteboard-mode .video-wrapper {
+    width: 180px;
+    height: 135px;
+    min-width: 180px;
+    max-height: 135px;
+    flex-shrink: 0;
+    order: 2;
+}
+
+.whiteboard-label {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 0.5rem 1rem;
+    background: linear-gradient(transparent, rgba(0,0,0,0.8));
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    z-index: 2;
+}
+
+.whiteboard-badge {
+    background: #f59e0b;
+    color: white;
+    padding: 0.125rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.625rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.whiteboard-status {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.whiteboard-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-primary);
+    border-bottom: 1px solid var(--border-color);
+    flex-wrap: wrap;
+}
+
+.toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.toolbar-group.colors {
+    gap: 6px;
+}
+
+.toolbar-divider {
+    width: 1px;
+    height: 24px;
+    background: var(--border-color);
+    margin: 0 4px;
+}
+
+.toolbar-btn {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    padding: 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.toolbar-btn:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+}
+
+.toolbar-btn.active {
+    background: #f59e0b;
+    border-color: #f59e0b;
+    color: white;
+}
+
+.toolbar-btn.danger:hover {
+    background: var(--danger-color);
+    border-color: var(--danger-color);
+    color: white;
+}
+
+.toolbar-btn svg {
+    width: 18px;
+    height: 18px;
+}
+
+.color-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    cursor: pointer;
+    transition: all 0.2s;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.2);
+}
+
+.color-btn:hover {
+    transform: scale(1.1);
+}
+
+.color-btn.active {
+    border-color: #f59e0b;
+    box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.4), inset 0 0 0 1px rgba(0, 0, 0, 0.2);
+}
+
+.stroke-width-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-secondary);
+}
+
+.stroke-width-label svg {
+    width: 14px;
+    height: 14px;
+}
+
+.stroke-width-label input[type="range"] {
+    width: 80px;
+    height: 4px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: var(--border-color);
+    border-radius: 2px;
+    outline: none;
+}
+
+.stroke-width-label input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #f59e0b;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.stroke-width-label input[type="range"]::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+}
+
+.whiteboard-canvas-container {
+    flex: 1;
+    background: #1a1a2e;
+    overflow: hidden;
+    position: relative;
+}
+
+.whiteboard-canvas-container canvas {
+    display: block;
+}
+
+/* Toolbar close button with text */
+.toolbar-btn span {
+    margin-left: 4px;
+    font-size: 0.75rem;
+}
+
+/* Responsive whiteboard */
+@media (max-width: 768px) {
+    .video-grid.whiteboard-mode {
+        flex-direction: column;
+    }
+    
+    .video-grid.whiteboard-mode .whiteboard-wrapper {
+        flex: 1;
+        min-height: 50vh;
+        order: 1;
+    }
+    
+    .video-grid.whiteboard-mode .video-wrapper {
+        width: 100%;
+        height: auto;
+        max-height: 100px;
+        min-width: auto;
+        order: 2;
+    }
+    
+    .whiteboard-toolbar {
+        padding: 6px 8px;
+        gap: 4px;
+    }
+    
+    .toolbar-btn {
+        padding: 6px;
+    }
+    
+    .toolbar-btn span {
+        display: none;
+    }
+    
+    .color-btn {
+        width: 22px;
+        height: 22px;
+    }
+    
+    .stroke-width-label input[type="range"] {
+        width: 50px;
+    }
+    
+    .toolbar-divider {
+        display: none;
+    }
+}
