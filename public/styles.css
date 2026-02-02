@@ -32,6 +32,12 @@
     box-sizing: border-box;
 }
 
+/* Mobile touch improvements */
+html {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+}
+
 html, body {
     height: 100%;
     overflow: hidden;
@@ -663,6 +669,78 @@ body {
 }
 
 /* =============================================================================
+   AI Interpreter Avatar (Robot Assistant)
+   ============================================================================= */
+
+.ai-interpreter-avatar {
+    position: absolute;
+    bottom: 50px;
+    right: 10px;
+    width: 52px;
+    height: 52px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, #1e1e2e 0%, #2d2d3d 100%);
+    border: 3px solid #f59e0b;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 5;
+    transition: all 0.3s ease;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.1) inset;
+}
+
+.ai-interpreter-avatar.active {
+    display: flex;
+}
+
+.ai-interpreter-avatar svg {
+    width: 28px;
+    height: 28px;
+    color: #f59e0b;
+    transition: all 0.2s ease;
+}
+
+/* AI Listening State (green) - when detecting speech input */
+.ai-interpreter-avatar.listening {
+    border-color: #22c55e;
+    background: linear-gradient(135deg, #15803d 0%, #16a34a 100%);
+    animation: ai-listening-pulse 0.8s ease-in-out infinite;
+}
+
+.ai-interpreter-avatar.listening svg {
+    color: white;
+}
+
+@keyframes ai-listening-pulse {
+    0%, 100% {
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 0 0 rgba(34, 197, 94, 0.6);
+    }
+    50% {
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 0 5px rgba(34, 197, 94, 0.3);
+    }
+}
+
+/* AI Speaking State (purple) - when outputting translation */
+.ai-interpreter-avatar.speaking {
+    border-color: #8b5cf6;
+    background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+    animation: ai-speaking-pulse 1s ease-in-out infinite;
+}
+
+.ai-interpreter-avatar.speaking svg {
+    color: white;
+}
+
+@keyframes ai-speaking-pulse {
+    0%, 100% {
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 0 0 rgba(139, 92, 246, 0.6);
+    }
+    50% {
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 0 6px rgba(139, 92, 246, 0.3);
+    }
+}
+
+/* =============================================================================
    Controls Bar
    ============================================================================= */
 
@@ -889,20 +967,32 @@ body {
         flex-direction: column;
         gap: 1.5rem;
         padding: 1rem;
+        overflow-y: auto;
+        align-items: center;
+        justify-content: flex-start;
+        padding-top: 1rem;
+        padding-bottom: 2rem;
     }
     
     .preview-section {
         width: 100%;
         max-width: 400px;
+        flex-shrink: 0;
     }
     
     .preview-video-container {
         width: 100%;
-        height: 240px;
+        height: 200px;
     }
     
     .join-card {
         max-width: 400px;
+        width: 100%;
+        flex-shrink: 0;
+    }
+    
+    .device-selectors {
+        display: none;
     }
 }
 
@@ -915,28 +1005,56 @@ body {
         font-size: 0.9375rem;
     }
     
+    .main-content {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+    
     .video-grid {
         grid-template-columns: 1fr;
+        flex: 1;
+        overflow-y: auto;
+        padding: 0.5rem;
     }
     
     .video-wrapper {
-        max-height: calc(50vh - 100px);
+        max-height: 40vh;
+        min-height: 150px;
     }
     
     .controls-bar {
-        padding: 0.5rem 1rem;
-        gap: 0.5rem;
+        padding: 0.5rem;
+        gap: 0.25rem;
+        flex-wrap: wrap;
+        margin: 0;
+        border-radius: 0;
+        border-left: none;
+        border-right: none;
+        border-bottom: none;
+        position: relative;
+        z-index: 100;
     }
     
     .btn-control {
-        width: 44px;
-        height: 44px;
-        font-size: 1.125rem;
+        width: 40px;
+        height: 40px;
+        font-size: 1rem;
     }
     
     .btn-ai {
-        padding: 0.5rem 0.75rem;
-        font-size: 0.8125rem;
+        padding: 0.4rem 0.6rem;
+        font-size: 0.75rem;
+        height: 40px;
+    }
+    
+    .btn-ai span {
+        display: none;
+    }
+    
+    .session-info {
+        display: none;
     }
     
     .interpreter-transcripts {
@@ -951,7 +1069,65 @@ body {
     
     .join-card {
         padding: 1.5rem;
-        margin: 1rem;
+        margin: 0.5rem;
+    }
+    
+    .join-card h2 {
+        font-size: 1.25rem;
+    }
+    
+    .form-group label {
+        font-size: 0.8125rem;
+    }
+    
+    .form-group input,
+    .form-group select {
+        padding: 0.6rem 0.75rem;
+        font-size: 0.875rem;
+    }
+}
+
+/* Extra small screens */
+@media (max-width: 480px) {
+    .join-container {
+        padding: 0.5rem;
+        padding-bottom: 1.5rem;
+    }
+    
+    .preview-video-container {
+        height: 180px;
+    }
+    
+    .join-card {
+        padding: 1rem;
+        margin: 0.25rem;
+    }
+    
+    .join-card h2 {
+        font-size: 1.1rem;
+    }
+    
+    .btn-primary {
+        padding: 0.75rem;
+    }
+    
+    .controls-bar {
+        padding: 0.4rem;
+    }
+    
+    .btn-control {
+        width: 36px;
+        height: 36px;
+    }
+    
+    .btn-ai {
+        width: 36px;
+        height: 36px;
+        padding: 0;
+    }
+    
+    .video-wrapper {
+        max-height: 35vh;
     }
 }
 

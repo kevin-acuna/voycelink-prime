@@ -19,6 +19,12 @@ class AudioProcessor {
         // Playback for translated audio
         this.playbackQueue = [];
         this.isPlaying = false;
+        
+        // Callback for AI speaking state changes
+        this.onSpeakingStateChange = null;
+        
+        // Callback for AI listening state changes (when input speech is detected)
+        this.onListeningStateChange = null;
     }
 
     log(type, message) {
@@ -150,10 +156,16 @@ class AudioProcessor {
 
             case 'speech_started':
                 this.log('info', 'Speech detected');
+                if (this.onListeningStateChange) {
+                    this.onListeningStateChange(true);
+                }
                 break;
 
             case 'speech_stopped':
                 this.log('info', 'Speech ended');
+                if (this.onListeningStateChange) {
+                    this.onListeningStateChange(false);
+                }
                 break;
 
             case 'error':
@@ -193,9 +205,18 @@ class AudioProcessor {
     playNextChunk() {
         if (this.playbackQueue.length === 0) {
             this.isPlaying = false;
+            // Notify that AI stopped speaking
+            if (this.onSpeakingStateChange) {
+                this.onSpeakingStateChange(false);
+            }
             return;
         }
 
+        // Notify that AI started speaking (only on first chunk)
+        if (!this.isPlaying && this.onSpeakingStateChange) {
+            this.onSpeakingStateChange(true);
+        }
+        
         this.isPlaying = true;
         const audioData = this.playbackQueue.shift();
 

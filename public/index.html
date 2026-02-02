@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Voycelink Prime - Video Conference</title>
     <link rel="stylesheet" href="styles.css">
     <script src="https://unpkg.com/lucide@latest"></script>
@@ -120,6 +120,9 @@
                         <div class="avatar-circle" id="localAvatarInitial">Y</div>
                     </div>
                     <video id="localVideo" autoplay playsinline muted></video>
+                    <div class="ai-interpreter-avatar" id="localAiAvatar">
+                        <i data-lucide="bot"></i>
+                    </div>
                     <div class="video-label">
                         <div class="video-label-left">
                             <span class="speaking-indicator" id="localSpeakingIndicator"></span>
@@ -162,24 +165,6 @@
                     <i data-lucide="phone-off"></i>
                     <span>Leave</span>
                 </button>
-            </div>
-            
-            <!-- AI Interpreter Status -->
-            <div class="interpreter-status" id="interpreterStatus" style="display: none;">
-                <div class="interpreter-indicator">
-                    <span class="pulse"></span>
-                    <span>AI Interpreter Active</span>
-                </div>
-                <div class="interpreter-transcripts">
-                    <div class="transcript-box">
-                        <label>Original:</label>
-                        <span id="transcriptOriginal">-</span>
-                    </div>
-                    <div class="transcript-box">
-                        <label>Translation:</label>
-                        <span id="transcriptTranslation">-</span>
-                    </div>
-                </div>
             </div>
 
             <!-- Session Info -->

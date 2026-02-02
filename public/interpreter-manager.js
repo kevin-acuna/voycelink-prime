@@ -24,6 +24,8 @@ class InterpreterManager {
         this.onLog = null;
         this.onTranscript = null;
         this.onStatusChange = null;
+        this.onAiSpeakingChange = null; // (isSpeaking) => void
+        this.onAiListeningChange = null; // (isListening) => void
     }
 
     log(type, message) {
@@ -111,6 +113,20 @@ class InterpreterManager {
                 // Create audio processor for this participant
                 const audioProcessor = new AudioProcessor();
                 audioProcessor.onLog = this.onLog;
+                
+                // Set up AI speaking state callback
+                audioProcessor.onSpeakingStateChange = (isSpeaking) => {
+                    if (this.onAiSpeakingChange) {
+                        this.onAiSpeakingChange(isSpeaking);
+                    }
+                };
+                
+                // Set up AI listening state callback (when input speech is detected)
+                audioProcessor.onListeningStateChange = (isListening) => {
+                    if (this.onAiListeningChange) {
+                        this.onAiListeningChange(isListening);
+                    }
+                };
 
                 // Build WebSocket URL
                 const wsUrl = `${CONFIG.BACKEND_URL.replace('http', 'ws')}/ws/interpret?source=${encodeURIComponent(remoteLangName)}&target=${encodeURIComponent(localLangName)}`;
@@ -188,6 +204,20 @@ class InterpreterManager {
 
             const audioProcessor = new AudioProcessor();
             audioProcessor.onLog = this.onLog;
+            
+            // Set up AI speaking state callback
+            audioProcessor.onSpeakingStateChange = (isSpeaking) => {
+                if (this.onAiSpeakingChange) {
+                    this.onAiSpeakingChange(isSpeaking);
+                }
+            };
+            
+            // Set up AI listening state callback
+            audioProcessor.onListeningStateChange = (isListening) => {
+                if (this.onAiListeningChange) {
+                    this.onAiListeningChange(isListening);
+                }
+            };
 
             const wsUrl = `${CONFIG.BACKEND_URL.replace('http', 'ws')}/ws/interpret?source=${encodeURIComponent(remoteLangName)}&target=${encodeURIComponent(localLangName)}`;
 

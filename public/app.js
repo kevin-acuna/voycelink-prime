@@ -126,9 +126,6 @@ const elements = {
     toggleDebugBtn: document.getElementById('toggleDebug'),
     // AI Interpreter elements
     toggleInterpreterBtn: document.getElementById('toggleInterpreter'),
-    interpreterStatus: document.getElementById('interpreterStatus'),
-    transcriptOriginal: document.getElementById('transcriptOriginal'),
-    transcriptTranslation: document.getElementById('transcriptTranslation'),
     // Preview elements
     previewVideo: document.getElementById('previewVideo'),
     previewAvatar: document.getElementById('previewAvatar'),
@@ -692,11 +689,23 @@ function createRemoteVideoElement(subscriber) {
     // Create subtitle container
     const subtitleContainer = createSubtitleElement(connectionId);
     
+    // Create AI interpreter avatar
+    const aiAvatar = document.createElement('div');
+    aiAvatar.className = 'ai-interpreter-avatar';
+    aiAvatar.id = `ai-avatar-${connectionId}`;
+    aiAvatar.innerHTML = '<i data-lucide="bot"></i>';
+    
     wrapper.appendChild(avatar);
     wrapper.appendChild(video);
     wrapper.appendChild(subtitleContainer);
+    wrapper.appendChild(aiAvatar);
     wrapper.appendChild(label);
     elements.videoGrid.appendChild(wrapper);
+    
+    // Initialize lucide icon for the AI avatar
+    if (typeof lucide !== 'undefined') {
+        lucide.createIcons({ nodes: [aiAvatar] });
+    }
     
     // Set up avatar with earthy color
     setupAvatar(wrapper, nickname, avatar, avatarCircle);
@@ -1091,13 +1100,6 @@ async function startInterpreter() {
     
     // Set up interpreter manager callbacks
     interpreterManager.onLog = logEvent;
-    interpreterManager.onTranscript = (type, text, connectionId) => {
-        if (type === 'input') {
-            elements.transcriptOriginal.textContent = text;
-        } else if (type === 'output') {
-            elements.transcriptTranslation.textContent += text;
-        }
-    };
     interpreterManager.onStatusChange = (isActive) => {
         appState.isInterpreterActive = isActive;
         elements.toggleInterpreterBtn.classList.toggle('active', isActive);
@@ -1105,12 +1107,20 @@ async function startInterpreter() {
             ? '<i data-lucide="languages"></i><span>Stop AI</span>' 
             : '<i data-lucide="languages"></i><span>AI Interpreter</span>';
         lucide.createIcons();
-        elements.interpreterStatus.style.display = isActive ? 'block' : 'none';
+        
+        // Send signal to all participants about interpreter state
+        sendInterpreterActiveSignal(isActive);
     };
     
-    // Clear previous transcripts
-    elements.transcriptOriginal.textContent = '-';
-    elements.transcriptTranslation.textContent = '';
+    // Set up AI speaking state callback
+    interpreterManager.onAiSpeakingChange = (isSpeaking) => {
+        sendAiSpeakingSignal(isSpeaking);
+    };
+    
+    // Set up AI listening state callback (when input speech is detected)
+    interpreterManager.onAiListeningChange = (isListening) => {
+        sendAiListeningSignal(isListening);
+    };
     
     const success = await interpreterManager.start({
         localLanguage: appState.preferredLanguage,
@@ -1127,6 +1137,8 @@ async function startInterpreter() {
  */
 function stopInterpreter() {
     interpreterManager.stop();
+    // Send signal that interpreter is deactivated
+    sendInterpreterActiveSignal(false);
     logEvent('info', 'AI Interpreter stopped');
 }
 
@@ -1409,6 +1421,185 @@ function resetChatUI() {
 }
 
 // =============================================================================
+// AI Interpreter Visual Feedback (Signals)
+// =============================================================================
+
+/**
+ * Initialize interpreter signal handlers
+ */
+function initializeInterpreterSignals(session) {
+    // Listen for interpreter active state changes from other users
+    session.on('signal:interpreter-active', (event) => {
+        if (event.from.connectionId === openviduClient.session.connection.connectionId) return;
+        
+        const data = JSON.parse(event.data);
+        const connectionId = event.from.connectionId;
+        updateRemoteInterpreterAvatar(connectionId, 'active', data.active);
+    });
+    
+    // Listen for AI speaking state changes from other users
+    session.on('signal:ai-speaking', (event) => {
+        if (event.from.connectionId === openviduClient.session.connection.connectionId) return;
+        
+        const data = JSON.parse(event.data);
+        const connectionId = event.from.connectionId;
+        updateRemoteInterpreterAvatar(connectionId, 'speaking', data.speaking);
+    });
+    
+    // Listen for AI listening state changes from other users
+    session.on('signal:ai-listening', (event) => {
+        if (event.from.connectionId === openviduClient.session.connection.connectionId) return;
+        
+        const data = JSON.parse(event.data);
+        const connectionId = event.from.connectionId;
+        updateRemoteInterpreterAvatar(connectionId, 'listening', data.listening);
+    });
+}
+
+/**
+ * Send interpreter active state signal to all participants
+ */
+function sendInterpreterActiveSignal(active) {
+    if (!openviduClient.session) return;
+    
+    openviduClient.session.signal({
+        data: JSON.stringify({ active }),
+        type: 'interpreter-active'
+    }).catch(err => console.error('Error sending interpreter signal:', err));
+    
+    // Update local AI avatar
+    updateLocalInterpreterAvatar('active', active);
+}
+
+/**
+ * Send AI speaking state signal to all participants
+ */
+function sendAiSpeakingSignal(speaking) {
+    if (!openviduClient.session) return;
+    
+    openviduClient.session.signal({
+        data: JSON.stringify({ speaking }),
+        type: 'ai-speaking'
+    }).catch(err => console.error('Error sending AI speaking signal:', err));
+    
+    // Update local AI avatar speaking state
+    updateLocalInterpreterAvatar('speaking', speaking);
+}
+
+/**
+ * Send AI listening state signal to all participants
+ */
+function sendAiListeningSignal(listening) {
+    if (!openviduClient.session) return;
+    
+    openviduClient.session.signal({
+        data: JSON.stringify({ listening }),
+        type: 'ai-listening'
+    }).catch(err => console.error('Error sending AI listening signal:', err));
+    
+    // Update local AI avatar listening state
+    updateLocalInterpreterAvatar('listening', listening);
+}
+
+/**
+ * Update local user's AI interpreter avatar
+ * @param {string} stateType - 'active', 'listening', or 'speaking'
+ * @param {boolean} value - true to enable state, false to disable
+ */
+function updateLocalInterpreterAvatar(stateType, value) {
+    const aiAvatar = document.getElementById('localAiAvatar');
+    
+    if (!aiAvatar) return;
+    
+    if (stateType === 'active') {
+        // Interpreter activated/deactivated
+        if (value) {
+            aiAvatar.classList.add('active');
+        } else {
+            aiAvatar.classList.remove('active', 'listening', 'speaking');
+        }
+        aiAvatar.innerHTML = '<i data-lucide="bot"></i>';
+    } else if (stateType === 'listening') {
+        // AI is listening to speech
+        if (value) {
+            aiAvatar.classList.add('listening');
+            aiAvatar.classList.remove('speaking');
+            aiAvatar.innerHTML = '<i data-lucide="ear"></i>';
+        } else {
+            aiAvatar.classList.remove('listening');
+            aiAvatar.innerHTML = '<i data-lucide="bot"></i>';
+        }
+    } else if (stateType === 'speaking') {
+        // AI is speaking translation
+        if (value) {
+            aiAvatar.classList.add('speaking');
+            aiAvatar.classList.remove('listening');
+            aiAvatar.innerHTML = '<i data-lucide="volume-2"></i>';
+        } else {
+            aiAvatar.classList.remove('speaking');
+            aiAvatar.innerHTML = '<i data-lucide="bot"></i>';
+        }
+    }
+    
+    // Refresh lucide icons
+    if (typeof lucide !== 'undefined') {
+        lucide.createIcons({ nodes: [aiAvatar] });
+    }
+}
+
+/**
+ * Update remote user's AI interpreter avatar
+ * @param {string} connectionId - Remote participant's connection ID
+ * @param {string|boolean} stateType - 'active', 'listening', 'speaking', or boolean for backward compat
+ * @param {boolean} value - true to enable state, false to disable
+ */
+function updateRemoteInterpreterAvatar(connectionId, stateType, value) {
+    const aiAvatar = document.getElementById(`ai-avatar-${connectionId}`);
+    
+    if (!aiAvatar) return;
+    
+    // Handle backward compatibility (boolean active parameter)
+    if (typeof stateType === 'boolean') {
+        if (stateType) {
+            aiAvatar.classList.add('active');
+        } else {
+            aiAvatar.classList.remove('active', 'listening', 'speaking');
+        }
+        aiAvatar.innerHTML = '<i data-lucide="bot"></i>';
+    } else if (stateType === 'active') {
+        if (value) {
+            aiAvatar.classList.add('active');
+        } else {
+            aiAvatar.classList.remove('active', 'listening', 'speaking');
+        }
+        aiAvatar.innerHTML = '<i data-lucide="bot"></i>';
+    } else if (stateType === 'listening') {
+        if (value) {
+            aiAvatar.classList.add('listening');
+            aiAvatar.classList.remove('speaking');
+            aiAvatar.innerHTML = '<i data-lucide="ear"></i>';
+        } else {
+            aiAvatar.classList.remove('listening');
+            aiAvatar.innerHTML = '<i data-lucide="bot"></i>';
+        }
+    } else if (stateType === 'speaking') {
+        if (value) {
+            aiAvatar.classList.add('speaking');
+            aiAvatar.classList.remove('listening');
+            aiAvatar.innerHTML = '<i data-lucide="volume-2"></i>';
+        } else {
+            aiAvatar.classList.remove('speaking');
+            aiAvatar.innerHTML = '<i data-lucide="bot"></i>';
+        }
+    }
+    
+    // Refresh lucide icons
+    if (typeof lucide !== 'undefined') {
+        lucide.createIcons({ nodes: [aiAvatar] });
+    }
+}
+
+// =============================================================================
 // OpenVidu Event Handlers
 // =============================================================================
 
@@ -1478,6 +1669,11 @@ function setupOpenViduCallbacks() {
                             await transcriptionManager.addParticipant(participantInfo);
                         }
                     }
+                }
+                
+                // Broadcast current interpreter state to new participant
+                if (appState.isInterpreterActive) {
+                    sendInterpreterActiveSignal(true);
                 }
             });
         }
@@ -1662,6 +1858,9 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         
         // Initialize chat
         initializeChat(openviduClient.session);
+        
+        // Initialize interpreter signals
+        initializeInterpreterSignals(openviduClient.session);
         
     } catch (error) {
         console.error('Error joining session:', error);
@@ -1884,7 +2083,6 @@ function leaveSession() {
     elements.toggleInterpreterBtn.disabled = true;
     elements.toggleInterpreterBtn.classList.remove('active');
     elements.toggleInterpreterBtn.textContent = '🌐 AI Interpreter';
-    elements.interpreterStatus.style.display = 'none';
     elements.toggleTranscriptionBtn.disabled = true;
     elements.toggleTranscriptionBtn.classList.remove('active');
     elements.toggleTranscriptionBtn.innerHTML = '<i data-lucide="subtitles"></i><span>Subtitles</span>';
