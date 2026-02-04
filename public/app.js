@@ -158,7 +158,10 @@ const elements = {
     // Whiteboard elements
     toggleWhiteboardBtn: document.getElementById('toggleWhiteboard'),
     whiteboardWrapper: document.getElementById('whiteboardWrapper'),
-    closeWhiteboardBtn: document.getElementById('closeWhiteboardBtn')
+    closeWhiteboardBtn: document.getElementById('closeWhiteboardBtn'),
+    // Reactions elements
+    toggleReactionsBtn: document.getElementById('toggleReactions'),
+    reactionsPopup: document.getElementById('reactionsPopup')
 };
 
 // Preview state
@@ -961,8 +964,17 @@ function startSpeakingDetectionLoop() {
     if (speakingState.animationFrame) return;
     
     const SPEAKING_THRESHOLD = 15;
+    const DETECTION_INTERVAL = 100; // Check every 100ms instead of every frame (better for 50+ participants)
+    let lastCheck = 0;
     
-    function detectSpeaking() {
+    function detectSpeaking(timestamp) {
+        // Throttle to reduce CPU usage with many participants
+        if (timestamp - lastCheck < DETECTION_INTERVAL) {
+            speakingState.animationFrame = requestAnimationFrame(detectSpeaking);
+            return;
+        }
+        lastCheck = timestamp;
+        
         // Check local audio
         if (speakingState.localAnalyser && speakingState.localDataArray) {
             const level = getAudioLevel(speakingState.localAnalyser, speakingState.localDataArray);
@@ -980,7 +992,7 @@ function startSpeakingDetectionLoop() {
         speakingState.animationFrame = requestAnimationFrame(detectSpeaking);
     }
     
-    detectSpeaking();
+    detectSpeaking(0);
 }
 
 /**
@@ -1019,7 +1031,9 @@ function updateInterpreterButtonState() {
     const hasRemoteParticipant = remoteParticipants > 0;
     
     // Enable button only if there's exactly one remote participant (PoC limitation)
-    elements.toggleInterpreterBtn.disabled = !hasRemoteParticipant;
+    // TEMPORARILY DISABLED for 30-participant test - uncomment line below to re-enable
+    // elements.toggleInterpreterBtn.disabled = !hasRemoteParticipant;
+    elements.toggleInterpreterBtn.disabled = true;
     
     if (hasRemoteParticipant) {
         logEvent('info', 'Remote participant detected - AI Interpreter available');
@@ -1422,6 +1436,105 @@ function resetChatUI() {
     elements.chatPanel.style.display = 'none';
     elements.toggleChatBtn.classList.remove('active');
     appState.isChatOpen = false;
+}
+
+// =============================================================================
+// Reactions
+// =============================================================================
+
+/**
+ * Toggle reactions popup visibility
+ */
+function toggleReactionsPopup() {
+    elements.reactionsPopup?.classList.toggle('show');
+    elements.toggleReactionsBtn?.classList.toggle('active');
+}
+
+/**
+ * Hide reactions popup
+ */
+function hideReactionsPopup() {
+    elements.reactionsPopup?.classList.remove('show');
+    elements.toggleReactionsBtn?.classList.remove('active');
+}
+
+/**
+ * Send a reaction to all participants
+ */
+function sendReaction(reaction) {
+    if (!openviduClient.session) {
+        console.error('[Reactions] No session available');
+        return;
+    }
+    
+    // Show reaction locally on own video
+    showReactionOnVideo('localVideoWrapper', reaction);
+    
+    // Broadcast to others
+    const signalData = {
+        reaction: reaction,
+        senderName: appState.nickname || 'Anonymous'
+    };
+    
+    console.log('[Reactions] Sending reaction:', signalData);
+    
+    openviduClient.session.signal({
+        data: JSON.stringify(signalData),
+        type: 'reaction'
+    }).then(() => {
+        console.log('[Reactions] Signal sent successfully');
+    }).catch(err => console.error('[Reactions] Error sending reaction:', err));
+    
+    logEvent('info', `Sent reaction: ${reaction}`);
+}
+
+/**
+ * Show reaction animation on a video wrapper
+ */
+function showReactionOnVideo(wrapperId, reaction) {
+    const wrapper = document.getElementById(wrapperId);
+    if (!wrapper) {
+        console.warn('[Reactions] Video wrapper not found:', wrapperId);
+        return;
+    }
+    
+    // Create reaction element
+    const reactionEl = document.createElement('div');
+    reactionEl.className = 'video-reaction';
+    reactionEl.textContent = reaction;
+    
+    wrapper.appendChild(reactionEl);
+    
+    // Remove after animation completes
+    setTimeout(() => {
+        reactionEl.remove();
+    }, 2000);
+}
+
+/**
+ * Initialize reaction signal handlers
+ */
+function initializeReactionSignals(session) {
+    session.on('signal:reaction', (event) => {
+        // Skip if it's our own signal
+        if (event.from.connectionId === openviduClient.session.connection.connectionId) return;
+        
+        try {
+            const data = JSON.parse(event.data);
+            const connectionId = event.from.connectionId;
+            
+            console.log('[Reactions] Received reaction from', connectionId, ':', data.reaction);
+            
+            // Show reaction on the sender's video
+            showReactionOnVideo(`video-${connectionId}`, data.reaction);
+            
+            logEvent('info', `${data.senderName} reacted: ${data.reaction}`);
+        } catch (err) {
+            console.error('[Reactions] Error processing reaction:', err);
+        }
+    });
+    
+    console.log('[Reactions] Signal handlers initialized');
 }
 
 // =============================================================================
@@ -1866,6 +1979,9 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         // Initialize whiteboard
         whiteboardManager.initialize(openviduClient.session);
         
+        // Initialize reactions
+        initializeReactionSignals(openviduClient.session);
+        
         // Initialize interpreter signals
         initializeInterpreterSignals(openviduClient.session);
         
@@ -2153,9 +2269,7 @@ elements.toggleVideoBtn.addEventListener('click', () => {
 
 // Leave session
 elements.leaveSessionBtn.addEventListener('click', () => {
-    if (confirm('Are you sure you want to leave the call?')) {
-        leaveSession();
-    }
+    leaveSession();
 });
 
 // Screen share toggle
@@ -2205,6 +2319,25 @@ elements.chatTranslateToggle.addEventListener('change', toggleChatTranslation);
 
 // Whiteboard controls
 elements.toggleWhiteboardBtn.addEventListener('click', () => whiteboardManager.toggle());
+
+// Reactions controls
+elements.toggleReactionsBtn?.addEventListener('click', toggleReactionsPopup);
+document.querySelectorAll('.reaction-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const reaction = btn.dataset.reaction;
+        sendReaction(reaction);
+        hideReactionsPopup();
+    });
+});
+
+// Close reactions popup when clicking outside
+document.addEventListener('click', (e) => {
+    if (elements.reactionsPopup?.classList.contains('show')) {
+        if (!e.target.closest('.reactions-container')) {
+            hideReactionsPopup();
+        }
+    }
+});
 
 // Clean up on page unload
 window.addEventListener('beforeunload', () => {

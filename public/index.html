@@ -235,6 +235,20 @@
                     <i data-lucide="pencil-ruler"></i>
                     <span>Whiteboard</span>
                 </button>
+                <div class="reactions-container">
+                    <button class="btn btn-reactions" id="toggleReactions" title="Send Reaction">
+                        <i data-lucide="smile-plus"></i>
+                        <span>React</span>
+                    </button>
+                    <div class="reactions-popup" id="reactionsPopup">
+                        <button class="reaction-btn" data-reaction="👍" title="Thumbs Up">👍</button>
+                        <button class="reaction-btn" data-reaction="❤️" title="Heart">❤️</button>
+                        <button class="reaction-btn" data-reaction="😂" title="Laugh">😂</button>
+                        <button class="reaction-btn" data-reaction="😮" title="Wow">😮</button>
+                        <button class="reaction-btn" data-reaction="👏" title="Clap">👏</button>
+                        <button class="reaction-btn" data-reaction="🎉" title="Celebrate">🎉</button>
+                    </div>
+                </div>
                 <button class="btn btn-danger" id="leaveSession" title="Leave Call">
                     <i data-lucide="phone-off"></i>
                     <span>Leave</span>
