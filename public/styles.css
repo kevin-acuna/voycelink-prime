@@ -38,6 +38,22 @@ html {
     touch-action: manipulation;
 }
 
+/* Button processing state - prevent multiple clicks */
+button.processing {
+    pointer-events: none;
+    opacity: 0.7;
+}
+
+/* Spinning animation for loading icons */
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.animate-spin {
+    animation: spin 1s linear infinite;
+}
+
 html, body {
     height: 100%;
     overflow: hidden;
@@ -2061,4 +2077,336 @@ body {
     .toolbar-divider {
         display: none;
     }
+}
+
+/* =============================================================================
+   Participants Panel
+   ============================================================================= */
+
+/* Participants button - same style as chat */
+.btn-participants {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    padding: 0.625rem 1rem;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-participants:hover {
+    background: #8b5cf6;
+    border-color: #8b5cf6;
+    color: white;
+}
+
+.btn-participants.active {
+    background: #8b5cf6;
+    border-color: #8b5cf6;
+    color: white;
+}
+
+.btn-participants svg {
+    width: 18px;
+    height: 18px;
+}
+
+/* Participants panel - similar to chat panel */
+.participants-panel {
+    position: absolute;
+    right: 16px;
+    top: 16px;
+    bottom: 100px;
+    width: 320px;
+    max-height: calc(100vh - 200px);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    z-index: 50;
+    animation: slideInRight 0.3s ease;
+}
+
+.participants-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+    border-radius: 12px 12px 0 0;
+}
+
+.participants-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.participants-header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.participants-header h3 {
+    font-size: 0.9375rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+}
+
+.participants-header h3 svg {
+    width: 18px;
+    height: 18px;
+    color: #8b5cf6;
+}
+
+.participants-count {
+    background: #8b5cf6;
+    color: white;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 12px;
+    min-width: 24px;
+    text-align: center;
+}
+
+.btn-close-panel {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-close-panel:hover {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+}
+
+.btn-close-panel svg {
+    width: 18px;
+    height: 18px;
+}
+
+/* Participants list */
+.participants-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-height: 200px;
+}
+
+.participants-empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 24px;
+}
+
+.participants-empty svg {
+    width: 48px;
+    height: 48px;
+    opacity: 0.3;
+    margin-bottom: 12px;
+}
+
+.participants-empty p {
+    font-size: 0.9375rem;
+    margin: 0;
+}
+
+/* Participant item */
+.participant-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    transition: all 0.2s;
+}
+
+.participant-item:hover {
+    background: var(--bg-primary);
+}
+
+.participant-item.is-you {
+    border: 1px solid var(--primary-color);
+}
+
+.participant-avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #8b5cf6, #a78bfa);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: white;
+    text-transform: uppercase;
+    flex-shrink: 0;
+}
+
+.participant-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.participant-name {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.participant-status {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.participant-status svg {
+    width: 12px;
+    height: 12px;
+}
+
+.participant-status.muted {
+    color: var(--danger-color);
+}
+
+.participant-you-badge {
+    font-size: 0.625rem;
+    background: var(--primary-color);
+    color: white;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-left: 4px;
+}
+
+/* Participant actions */
+.participant-actions {
+    display: flex;
+    gap: 4px;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.participant-item:hover .participant-actions {
+    opacity: 1;
+}
+
+.participant-action-btn {
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+
+.participant-action-btn:hover {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+}
+
+.participant-action-btn.mute-btn:hover {
+    background: rgba(239, 68, 68, 0.2);
+    color: #ef4444;
+}
+
+.participant-action-btn.kick-btn:hover {
+    background: rgba(239, 68, 68, 0.2);
+    color: #ef4444;
+}
+
+.participant-action-btn svg {
+    width: 14px;
+    height: 14px;
+}
+
+/* Responsive participants panel */
+@media (max-width: 768px) {
+    .participants-panel {
+        right: 8px;
+        left: 8px;
+        top: 60px;
+        width: auto;
+        bottom: 80px;
+    }
+    
+    .participant-actions {
+        opacity: 1;
+    }
+}
+
+/* Notification toast animations */
+@keyframes slideDown {
+    from {
+        opacity: 0;
+        transform: translateX(-50%) translateY(-20px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+    }
+}
+
+@keyframes slideUp {
+    from {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+    }
+    to {
+        opacity: 0;
+        transform: translateX(-50%) translateY(-20px);
+    }
+}
+
+.notification {
+    color: var(--text-primary);
+}
+
+.notification svg {
+    width: 18px;
+    height: 18px;
+    color: #3b82f6;
 }

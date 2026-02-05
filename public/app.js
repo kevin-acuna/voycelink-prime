@@ -5,6 +5,56 @@
  */
 
 // =============================================================================
+// Button Click Protection (Prevent Multiple Clicks)
+// =============================================================================
+
+/**
+ * Track buttons currently processing to prevent double-clicks
+ */
+const processingButtons = new Set();
+
+/**
+ * Wrap an async handler to prevent multiple simultaneous executions
+ * Best practice: disable button during action, show loading state
+ * @param {HTMLElement} button - The button element
+ * @param {Function} handler - Async handler function
+ * @param {Object} options - Options for loading state
+ */
+async function withButtonProtection(button, handler, options = {}) {
+    const { loadingText, originalText } = options;
+    
+    // Prevent multiple clicks
+    if (processingButtons.has(button)) {
+        return;
+    }
+    
+    processingButtons.add(button);
+    button.disabled = true;
+    
+    // Store original content and show loading state
+    const originalContent = button.innerHTML;
+    if (loadingText) {
+        button.innerHTML = loadingText;
+    }
+    button.classList.add('processing');
+    
+    try {
+        await handler();
+    } finally {
+        // Re-enable button
+        processingButtons.delete(button);
+        button.disabled = false;
+        button.innerHTML = originalContent;
+        button.classList.remove('processing');
+        
+        // Refresh Lucide icons if needed
+        if (typeof lucide !== 'undefined') {
+            lucide.createIcons();
+        }
+    }
+}
+
+// =============================================================================
 // Audio Notifications
 // =============================================================================
 let audioContext = null;
@@ -95,6 +145,7 @@ const appState = {
     isInterpreterActive: false,
     isTranscriptionActive: false,
     isChatOpen: false,
+    isParticipantsOpen: false,
     isScreenSharing: false,
     screenPublisher: null
 };
@@ -161,7 +212,13 @@ const elements = {
     closeWhiteboardBtn: document.getElementById('closeWhiteboardBtn'),
     // Reactions elements
     toggleReactionsBtn: document.getElementById('toggleReactions'),
-    reactionsPopup: document.getElementById('reactionsPopup')
+    reactionsPopup: document.getElementById('reactionsPopup'),
+    // Participants panel elements
+    toggleParticipantsBtn: document.getElementById('toggleParticipants'),
+    participantsPanel: document.getElementById('participantsPanel'),
+    participantsList: document.getElementById('participantsList'),
+    participantsPanelCount: document.getElementById('participantsPanelCount'),
+    closeParticipantsBtn: document.getElementById('closeParticipantsBtn')
 };
 
 // Preview state
@@ -652,9 +709,17 @@ function createRemoteVideoElement(subscriber) {
     const connectionId = stream.connection.connectionId;
     
     // Parse connection data
+    // OpenVidu concatenates client and server data with '%/%' separator
     let connectionData = {};
     try {
-        connectionData = JSON.parse(stream.connection.data);
+        const rawData = stream.connection.data;
+        const dataParts = rawData.split('%/%');
+        for (const part of dataParts) {
+            try {
+                const parsed = JSON.parse(part);
+                connectionData = { ...connectionData, ...parsed };
+            } catch (e) {}
+        }
     } catch (e) {
         connectionData = { nickname: 'Unknown', preferredLanguage: 'en' };
     }
@@ -747,14 +812,26 @@ function createRemoteScreenShareElement(subscriber) {
     const connectionId = stream.connection.connectionId;
     
     // Parse connection data for nickname
+    // OpenVidu concatenates client and server data with '%/%' separator
     let connectionData = {};
     try {
-        connectionData = JSON.parse(stream.connection.data);
+        const rawData = stream.connection.data;
+        // Handle OpenVidu's '%/%' separator format
+        const dataParts = rawData.split('%/%');
+        // Try to parse each part and merge
+        for (const part of dataParts) {
+            try {
+                const parsed = JSON.parse(part);
+                connectionData = { ...connectionData, ...parsed };
+            } catch (e) {}
+        }
     } catch (e) {
         connectionData = { nickname: 'Unknown' };
     }
     
-    const nickname = connectionData.nickname || 'Participant';
+    // Extract nickname - remove "(Screen)" suffix if present since we add it in the label
+    let nickname = connectionData.nickname || 'Participant';
+    nickname = nickname.replace(/\s*\(Screen\)\s*$/, '');
     
     // Create wrapper for screen share
     const wrapper = document.createElement('div');
@@ -1439,6 +1516,312 @@ function resetChatUI() {
 }
 
 // =============================================================================
+// Participants Panel
+// =============================================================================
+
+/**
+ * Track participants data for the panel
+ */
+const participantsData = new Map();
+
+/**
+ * Toggle participants panel visibility
+ */
+function toggleParticipants() {
+    appState.isParticipantsOpen = !appState.isParticipantsOpen;
+    
+    if (appState.isParticipantsOpen) {
+        elements.participantsPanel.style.display = 'flex';
+        elements.toggleParticipantsBtn.classList.add('active');
+        renderParticipantsList();
+    } else {
+        elements.participantsPanel.style.display = 'none';
+        elements.toggleParticipantsBtn.classList.remove('active');
+    }
+    
+    lucide.createIcons();
+}
+
+/**
+ * Close participants panel
+ */
+function closeParticipants() {
+    appState.isParticipantsOpen = false;
+    elements.participantsPanel.style.display = 'none';
+    elements.toggleParticipantsBtn.classList.remove('active');
+}
+
+/**
+ * Add participant to tracking
+ */
+function addParticipantToPanel(connectionId, nickname, isLocal = false) {
+    participantsData.set(connectionId, {
+        connectionId,
+        nickname,
+        isLocal,
+        isMuted: false,
+        isVideoOff: false
+    });
+    updateParticipantsCount();
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+}
+
+/**
+ * Remove participant from tracking
+ */
+function removeParticipantFromPanel(connectionId) {
+    participantsData.delete(connectionId);
+    updateParticipantsCount();
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+}
+
+/**
+ * Update participants count display
+ */
+function updateParticipantsCount() {
+    const count = participantsData.size;
+    elements.participantsPanelCount.textContent = count;
+    elements.participantCount.textContent = count;
+}
+
+/**
+ * Render the participants list
+ */
+function renderParticipantsList() {
+    if (participantsData.size === 0) {
+        elements.participantsList.innerHTML = `
+            <div class="participants-empty">
+                <i data-lucide="user-x"></i>
+                <p>No participants yet</p>
+            </div>
+        `;
+        lucide.createIcons();
+        return;
+    }
+    
+    // Sort: local user first, then alphabetically
+    const sortedParticipants = Array.from(participantsData.values()).sort((a, b) => {
+        if (a.isLocal) return -1;
+        if (b.isLocal) return 1;
+        return a.nickname.localeCompare(b.nickname);
+    });
+    
+    elements.participantsList.innerHTML = sortedParticipants.map(p => {
+        const initials = p.nickname.charAt(0).toUpperCase();
+        const isYou = p.isLocal;
+        
+        return `
+            <div class="participant-item ${isYou ? 'is-you' : ''}" data-connection-id="${p.connectionId}">
+                <div class="participant-avatar">${initials}</div>
+                <div class="participant-info">
+                    <div class="participant-name">
+                        ${escapeHtml(p.nickname)}
+                        ${isYou ? '<span class="participant-you-badge">You</span>' : ''}
+                    </div>
+                    <div class="participant-status ${p.isMuted ? 'muted' : ''}">
+                        ${p.isMuted 
+                            ? '<i data-lucide="mic-off"></i> Muted' 
+                            : '<i data-lucide="mic"></i> Active'}
+                    </div>
+                </div>
+                ${!isYou ? `
+                    <div class="participant-actions">
+                        <button class="participant-action-btn mute-btn" 
+                                data-connection-id="${p.connectionId}" 
+                                title="Request mute">
+                            <i data-lucide="mic-off"></i>
+                        </button>
+                        <button class="participant-action-btn kick-btn" 
+                                data-connection-id="${p.connectionId}" 
+                                title="Remove from call">
+                            <i data-lucide="user-x"></i>
+                        </button>
+                    </div>
+                ` : ''}
+            </div>
+        `;
+    }).join('');
+    
+    lucide.createIcons();
+    
+    // Add click handlers for action buttons
+    elements.participantsList.querySelectorAll('.mute-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const connectionId = btn.dataset.connectionId;
+            requestMuteParticipant(connectionId);
+        });
+    });
+    
+    elements.participantsList.querySelectorAll('.kick-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const connectionId = btn.dataset.connectionId;
+            kickParticipant(connectionId);
+        });
+    });
+}
+
+/**
+ * Request a participant to mute their microphone
+ */
+function requestMuteParticipant(connectionId) {
+    if (!openviduClient.session) return;
+    
+    const participant = participantsData.get(connectionId);
+    if (!participant) return;
+    
+    // Send signal to request mute
+    openviduClient.session.signal({
+        data: JSON.stringify({ 
+            fromNickname: appState.nickname 
+        }),
+        to: [openviduClient.session.remoteConnections.get(connectionId)],
+        type: 'requestMute'
+    }).then(() => {
+        logEvent('info', `Sent mute request to ${participant.nickname}`);
+    }).catch(err => {
+        console.error('Error sending mute request:', err);
+    });
+}
+
+/**
+ * Kick a participant from the call
+ */
+function kickParticipant(connectionId) {
+    if (!openviduClient.session) return;
+    
+    const participant = participantsData.get(connectionId);
+    if (!participant) return;
+    
+    // Confirm before kicking
+    if (!confirm(`Remove ${participant.nickname} from the call?`)) {
+        return;
+    }
+    
+    // Send signal to kick
+    openviduClient.session.signal({
+        data: JSON.stringify({ 
+            fromNickname: appState.nickname,
+            reason: 'Removed by host'
+        }),
+        to: [openviduClient.session.remoteConnections.get(connectionId)],
+        type: 'kick'
+    }).then(() => {
+        logEvent('info', `Kicked ${participant.nickname} from the call`);
+    }).catch(err => {
+        console.error('Error kicking participant:', err);
+    });
+}
+
+/**
+ * Handle incoming mute request signal
+ */
+function handleMuteRequest(event) {
+    try {
+        const data = JSON.parse(event.data);
+        // Show notification and auto-mute
+        const message = `${data.fromNickname} has requested you to mute your microphone`;
+        
+        // Auto-mute the user
+        if (appState.isAudioEnabled) {
+            appState.isAudioEnabled = openviduClient.toggleAudio();
+            elements.toggleAudioBtn.classList.add('muted');
+            elements.toggleAudioBtn.innerHTML = '<i data-lucide="mic-off"></i>';
+            lucide.createIcons();
+        }
+        
+        // Show a brief notification
+        showNotification(message, 'info');
+        logEvent('info', message);
+    } catch (e) {
+        console.error('Error handling mute request:', e);
+    }
+}
+
+/**
+ * Handle incoming kick signal
+ */
+function handleKickSignal(event) {
+    try {
+        const data = JSON.parse(event.data);
+        alert(`You have been removed from the call by ${data.fromNickname}`);
+        leaveSession();
+    } catch (e) {
+        console.error('Error handling kick signal:', e);
+    }
+}
+
+/**
+ * Show a brief notification toast
+ */
+function showNotification(message, type = 'info') {
+    // Create notification element
+    const notification = document.createElement('div');
+    notification.className = `notification notification-${type}`;
+    notification.innerHTML = `
+        <i data-lucide="${type === 'info' ? 'info' : 'alert-circle'}"></i>
+        <span>${escapeHtml(message)}</span>
+    `;
+    notification.style.cssText = `
+        position: fixed;
+        top: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        padding: 12px 20px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        z-index: 9999;
+        animation: slideDown 0.3s ease;
+    `;
+    
+    document.body.appendChild(notification);
+    lucide.createIcons();
+    
+    // Remove after 3 seconds
+    setTimeout(() => {
+        notification.style.animation = 'slideUp 0.3s ease';
+        setTimeout(() => notification.remove(), 300);
+    }, 3000);
+}
+
+/**
+ * Reset participants panel
+ */
+function resetParticipantsPanel() {
+    participantsData.clear();
+    elements.participantsList.innerHTML = `
+        <div class="participants-empty">
+            <i data-lucide="user-x"></i>
+            <p>No participants yet</p>
+        </div>
+    `;
+    lucide.createIcons();
+    elements.participantsPanel.style.display = 'none';
+    elements.toggleParticipantsBtn.classList.remove('active');
+    appState.isParticipantsOpen = false;
+    updateParticipantsCount();
+}
+
+/**
+ * Escape HTML to prevent XSS
+ */
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// =============================================================================
 // Reactions
 // =============================================================================
 
@@ -1755,6 +2138,21 @@ function setupOpenViduCallbacks() {
             // Regular camera stream
             logEvent('info', `Creating regular video element for ${connectionId}`);
             createRemoteVideoElement(subscriber);
+            
+            // Add to participants panel
+            let nickname = 'Participant';
+            try {
+                const rawData = stream.connection.data;
+                const dataParts = rawData.split('%/%');
+                for (const part of dataParts) {
+                    try {
+                        const parsed = JSON.parse(part);
+                        if (parsed.nickname) nickname = parsed.nickname;
+                    } catch (e) {}
+                }
+            } catch (e) {}
+            addParticipantToPanel(connectionId, nickname, false);
+            
             updateParticipantCount();
             updateAudioTracksDebug();
             updateInterpreterButtonState();
@@ -1827,6 +2225,10 @@ function setupOpenViduCallbacks() {
             // Regular camera stream
             removeRemoteVideoElement(connectionId);
             cleanupRemoteSpeakingDetection(connectionId);
+            
+            // Remove from participants panel
+            removeParticipantFromPanel(connectionId);
+            
             updateParticipantCount();
             updateAudioTracksDebug();
             updateInterpreterButtonState();
@@ -1984,6 +2386,14 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         
         // Initialize interpreter signals
         initializeInterpreterSignals(openviduClient.session);
+        
+        // Initialize participants panel with local user
+        const localConnectionId = openviduClient.session.connection.connectionId;
+        addParticipantToPanel(localConnectionId, nickname, true);
+        
+        // Register signal handlers for participants panel (mute/kick)
+        openviduClient.session.on('signal:requestMute', handleMuteRequest);
+        openviduClient.session.on('signal:kick', handleKickSignal);
         
     } catch (error) {
         console.error('Error joining session:', error);
@@ -2179,6 +2589,9 @@ function leaveSession() {
     chatManager.destroy();
     resetChatUI();
     
+    // Clean up participants panel
+    resetParticipantsPanel();
+    
     // Stop speaking detection
     stopSpeakingDetection();
     
@@ -2232,7 +2645,15 @@ elements.joinForm.addEventListener('submit', async (e) => {
         return;
     }
     
-    await joinSession(sessionId, nickname, preferredLanguage);
+    // Find submit button and protect against multiple clicks
+    const submitBtn = elements.joinForm.querySelector('button[type="submit"]');
+    if (submitBtn) {
+        await withButtonProtection(submitBtn, async () => {
+            await joinSession(sessionId, nickname, preferredLanguage);
+        }, { loadingText: '<i data-lucide="loader-2" class="animate-spin"></i> Joining...' });
+    } else {
+        await joinSession(sessionId, nickname, preferredLanguage);
+    }
 });
 
 // Audio toggle
@@ -2274,12 +2695,16 @@ elements.leaveSessionBtn.addEventListener('click', () => {
 
 // Screen share toggle
 elements.toggleScreenShareBtn.addEventListener('click', async () => {
-    await toggleScreenShare();
+    await withButtonProtection(elements.toggleScreenShareBtn, async () => {
+        await toggleScreenShare();
+    });
 });
 
 // AI Interpreter toggle
 elements.toggleInterpreterBtn.addEventListener('click', async () => {
-    await toggleInterpreter();
+    await withButtonProtection(elements.toggleInterpreterBtn, async () => {
+        await toggleInterpreter();
+    });
 });
 
 // Debug panel toggle
@@ -2302,7 +2727,9 @@ elements.shareMeetingBtn.addEventListener('click', copyMeetingLink);
 
 // Transcription toggle
 elements.toggleTranscriptionBtn.addEventListener('click', async () => {
-    await toggleTranscription();
+    await withButtonProtection(elements.toggleTranscriptionBtn, async () => {
+        await toggleTranscription();
+    });
 });
 
 // Chat controls
@@ -2316,6 +2743,10 @@ elements.chatInput.addEventListener('keydown', (e) => {
     }
 });
 elements.chatTranslateToggle.addEventListener('change', toggleChatTranslation);
+
+// Participants panel controls
+elements.toggleParticipantsBtn.addEventListener('click', toggleParticipants);
+elements.closeParticipantsBtn.addEventListener('click', closeParticipants);
 
 // Whiteboard controls
 elements.toggleWhiteboardBtn.addEventListener('click', () => whiteboardManager.toggle());

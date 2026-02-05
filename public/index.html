@@ -231,6 +231,10 @@
                     <span>Chat</span>
                     <span class="chat-badge" id="chatBadge" style="display: none;">0</span>
                 </button>
+                <button class="btn btn-participants" id="toggleParticipants" title="Participants">
+                    <i data-lucide="users"></i>
+                    <span>Participants</span>
+                </button>
                 <button class="btn btn-whiteboard" id="toggleWhiteboard" title="Toggle Whiteboard">
                     <i data-lucide="pencil-ruler"></i>
                     <span>Whiteboard</span>
@@ -294,6 +298,27 @@
                     <button class="btn-send" id="sendChatBtn" title="Send message">
                         <i data-lucide="send"></i>
                     </button>
+                </div>
+            </div>
+
+            <!-- Participants Panel -->
+            <div class="participants-panel" id="participantsPanel" style="display: none;">
+                <div class="participants-header">
+                    <div class="participants-header-left">
+                        <h3><i data-lucide="users"></i> Participants</h3>
+                        <span class="participants-count" id="participantsPanelCount">0</span>
+                    </div>
+                    <div class="participants-header-right">
+                        <button class="btn-close-panel" id="closeParticipantsBtn" title="Close">
+                            <i data-lucide="x"></i>
+                        </button>
+                    </div>
+                </div>
+                <div class="participants-list" id="participantsList">
+                    <div class="participants-empty">
+                        <i data-lucide="user-x"></i>
+                        <p>No participants yet</p>
+                    </div>
                 </div>
             </div>
 
