@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * AI Live Dubbing Platform - Backend BFF
  * 
@@ -5,39 +6,23 @@
  * It handles session creation, token generation, and OpenAI Realtime translation proxy.
  */
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
-const { OpenVidu } = require('openvidu-node-client');
-const WebSocket = require('ws');
+import cors from 'cors';
+import express from 'express';
+import path from 'path';
+import { OpenVidu } from 'openvidu-node-client';
+import WebSocket from 'ws';
+import { config, validateServerConfig } from './config';
+import { logger } from './logger';
 
 const app = express();
 
-// =============================================================================
-// Configuration
-// =============================================================================
-const OPENVIDU_URL = process.env.OPENVIDU_URL;
-const OPENVIDU_SECRET = process.env.OPENVIDU_SECRET;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const AZURE_SPEECH_KEY = process.env.AZURE_SPEECH_KEY;
-const AZURE_SPEECH_REGION = process.env.AZURE_SPEECH_REGION || 'eastus';
-const AZURE_TRANSLATOR_KEY = process.env.AZURE_TRANSLATOR_KEY || process.env.AZURE_SPEECH_KEY;
-const AZURE_TRANSLATOR_REGION = process.env.AZURE_TRANSLATOR_REGION || 'eastus';
-const PORT = process.env.PORT || 3000;
-const OPENAI_REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
-
 // Validate required environment variables
-if (!OPENVIDU_URL || !OPENVIDU_SECRET) {
-    console.error('ERROR: Missing required environment variables.');
-    console.error('Please ensure OPENVIDU_URL and OPENVIDU_SECRET are set in your .env file.');
-    process.exit(1);
-}
+validateServerConfig();
 
 // =============================================================================
 // OpenVidu Client Initialization
 // =============================================================================
-const openvidu = new OpenVidu(OPENVIDU_URL, OPENVIDU_SECRET);
+const openvidu = new OpenVidu(config.openvidu.url, config.openvidu.secret);
 
 // =============================================================================
 // Middleware
@@ -54,7 +39,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Request logging middleware
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    logger.info({ method: req.method, path: req.path }, 'Incoming request');
     next();
 });
 
@@ -75,7 +60,7 @@ app.get('/api/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         timestamp: new Date().toISOString(),
-        openviduUrl: OPENVIDU_URL 
+        openviduUrl: config.openvidu.url 
     });
 });
 
@@ -84,18 +69,18 @@ app.get('/api/health', (req, res) => {
  * Returns Azure Speech credentials for client-side transcription
  */
 app.get('/api/azure-speech-token', (req, res) => {
-    if (!AZURE_SPEECH_KEY) {
-        console.error('[Azure Speech] AZURE_SPEECH_KEY not configured');
+    if (!config.azure.speechKey) {
+        logger.error('AZURE_SPEECH_KEY not configured');
         return res.status(500).json({ 
             error: 'Azure Speech not configured',
             details: 'AZURE_SPEECH_KEY environment variable is not set'
         });
     }
     
-    console.log(`[Azure Speech] Providing credentials (region: ${AZURE_SPEECH_REGION})`);
+    logger.info({ region: config.azure.speechRegion }, 'Providing Azure Speech credentials');
     res.json({
-        token: AZURE_SPEECH_KEY,
-        region: AZURE_SPEECH_REGION
+        token: config.azure.speechKey,
+        region: config.azure.speechRegion
     });
 });
 
@@ -113,8 +98,8 @@ app.post('/api/translate', async (req, res) => {
         });
     }
     
-    if (!AZURE_TRANSLATOR_KEY) {
-        console.error('[Azure Translator] AZURE_TRANSLATOR_KEY not configured');
+    if (!config.azure.translatorKey) {
+        logger.error('AZURE_TRANSLATOR_KEY not configured');
         return res.status(500).json({ 
             error: 'Azure Translator not configured',
             details: 'AZURE_TRANSLATOR_KEY environment variable is not set'
@@ -128,8 +113,8 @@ app.post('/api/translate', async (req, res) => {
         const response = await fetch(url, {
             method: 'POST',
             headers: {
-                'Ocp-Apim-Subscription-Key': AZURE_TRANSLATOR_KEY,
-                'Ocp-Apim-Subscription-Region': AZURE_TRANSLATOR_REGION,
+                'Ocp-Apim-Subscription-Key': config.azure.translatorKey,
+                'Ocp-Apim-Subscription-Region': config.azure.translatorRegion,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify([{ text }])
@@ -137,7 +122,7 @@ app.post('/api/translate', async (req, res) => {
         
         if (!response.ok) {
             const errorText = await response.text();
-            console.error('[Azure Translator] API error:', errorText);
+            logger.error({ errorText }, 'Azure Translator API error');
             return res.status(500).json({ 
                 error: 'Translation failed',
                 details: errorText
@@ -147,11 +132,15 @@ app.post('/api/translate', async (req, res) => {
         const data = await response.json();
         const translatedText = data[0]?.translations[0]?.text || text;
         
-        console.log(`[Azure Translator] ${text.substring(0, 30)}... → ${translatedText.substring(0, 30)}... (${targetLanguage})`);
+        logger.info({
+            targetLanguage,
+            sourcePreview: text.substring(0, 30),
+            translatedPreview: translatedText.substring(0, 30),
+        }, 'Azure translation completed');
         res.json({ translatedText });
         
     } catch (error) {
-        console.error('[Azure Translator] Error:', error.message);
+        logger.error({ err: error }, 'Azure Translator request failed');
         res.status(500).json({ 
             error: 'Translation failed',
             details: error.message
@@ -178,7 +167,7 @@ app.post('/api/sessions', async (req, res) => {
         // Check if session already exists in our cache
         const existingSession = activeSessions.get(sessionProperties.customSessionId);
         if (existingSession) {
-            console.log(`[Session] Returning existing session: ${existingSession.sessionId}`);
+            logger.info({ sessionId: existingSession.sessionId }, 'Returning existing session');
             return res.json({ sessionId: existingSession.sessionId });
         }
 
@@ -188,18 +177,18 @@ app.post('/api/sessions', async (req, res) => {
         // Cache the session for future token generation
         activeSessions.set(session.sessionId, session);
         
-        console.log(`[Session] Created new session: ${session.sessionId}`);
+        logger.info({ sessionId: session.sessionId }, 'Created new session');
         res.json({ sessionId: session.sessionId });
 
     } catch (error) {
         // Handle case where session already exists on server but not in our cache
         if (error.message && error.message.includes('409')) {
             const sessionId = req.body.sessionId || req.body.sessionProperties?.customSessionId;
-            console.log(`[Session] Session already exists on server: ${sessionId}`);
+            logger.info({ sessionId }, 'Session already exists on server');
             return res.json({ sessionId });
         }
         
-        console.error('[Session] Error creating session:', error.message);
+        logger.error({ err: error }, 'Failed to create session');
         res.status(500).json({ 
             error: 'Failed to create session', 
             details: error.message 
@@ -243,7 +232,7 @@ app.post('/api/sessions/:sessionId/connections', async (req, res) => {
         
         if (!session) {
             // Session might exist on server but not in our cache - create/fetch it
-            console.log(`[Connection] Session not in cache, creating: ${sessionId}`);
+            logger.info({ sessionId }, 'Session not in cache, creating');
             session = await openvidu.createSession({ customSessionId: sessionId });
             activeSessions.set(sessionId, session);
         }
@@ -252,7 +241,7 @@ app.post('/api/sessions/:sessionId/connections', async (req, res) => {
         try {
             const connection = await session.createConnection(finalConnectionProperties);
             
-            console.log(`[Connection] Token generated for session: ${sessionId}, nickname: ${nickname}`);
+            logger.info({ sessionId, nickname, connectionId: connection.connectionId }, 'Generated connection token');
             
             return res.json({ 
                 token: connection.token,
@@ -261,7 +250,7 @@ app.post('/api/sessions/:sessionId/connections', async (req, res) => {
         } catch (connectionError) {
             // If session was closed/destroyed, remove from cache and recreate
             if (connectionError.message && connectionError.message.includes('404')) {
-                console.log(`[Connection] Session ${sessionId} was closed, recreating...`);
+                logger.warn({ sessionId }, 'Session was closed, recreating');
                 activeSessions.delete(sessionId);
                 
                 // Create a fresh session with the same ID
@@ -271,7 +260,7 @@ app.post('/api/sessions/:sessionId/connections', async (req, res) => {
                 // Now create the connection
                 const connection = await session.createConnection(finalConnectionProperties);
                 
-                console.log(`[Connection] Token generated for recreated session: ${sessionId}, nickname: ${nickname}`);
+                logger.info({ sessionId, nickname, connectionId: connection.connectionId }, 'Generated token for recreated session');
                 
                 return res.json({ 
                     token: connection.token,
@@ -282,7 +271,7 @@ app.post('/api/sessions/:sessionId/connections', async (req, res) => {
         }
 
     } catch (error) {
-        console.error('[Connection] Error generating token:', error.message);
+        logger.error({ err: error }, 'Failed to generate connection token');
         
         res.status(500).json({ 
             error: 'Failed to generate connection token', 
@@ -320,7 +309,7 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[Session Info] Error:', error.message);
+        logger.error({ err: error }, 'Failed to fetch session info');
         res.status(500).json({ error: 'Failed to fetch session info' });
     }
 });
@@ -368,27 +357,28 @@ class InterpreterSession {
         this.sessionId = sessionId;
         this.openaiWs = null;
         this.isConfigured = false;
+        this.logger = logger.child({ scope: 'interpreter', sessionId });
         
-        console.log(`[Interpreter ${sessionId}] Creating session: ${sourceLanguage} → ${targetLanguage}`);
+        this.logger.info({ sourceLanguage, targetLanguage }, 'Creating interpreter session');
         this.connectToOpenAI();
     }
 
     connectToOpenAI() {
-        if (!OPENAI_API_KEY || OPENAI_API_KEY === 'sk-your-openai-api-key-here') {
-            console.error(`[Interpreter ${this.sessionId}] ERROR: OPENAI_API_KEY not configured`);
+        if (!config.openai.apiKey || config.openai.apiKey === 'sk-your-openai-api-key-here') {
+            this.logger.error('OPENAI_API_KEY not configured');
             this.sendToClient({ type: 'error', message: 'OpenAI API key not configured on server' });
             return;
         }
 
-        this.openaiWs = new WebSocket(OPENAI_REALTIME_URL, {
+        this.openaiWs = new WebSocket(config.openai.realtimeUrl, {
             headers: {
-                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                'Authorization': `Bearer ${config.openai.apiKey}`,
                 'OpenAI-Beta': 'realtime=v1'
             }
         });
 
         this.openaiWs.on('open', () => {
-            console.log(`[Interpreter ${this.sessionId}] Connected to OpenAI Realtime`);
+            this.logger.info('Connected to OpenAI Realtime');
             this.sendToClient({ type: 'connected' });
         });
 
@@ -397,12 +387,12 @@ class InterpreterSession {
         });
 
         this.openaiWs.on('error', (error) => {
-            console.error(`[Interpreter ${this.sessionId}] OpenAI WebSocket error:`, error.message);
+            this.logger.error({ err: error }, 'OpenAI WebSocket error');
             this.sendToClient({ type: 'error', message: 'OpenAI connection error' });
         });
 
         this.openaiWs.on('close', () => {
-            console.log(`[Interpreter ${this.sessionId}] OpenAI WebSocket closed`);
+            this.logger.info('OpenAI WebSocket closed');
             this.openaiWs = null;
         });
     }
@@ -413,7 +403,7 @@ class InterpreterSession {
         this.isConfigured = true;
         const prompt = generateInterpreterPrompt(this.sourceLanguage, this.targetLanguage);
         
-        console.log(`[Interpreter ${this.sessionId}] Configuring session...`);
+        this.logger.info('Configuring interpreter session');
 
         const sessionConfig = {
             type: 'session.update',
@@ -445,27 +435,27 @@ class InterpreterSession {
     handleOpenAIMessage(data) {
         switch (data.type) {
             case 'session.created':
-                console.log(`[Interpreter ${this.sessionId}] Session created`);
+                this.logger.info('OpenAI session created');
                 this.configureSession();
                 break;
 
             case 'session.updated':
-                console.log(`[Interpreter ${this.sessionId}] Session configured`);
+                this.logger.info('OpenAI session configured');
                 this.sendToClient({ type: 'ready' });
                 break;
 
             case 'input_audio_buffer.speech_started':
-                console.log(`[Interpreter ${this.sessionId}] Speech detected`);
+                this.logger.debug('Speech detected');
                 this.sendToClient({ type: 'speech_started' });
                 break;
 
             case 'input_audio_buffer.speech_stopped':
-                console.log(`[Interpreter ${this.sessionId}] Speech ended`);
+                this.logger.debug('Speech ended');
                 this.sendToClient({ type: 'speech_stopped' });
                 break;
 
             case 'conversation.item.input_audio_transcription.completed':
-                console.log(`[Interpreter ${this.sessionId}] User said: ${data.transcript}`);
+                this.logger.info({ transcript: data.transcript }, 'Input transcription completed');
                 this.sendToClient({ type: 'transcript_input', text: data.transcript });
                 break;
 
@@ -484,7 +474,7 @@ class InterpreterSession {
                 break;
 
             case 'error':
-                console.error(`[Interpreter ${this.sessionId}] OpenAI Error:`, data.error);
+                this.logger.error({ error: data.error }, 'OpenAI error');
                 this.sendToClient({ type: 'error', message: data.error?.message || 'Unknown error' });
                 break;
         }
@@ -515,10 +505,10 @@ class InterpreterSession {
                     break;
 
                 default:
-                    console.log(`[Interpreter ${this.sessionId}] Unknown message type:`, data.type);
+                    this.logger.warn({ type: data.type }, 'Unknown client message type');
             }
         } catch (error) {
-            console.error(`[Interpreter ${this.sessionId}] Error parsing message:`, error);
+            this.logger.error({ err: error }, 'Error parsing client message');
         }
     }
 
@@ -529,7 +519,7 @@ class InterpreterSession {
     }
 
     close() {
-        console.log(`[Interpreter ${this.sessionId}] Closing session`);
+        this.logger.info('Closing interpreter session');
         if (this.openaiWs) {
             this.openaiWs.close();
             this.openaiWs = null;
@@ -546,6 +536,7 @@ let sessionCounter = 0;
  */
 function setupInterpreterWebSocket(server) {
     const wss = new WebSocket.Server({ server, path: '/ws/interpret' });
+    const wsLogger = logger.child({ scope: 'websocket' });
 
     wss.on('connection', (ws, req) => {
         // Parse query parameters for language configuration
@@ -554,7 +545,7 @@ function setupInterpreterWebSocket(server) {
         const targetLanguage = url.searchParams.get('target') || 'Spanish';
         const sessionId = `interpreter-${++sessionCounter}`;
 
-        console.log(`[WebSocket] New interpreter connection: ${sessionId}`);
+        wsLogger.info({ sessionId, sourceLanguage, targetLanguage }, 'New interpreter connection');
 
         const session = new InterpreterSession(ws, sourceLanguage, targetLanguage, sessionId);
         interpreterSessions.set(sessionId, session);
@@ -564,17 +555,17 @@ function setupInterpreterWebSocket(server) {
         });
 
         ws.on('close', () => {
-            console.log(`[WebSocket] Interpreter disconnected: ${sessionId}`);
+            wsLogger.info({ sessionId }, 'Interpreter disconnected');
             session.close();
             interpreterSessions.delete(sessionId);
         });
 
         ws.on('error', (error) => {
-            console.error(`[WebSocket] Error for ${sessionId}:`, error.message);
+            wsLogger.error({ err: error, sessionId }, 'WebSocket error');
         });
     });
 
-    console.log('  WS   /ws/interpret                      - OpenAI Realtime proxy');
+    logger.info({ path: '/ws/interpret' }, 'OpenAI Realtime proxy WebSocket enabled');
     return wss;
 }
 
@@ -588,31 +579,28 @@ app.get('*', (req, res) => {
 // =============================================================================
 // Server Startup
 // =============================================================================
-const server = app.listen(PORT, () => {
-    console.log('='.repeat(60));
-    console.log('AI Live Dubbing Platform - Backend Server');
-    console.log('='.repeat(60));
-    console.log(`Server running on: http://localhost:${PORT}`);
-    console.log(`OpenVidu Server:   ${OPENVIDU_URL}`);
-    console.log(`OpenAI API Key:    ${OPENAI_API_KEY ? '✓ Configured' : '✗ NOT SET'}`);
-    console.log('='.repeat(60));
-    console.log('Available endpoints:');
-    console.log('  GET  /api/health                        - Health check');
-    console.log('  POST /api/sessions                      - Create session');
-    console.log('  POST /api/sessions/:id/connections      - Get connection token');
-    console.log('  GET  /api/sessions/:id                  - Get session info');
+const server = app.listen(config.port, () => {
+    logger.info({
+        port: config.port,
+        openviduUrl: config.openvidu.url,
+        openaiConfigured: Boolean(config.openai.apiKey),
+        endpoints: [
+            'GET /api/health',
+            'POST /api/sessions',
+            'POST /api/sessions/:id/connections',
+            'GET /api/sessions/:id',
+        ],
+    }, 'Backend server started');
     
     // Setup WebSocket for interpretation
     setupInterpreterWebSocket(server);
-    
-    console.log('='.repeat(60));
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-    console.log('SIGTERM received. Shutting down gracefully...');
+    logger.info('SIGTERM received. Shutting down gracefully');
     server.close(() => {
-        console.log('Server closed.');
+        logger.info('Server closed');
         process.exit(0);
     });
 });

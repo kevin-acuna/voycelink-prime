@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * OpenVidu Client Module
  * 
