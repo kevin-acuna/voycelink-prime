@@ -330,6 +330,18 @@ function getBootstrapSessionFromRequest(req) {
     }
 }
 
+function isTopLevelUserNavigation(req) {
+    const secFetchMode = req.headers['sec-fetch-mode'];
+    const secFetchDest = req.headers['sec-fetch-dest'];
+    const secFetchUser = req.headers['sec-fetch-user'];
+
+    return (
+        secFetchMode === 'navigate' &&
+        secFetchDest === 'document' &&
+        secFetchUser === '?1'
+    );
+}
+
 function getRequestedRoomIdForRequest(req) {
     const candidateRoomIds = [
         req.params?.sessionId,
@@ -409,6 +421,7 @@ function resolveBootstrapSession(req, decodedToken) {
             ? req.query.room
             : null;
     const ownedRooms = getOwnedRoomsFromRequest(req);
+    const bootstrapSession = getBootstrapSessionFromRequest(req);
 
     if (requestedRoomId) {
         const inviteSession = getInviteSessionFromRequest(req);
@@ -434,10 +447,48 @@ function resolveBootstrapSession(req, decodedToken) {
         };
     }
 
+    if (
+        !isTopLevelUserNavigation(req) &&
+        decodedToken?.role === Role.HOST &&
+        typeof decodedToken?.roomId === 'string' &&
+        ROOM_ID_PATTERN.test(decodedToken.roomId)
+    ) {
+        return {
+            role: Role.HOST,
+            roomId: decodedToken.roomId,
+        };
+    }
+
+    if (
+        !isTopLevelUserNavigation(req) &&
+        bootstrapSession?.role === Role.HOST &&
+        typeof bootstrapSession?.roomId === 'string' &&
+        ROOM_ID_PATTERN.test(bootstrapSession.roomId)
+    ) {
+        return {
+            role: Role.HOST,
+            roomId: bootstrapSession.roomId,
+        };
+    }
+
     return {
         role: Role.HOST,
         roomId: generateRoomId(),
     };
+}
+
+function isPrimaryDocumentNavigation(req) {
+    const mode = req.headers['sec-fetch-mode'];
+    const dest = req.headers['sec-fetch-dest'];
+    const user = req.headers['sec-fetch-user'];
+
+    // Browsers on real top-level navigations usually send navigate/document.
+    // We accept missing headers as a fallback for clients that don't set them.
+    if (!mode && !dest && !user) {
+        return true;
+    }
+
+    return mode === 'navigate' && dest === 'document';
 }
 
 function validateRoomBinding(req, res, sessionId) {
@@ -1697,9 +1748,24 @@ app.get('*', (req, res) => {
     const acceptHeader = req.headers.accept || '';
     const isDocumentRequest = acceptHeader.includes('text/html');
     const hasFileExtension = path.extname(req.path) !== '';
+    const hasExplicitRoom = typeof req.query.room === 'string' && ROOM_ID_PATTERN.test(req.query.room);
 
     if (!isDocumentRequest || hasFileExtension) {
         return res.status(404).end();
+    }
+
+    if (!hasExplicitRoom && !isPrimaryDocumentNavigation(req)) {
+        logger.info(
+            {
+                path: req.path,
+                originalUrl: req.originalUrl,
+                mode: req.headers['sec-fetch-mode'],
+                dest: req.headers['sec-fetch-dest'],
+                user: req.headers['sec-fetch-user'],
+            },
+            'Serving frontend without mutating bootstrap cookies for non-primary navigation'
+        );
+        return res.sendFile(frontendDocumentPath);
     }
 
     let decodedToken = null;
@@ -1717,6 +1783,19 @@ app.get('*', (req, res) => {
     const authSession = createAccessSession(
         bootstrapSession.role,
         bootstrapSession.roomId
+    );
+
+    logger.info(
+        {
+            originalUrl: req.originalUrl,
+            requestedRoomId: hasExplicitRoom ? req.query.room : null,
+            resolvedRole: bootstrapSession.role,
+            resolvedRoomId: bootstrapSession.roomId,
+            mode: req.headers['sec-fetch-mode'],
+            dest: req.headers['sec-fetch-dest'],
+            user: req.headers['sec-fetch-user'],
+        },
+        'Issued bootstrap session'
     );
 
     issueBootstrapCookies(res, authSession);

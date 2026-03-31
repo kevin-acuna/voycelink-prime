@@ -653,18 +653,12 @@ async function enforceCurrentPermissions() {
  */
 function initializePage() {
     const roomId = getRoomIdFromUrl();
-    const bootstrapRoomId = appState.authRoomId;
     
     if (roomId) {
-        const effectiveRoomId = bootstrapRoomId || roomId;
-        if (bootstrapRoomId && roomId !== bootstrapRoomId) {
-            const newUrl = `${window.location.origin}${window.location.pathname}?room=${bootstrapRoomId}`;
-            window.history.replaceState({ roomId: bootstrapRoomId }, '', newUrl);
-        }
         elements.homeCard.style.display = 'none';
         elements.joinCard.style.display = 'block';
-        elements.sessionIdInput.value = effectiveRoomId;
-        elements.roomIdDisplay.textContent = effectiveRoomId;
+        elements.sessionIdInput.value = roomId;
+        elements.roomIdDisplay.textContent = roomId;
     } else {
         // No room - show create meeting button
         elements.homeCard.style.display = 'block';
@@ -675,6 +669,11 @@ function initializePage() {
 }
 
 function resolveBoundSessionId(sessionId) {
+    const roomIdFromUrl = getRoomIdFromUrl();
+    if (roomIdFromUrl) {
+        return roomIdFromUrl;
+    }
+
     if (appState.authRoomId && sessionId !== appState.authRoomId) {
         return appState.authRoomId;
     }
