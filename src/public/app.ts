@@ -744,6 +744,7 @@ window.voycelinkApiFetch = apiFetch;
 
 async function refreshCurrentPermissions(options = {}) {
     const { silent = false } = options;
+    const requestedRoomId = getRoomIdFromUrl() || appState.authRoomId;
 
     if (!appState.authRoomId && !getCookieValue(BOOTSTRAP_COOKIE_NAME)) {
         appState.currentPermissions = [];
@@ -760,6 +761,9 @@ async function refreshCurrentPermissions(options = {}) {
         if (appState.currentParticipantId) {
             permissionsUrl.searchParams.set('participantId', appState.currentParticipantId);
         }
+        if (requestedRoomId) {
+            permissionsUrl.searchParams.set('roomId', requestedRoomId);
+        }
 
         const response = await apiFetch(permissionsUrl.toString());
         if (!response.ok) {
@@ -771,6 +775,15 @@ async function refreshCurrentPermissions(options = {}) {
         }
 
         const authorization = await response.json();
+        if (
+            requestedRoomId &&
+            authorization.roomId &&
+            authorization.roomId !== requestedRoomId
+        ) {
+            throw new Error(
+                `Authenticated session is bound to ${authorization.roomId}, not ${requestedRoomId}`
+            );
+        }
         appState.authRole = authorization.role || appState.authRole;
         appState.authRoomId = authorization.roomId || appState.authRoomId;
         appState.sessionFeatures = authorization.session || appState.sessionFeatures;

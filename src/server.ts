@@ -428,6 +428,7 @@ function validateRoomBinding(req, res, sessionId) {
 }
 
 function authenticateRequest(req, res, next) {
+    const requestedRoomId = getRequestedRoomIdForRequest(req);
     const token = getAccessTokenFromRequest(req);
 
     if (!token) {
@@ -436,6 +437,20 @@ function authenticateRequest(req, res, next) {
             try {
                 const decodedRefresh = jwt.verify(refreshToken, config.auth.jwtSecret);
                 if (decodedRefresh && typeof decodedRefresh === 'object' && isRole(decodedRefresh.role)) {
+                    if (
+                        requestedRoomId &&
+                        decodedRefresh.roomId &&
+                        decodedRefresh.roomId !== requestedRoomId
+                    ) {
+                        logger.warn(
+                            {
+                                path: req.path,
+                                requestedRoomId,
+                                refreshRoomId: decodedRefresh.roomId,
+                            },
+                            'Ignoring refresh token bound to a different room'
+                        );
+                    } else {
                     const authSession = createAccessSession(decodedRefresh.role, decodedRefresh.roomId ?? null);
                     issueBootstrapCookies(res, authSession);
                     req.auth = {
@@ -443,6 +458,7 @@ function authenticateRequest(req, res, next) {
                         roomId: decodedRefresh.roomId ?? null,
                     };
                     return next();
+                    }
                 }
             } catch (error) {
                 logger.warn({ err: error, path: req.path }, 'Invalid refresh token');
@@ -468,6 +484,25 @@ function authenticateRequest(req, res, next) {
             });
         }
 
+        if (requestedRoomId && decoded.roomId && decoded.roomId !== requestedRoomId) {
+            logger.warn(
+                {
+                    path: req.path,
+                    requestedRoomId,
+                    tokenRoomId: decoded.roomId,
+                },
+                'Ignoring access token bound to a different room'
+            );
+            if (tryRestoreOwnerAuthentication(req, res)) {
+                return next();
+            }
+
+            return res.status(401).json({
+                error: 'Invalid authorization token',
+                details: `Authenticated session is bound to ${decoded.roomId}, not ${requestedRoomId}`,
+            });
+        }
+
         req.auth = decoded;
         next();
     } catch (error) {
@@ -476,6 +511,20 @@ function authenticateRequest(req, res, next) {
             try {
                 const decodedRefresh = jwt.verify(refreshToken, config.auth.jwtSecret);
                 if (decodedRefresh && typeof decodedRefresh === 'object' && isRole(decodedRefresh.role)) {
+                    if (
+                        requestedRoomId &&
+                        decodedRefresh.roomId &&
+                        decodedRefresh.roomId !== requestedRoomId
+                    ) {
+                        logger.warn(
+                            {
+                                path: req.path,
+                                requestedRoomId,
+                                refreshRoomId: decodedRefresh.roomId,
+                            },
+                            'Ignoring refresh token bound to a different room after access token failure'
+                        );
+                    } else {
                     const authSession = createAccessSession(decodedRefresh.role, decodedRefresh.roomId ?? null);
                     issueBootstrapCookies(res, authSession);
                     req.auth = {
@@ -483,6 +532,7 @@ function authenticateRequest(req, res, next) {
                         roomId: decodedRefresh.roomId ?? null,
                     };
                     return next();
+                    }
                 }
             } catch (refreshError) {
                 logger.warn({ err: refreshError, path: req.path }, 'Invalid refresh token after access token failure');
