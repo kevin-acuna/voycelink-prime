@@ -16,6 +16,7 @@ import { canPerform, getEffectivePermissions } from './authz';
 import { Permission } from './authz/permissions';
 import { Role, isRole } from './authz/roles';
 import { config, validateServerConfig } from './config';
+import { verifyCosmosConnection } from './infrastructure/cosmos-client';
 import { logger } from './logger';
 
 const app = express();
@@ -308,8 +309,34 @@ app.get('/api/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         timestamp: new Date().toISOString(),
-        openviduUrl: config.openvidu.url 
+        openviduUrl: config.openvidu.url,
+        cosmosDatabase: config.cosmos.databaseName,
+        cosmosContainers: [
+            config.cosmos.roomsContainerName,
+            config.cosmos.participantPermissionsContainerName,
+        ],
     });
+});
+
+app.get('/api/health/cosmos', async (req, res) => {
+    try {
+        const database = await verifyCosmosConnection();
+        res.json({
+            status: 'ok',
+            databaseId: database?.id ?? config.cosmos.databaseName,
+            containers: {
+                rooms: config.cosmos.roomsContainerName,
+                participantPermissions: config.cosmos.participantPermissionsContainerName,
+            },
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Cosmos DB health check failed');
+        res.status(500).json({
+            status: 'error',
+            error: 'Cosmos DB health check failed',
+            details: error.message,
+        });
+    }
 });
 
 app.use('/api', (req, res, next) => {

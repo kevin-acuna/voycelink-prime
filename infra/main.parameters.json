@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "projectName": {
+      "value": "voycelink"
+    },
+    "environmentName": {
+      "value": "dev"
+    },
+    "cosmosDatabaseName": {
+      "value": "voycelink"
+    },
+    "cosmosContainers": {
+      "value": [
+        {
+          "name": "rooms",
+          "partitionKeyPath": "/roomId"
+        },
+        {
+          "name": "participant-custom-permissions",
+          "partitionKeyPath": "/roomId"
+        }
+      ]
+    },
+    "tags": {
+      "value": {
+        "application": "voycelink-prime",
+        "environment": "dev"
+      }
+    }
+  }
+}

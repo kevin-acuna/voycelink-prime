@@ -24,12 +24,26 @@ export const config = {
     translatorKey: env.AZURE_TRANSLATOR_KEY || env.AZURE_SPEECH_KEY,
     translatorRegion: env.AZURE_TRANSLATOR_REGION || 'eastus',
   },
+  cosmos: {
+    connectionString: env.COSMOS_DB_CONNECTION_STRING,
+    databaseName: env.COSMOS_DB_DATABASE_NAME || 'voycelink',
+    roomsContainerName: env.COSMOS_DB_ROOMS_CONTAINER || 'rooms',
+    participantPermissionsContainerName:
+      env.COSMOS_DB_PARTICIPANT_PERMISSIONS_CONTAINER || 'participant-permissions',
+  },
 };
 
 export function validateServerConfig() {
-  if (!config.openvidu.url || !config.openvidu.secret || !config.auth.jwtSecret) {
+  if (
+    !config.openvidu.url ||
+    !config.openvidu.secret ||
+    !config.auth.jwtSecret ||
+    !config.cosmos.connectionString
+  ) {
     process.stderr.write('ERROR: Missing required environment variables.\n');
-    process.stderr.write('Please ensure OPENVIDU_URL, OPENVIDU_SECRET, and optionally AUTH_JWT_SECRET are set in your .env file.\n');
+    process.stderr.write(
+      'Please ensure OPENVIDU_URL, OPENVIDU_SECRET, COSMOS_DB_CONNECTION_STRING, and optionally AUTH_JWT_SECRET are set in your .env file.\n'
+    );
     process.exit(1);
   }
 }
