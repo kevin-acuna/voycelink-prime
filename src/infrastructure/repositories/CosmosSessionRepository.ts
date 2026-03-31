@@ -35,6 +35,14 @@ export class CosmosSessionRepository implements SessionRepository {
   }
 
   async delete(sessionId: string): Promise<void> {
-    await cosmos.containers.rooms.item(sessionId, sessionId).delete();
+    try {
+      await cosmos.containers.rooms.item(sessionId, sessionId).delete();
+    } catch (error) {
+      if (error?.code === 404) {
+        return;
+      }
+
+      throw error;
+    }
   }
 }

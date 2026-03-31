@@ -17,7 +17,9 @@ import { Permission } from './authz/permissions';
 import { Role, isRole } from './authz/roles';
 import { config, validateServerConfig } from './config';
 import { verifyCosmosConnection } from './infrastructure/cosmos-client';
+import { CosmosSessionRepository } from './infrastructure/repositories/CosmosSessionRepository';
 import { logger } from './logger';
+import { ParticipantId, Session as DomainSession } from './session/Session';
 
 const app = express();
 const projectRoot = process.cwd();
@@ -36,6 +38,7 @@ validateServerConfig();
 // OpenVidu Client Initialization
 // =============================================================================
 const openvidu = new OpenVidu(config.openvidu.url, config.openvidu.secret);
+const sessionRepository = new CosmosSessionRepository();
 
 // =============================================================================
 // Middleware
@@ -68,6 +71,8 @@ const AUTH_TOKEN_TTL_SECONDS = 15 * 60;
 const AUTH_COOKIE_NAME = 'voycelink_auth';
 const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
 const ROOM_ID_PATTERN = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
+const OPENVIDU_RETRY_ATTEMPTS = 3;
+const OPENVIDU_RETRY_DELAY_MS = 250;
 
 function generateRoomId() {
     const chars = 'abcdefghijklmnopqrstuvwxyz';
@@ -298,6 +303,134 @@ function getAuthorizationContextForRequest(req) {
     };
 }
 
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getErrorMessage(error) {
+    return error?.message || 'Unexpected error';
+}
+
+function getOpenViduStatusCode(error) {
+    const directStatus = error?.status || error?.statusCode || error?.response?.status;
+    if (typeof directStatus === 'number') {
+        return directStatus;
+    }
+
+    const message = getErrorMessage(error);
+    const match = message.match(/\b(4\d{2}|5\d{2})\b/);
+    return match ? Number(match[1]) : null;
+}
+
+function isRetryableOpenViduError(error) {
+    const statusCode = getOpenViduStatusCode(error);
+    if (statusCode === 408 || statusCode === 409 || statusCode === 429) {
+        return true;
+    }
+
+    if (statusCode && statusCode >= 500) {
+        return true;
+    }
+
+    const message = getErrorMessage(error).toLowerCase();
+    return (
+        message.includes('timeout') ||
+        message.includes('network') ||
+        message.includes('socket hang up') ||
+        message.includes('econnreset') ||
+        message.includes('temporarily unavailable')
+    );
+}
+
+async function withOpenViduRetry(operationName, handler) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= OPENVIDU_RETRY_ATTEMPTS; attempt += 1) {
+        try {
+            return await handler();
+        } catch (error) {
+            lastError = error;
+            const retryable = isRetryableOpenViduError(error);
+
+            logger.warn(
+                {
+                    err: error,
+                    operationName,
+                    attempt,
+                    retryable,
+                },
+                'OpenVidu operation failed'
+            );
+
+            if (!retryable || attempt === OPENVIDU_RETRY_ATTEMPTS) {
+                throw error;
+            }
+
+            await delay(OPENVIDU_RETRY_DELAY_MS * attempt);
+        }
+    }
+
+    throw lastError;
+}
+
+function sendOpenViduError(res, error, fallbackMessage) {
+    const statusCode = getOpenViduStatusCode(error);
+    const details = getErrorMessage(error);
+
+    if (statusCode === 404) {
+        return res.status(404).json({
+            error: 'Session not found',
+            details,
+        });
+    }
+
+    if (statusCode === 409) {
+        return res.status(409).json({
+            error: fallbackMessage,
+            details,
+        });
+    }
+
+    if (statusCode === 429) {
+        return res.status(429).json({
+            error: 'OpenVidu rate limit reached',
+            details,
+        });
+    }
+
+    if (statusCode && statusCode >= 400 && statusCode < 500) {
+        return res.status(statusCode).json({
+            error: fallbackMessage,
+            details,
+        });
+    }
+
+    return res.status(502).json({
+        error: fallbackMessage,
+        details,
+    });
+}
+
+async function fetchOpenViduSessionById(sessionId) {
+    await withOpenViduRetry('openvidu.fetch', () => openvidu.fetch());
+    return openvidu.activeSessions.find((candidate) => candidate.sessionId === sessionId) || null;
+}
+
+async function getCachedOrRemoteOpenViduSession(sessionId) {
+    const cachedSession = activeSessions.get(sessionId);
+    if (cachedSession) {
+        return cachedSession;
+    }
+
+    const remoteSession = await fetchOpenViduSessionById(sessionId);
+    if (!remoteSession) {
+        return null;
+    }
+
+    activeSessions.set(sessionId, remoteSession);
+    return remoteSession;
+}
+
 // =============================================================================
 // API Routes
 // =============================================================================
@@ -464,9 +597,14 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
         
         sessionProperties.customSessionId = resolvedSessionId;
 
-        // Check if session already exists in our cache
-        const existingSession = activeSessions.get(sessionProperties.customSessionId);
+        const storedSession = await sessionRepository.findById(resolvedSessionId);
+        const existingSession = await getCachedOrRemoteOpenViduSession(sessionProperties.customSessionId);
+
         if (existingSession) {
+            if (!storedSession) {
+                await sessionRepository.save(DomainSession.create(existingSession.sessionId));
+            }
+
             logger.info({ sessionId: existingSession.sessionId }, 'Returning existing session');
             const authSession = createAccessSession(req.auth.role, existingSession.sessionId);
             issueBootstrapCookies(res, authSession);
@@ -475,11 +613,13 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
             });
         }
 
-        // Create new session on Azure OpenVidu Server
-        const session = await openvidu.createSession(sessionProperties);
+        const session = await withOpenViduRetry(
+            'openvidu.createSession',
+            () => openvidu.createSession(sessionProperties)
+        );
         
-        // Cache the session for future token generation
         activeSessions.set(session.sessionId, session);
+        await sessionRepository.save(DomainSession.create(session.sessionId));
         
         logger.info({ sessionId: session.sessionId }, 'Created new session');
         const authSession = createAccessSession(req.auth.role, session.sessionId);
@@ -489,12 +629,13 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
         });
 
     } catch (error) {
-        // Handle case where session already exists on server but not in our cache
         if (error.message && error.message.includes('409')) {
             const sessionId =
                 req.body.sessionId ||
                 req.body.sessionProperties?.customSessionId ||
                 req.auth.roomId;
+
+            await sessionRepository.save(DomainSession.create(sessionId));
             logger.info({ sessionId }, 'Session already exists on server');
             const authSession = createAccessSession(req.auth.role, sessionId);
             issueBootstrapCookies(res, authSession);
@@ -504,10 +645,7 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
         }
         
         logger.error({ err: error }, 'Failed to create session');
-        res.status(500).json({ 
-            error: 'Failed to create session', 
-            details: error.message 
-        });
+        return sendOpenViduError(res, error, 'Failed to create session');
     }
 });
 
@@ -546,26 +684,31 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
             ...connectionProperties
         };
 
-        // Get or create the session
-        let session = activeSessions.get(sessionId);
-        
-        if (!session) {
-            await openvidu.fetch();
-            session = openvidu.activeSessions.find((candidate) => candidate.sessionId === sessionId);
+        const storedSession = await sessionRepository.findById(sessionId);
+        if (!storedSession) {
+            return res.status(404).json({
+                error: 'Session not found',
+                details: `Session ${sessionId} is not registered in the repository`,
+            });
+        }
 
+        try {
+            const session = await getCachedOrRemoteOpenViduSession(sessionId);
             if (!session) {
+                await sessionRepository.delete(sessionId);
                 return res.status(404).json({
                     error: 'Session not found',
                     details: `Session ${sessionId} does not exist`,
                 });
             }
 
-            activeSessions.set(sessionId, session);
-        }
+            const connection = await withOpenViduRetry(
+                'openvidu.createConnection',
+                () => session.createConnection(finalConnectionProperties)
+            );
 
-        // Try to generate connection token
-        try {
-            const connection = await session.createConnection(finalConnectionProperties);
+            storedSession.addParticipant(new ParticipantId(connection.connectionId));
+            await sessionRepository.save(storedSession);
             
             logger.info({ sessionId, nickname, connectionId: connection.connectionId }, 'Generated connection token');
             const authSession = createAccessSession(req.auth.role, sessionId);
@@ -576,10 +719,10 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
                 connectionId: connection.connectionId,
             });
         } catch (connectionError) {
-            // If session was closed/destroyed, remove from cache and return not found
             if (connectionError.message && connectionError.message.includes('404')) {
                 logger.warn({ sessionId }, 'Session was closed before connection creation');
                 activeSessions.delete(sessionId);
+                await sessionRepository.delete(sessionId);
 
                 return res.status(404).json({
                     error: 'Session not found',
@@ -591,11 +734,7 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
 
     } catch (error) {
         logger.error({ err: error }, 'Failed to generate connection token');
-        
-        res.status(500).json({ 
-            error: 'Failed to generate connection token', 
-            details: error.message 
-        });
+        return sendOpenViduError(res, error, 'Failed to generate connection token');
     }
 });
 
@@ -611,19 +750,25 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
             return;
         }
         
-        // Fetch fresh session data from OpenVidu server
-        await openvidu.fetch();
-        
-        const sessions = openvidu.activeSessions;
-        const session = sessions.find(s => s.sessionId === sessionId);
+        const storedSession = await sessionRepository.findById(sessionId);
+        if (!storedSession) {
+            return res.status(404).json({ error: 'Session not found', details: `Session ${sessionId} is not registered in the repository` });
+        }
+
+        const session = await fetchOpenViduSessionById(sessionId);
         
         if (!session) {
-            return res.status(404).json({ error: 'Session not found' });
+            activeSessions.delete(sessionId);
+            await sessionRepository.delete(sessionId);
+            return res.status(404).json({ error: 'Session not found', details: `Session ${sessionId} is no longer active in OpenVidu` });
         }
+
+        activeSessions.set(sessionId, session);
 
         res.json({
             sessionId: session.sessionId,
             createdAt: session.createdAt,
+            persistedParticipants: storedSession.getParticipantIds(),
             connections: session.activeConnections.map(conn => ({
                 connectionId: conn.connectionId,
                 data: conn.data,
@@ -633,7 +778,7 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
 
     } catch (error) {
         logger.error({ err: error }, 'Failed to fetch session info');
-        res.status(500).json({ error: 'Failed to fetch session info' });
+        return sendOpenViduError(res, error, 'Failed to fetch session info');
     }
 });
 
