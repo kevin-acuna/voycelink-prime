@@ -2539,19 +2539,16 @@ function setupOpenViduCallbacks() {
             removeRemoteScreenShareElement(connectionId);
             logEvent('info', `Remote screen share ended from ${connectionId}`);
         } else {
-            // Regular camera stream: keep participant visible, just fall back to avatar
-            const wrapper = document.getElementById(`video-${connectionId}`);
-            const avatar = document.getElementById(`avatar-${connectionId}`);
-            if (wrapper) {
-                wrapper.classList.add('camera-off');
-            }
-            if (avatar) {
-                avatar.classList.add('visible');
-            }
+            const hadParticipant = participantsData.has(connectionId);
+            removeRemoteVideoElement(connectionId);
+            removeParticipantFromPanel(connectionId);
             cleanupRemoteSpeakingDetection(connectionId);
             updateParticipantCount();
             updateAudioTracksDebug();
             updateInterpreterButtonState();
+            if (hadParticipant) {
+                playLeaveSound();
+            }
             
             // Update transcription button state
             updateTranscriptionButtonState();
@@ -2594,8 +2591,11 @@ function setupOpenViduCallbacks() {
         const connectionData = parseOpenViduConnectionData(event.connection);
         removeRemoteVideoElement(connectionId);
         if (!connectionData.isScreenShare) {
+            const hadParticipant = participantsData.has(connectionId);
             removeParticipantFromPanel(connectionId);
-            playLeaveSound();
+            if (hadParticipant) {
+                playLeaveSound();
+            }
         }
         updateParticipantCount();
         updateAudioTracksDebug();
