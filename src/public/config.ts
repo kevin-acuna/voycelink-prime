@@ -17,6 +17,7 @@ const CONFIG = {
         HEALTH: '/api/health',
         MY_PERMISSIONS: '/api/me/permissions',
         SESSIONS: '/api/sessions',
+        SESSION_INVITE_LINK: (sessionId) => `/api/sessions/${sessionId}/invite-link`,
         CONNECTIONS: (sessionId) => `/api/sessions/${sessionId}/connections`,
         PARTICIPANT_PERMISSIONS: (sessionId, participantId) =>
             `/api/sessions/${sessionId}/participants/${participantId}/permissions`

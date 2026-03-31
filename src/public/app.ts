@@ -337,13 +337,34 @@ function getMeetingUrl() {
     return `${window.location.origin}${window.location.pathname}?room=${appState.sessionId}`;
 }
 
+async function getInviteMeetingUrl() {
+    if (!appState.sessionId) {
+        return getMeetingUrl();
+    }
+
+    if (!canCreateMeetings() || appState.authRole !== 'host') {
+        return getMeetingUrl();
+    }
+
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_INVITE_LINK(appState.sessionId)}`
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to generate invite link');
+    }
+
+    const payload = await response.json();
+    return payload.inviteUrl || getMeetingUrl();
+}
+
 /**
  * Copy the meeting link to clipboard
  */
 async function copyMeetingLink() {
-    const url = getMeetingUrl();
-    
     try {
+        const url = await getInviteMeetingUrl();
         await navigator.clipboard.writeText(url);
         
         // Visual feedback
@@ -362,6 +383,7 @@ async function copyMeetingLink() {
         
     } catch (err) {
         console.error('Failed to copy link:', err);
+        showNotification(err.message || 'Failed to copy meeting link.', 'error');
     }
 }
 

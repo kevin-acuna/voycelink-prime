@@ -69,6 +69,7 @@ app.use((req, res, next) => {
 const activeSessions = new Map();
 const AUTH_TOKEN_TTL_SECONDS = 15 * 60;
 const REFRESH_TOKEN_TTL_SECONDS = 12 * 60 * 60;
+const INVITE_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const OWNER_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const AUTH_COOKIE_NAME = 'voycelink_auth';
 const AUTH_REFRESH_COOKIE_NAME = 'voycelink_auth_refresh';
@@ -168,6 +169,12 @@ function signRefreshToken(payload) {
     });
 }
 
+function signInviteToken(payload) {
+    return jwt.sign(payload, config.auth.jwtSecret, {
+        expiresIn: INVITE_TOKEN_TTL_SECONDS,
+    });
+}
+
 function signOwnedRoomsToken(ownedRoomIds) {
     return jwt.sign(
         { ownedRoomIds },
@@ -242,6 +249,42 @@ function getOwnedRoomsFromRequest(req) {
 function getRefreshTokenFromRequest(req) {
     const cookies = parseCookies(req);
     return cookies[AUTH_REFRESH_COOKIE_NAME] || null;
+}
+
+function getInviteTokenFromRequest(req) {
+    return typeof req.query?.invite === 'string' ? req.query.invite : null;
+}
+
+function getInviteSessionFromRequest(req) {
+    const inviteToken = getInviteTokenFromRequest(req);
+    const requestedRoomId =
+        typeof req.query.room === 'string' && ROOM_ID_PATTERN.test(req.query.room)
+            ? req.query.room
+            : null;
+
+    if (!inviteToken || !requestedRoomId) {
+        return null;
+    }
+
+    try {
+        const decoded = jwt.verify(inviteToken, config.auth.jwtSecret);
+        if (
+            !decoded ||
+            typeof decoded !== 'object' ||
+            decoded.role !== Role.PARTICIPANT ||
+            decoded.roomId !== requestedRoomId
+        ) {
+            return null;
+        }
+
+        return {
+            role: Role.PARTICIPANT,
+            roomId: requestedRoomId,
+        };
+    } catch (error) {
+        logger.warn({ err: error, roomId: requestedRoomId }, 'Ignoring invalid invite token');
+        return null;
+    }
 }
 
 function issueOwnedRoomsCookie(res, ownedRooms) {
@@ -333,6 +376,7 @@ function resolveBootstrapSession(req, decodedToken) {
     const ownedRooms = getOwnedRoomsFromRequest(req);
 
     if (requestedRoomId) {
+        const inviteSession = getInviteSessionFromRequest(req);
         if (
             (decodedToken?.role === Role.HOST &&
                 typeof decodedToken?.roomId === 'string' &&
@@ -343,6 +387,10 @@ function resolveBootstrapSession(req, decodedToken) {
                 role: Role.HOST,
                 roomId: requestedRoomId,
             };
+        }
+
+        if (inviteSession) {
+            return inviteSession;
         }
 
         return {
@@ -824,6 +872,33 @@ app.get('/api/me/permissions', requirePermission(Permission.JOIN_SESSION), async
         logger.error({ err: error }, 'Failed to resolve current permissions');
         res.status(500).json({
             error: 'Failed to resolve current permissions',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.get('/api/sessions/:sessionId/invite-link', requirePermission(Permission.CREATE_SESSION), async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const inviteToken = signInviteToken({
+            role: Role.PARTICIPANT,
+            roomId: sessionId,
+        });
+
+        res.json({
+            sessionId,
+            inviteToken,
+            inviteUrl: `${req.protocol}://${req.get('host')}/?room=${sessionId}&invite=${encodeURIComponent(inviteToken)}`,
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to generate invite link');
+        res.status(500).json({
+            error: 'Failed to generate invite link',
             details: getErrorMessage(error),
         });
     }
