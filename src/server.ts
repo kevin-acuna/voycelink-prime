@@ -45,7 +45,7 @@ const sessionRepository = new CosmosSessionRepository();
 // =============================================================================
 app.use(cors({
     origin: '*', // In production, restrict this to your frontend domain
-    methods: ['GET', 'POST'],
+    methods: ['GET', 'POST', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
 }));
@@ -68,11 +68,16 @@ app.use((req, res, next) => {
 // =============================================================================
 const activeSessions = new Map();
 const AUTH_TOKEN_TTL_SECONDS = 15 * 60;
+const REFRESH_TOKEN_TTL_SECONDS = 12 * 60 * 60;
+const OWNER_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const AUTH_COOKIE_NAME = 'voycelink_auth';
+const AUTH_REFRESH_COOKIE_NAME = 'voycelink_auth_refresh';
 const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
+const OWNER_COOKIE_NAME = 'voycelink_owner_rooms';
 const ROOM_ID_PATTERN = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
 const OPENVIDU_RETRY_ATTEMPTS = 3;
 const OPENVIDU_RETRY_DELAY_MS = 250;
+const permissionSubscriptions = new Map();
 
 function generateRoomId() {
     const chars = 'abcdefghijklmnopqrstuvwxyz';
@@ -157,6 +162,20 @@ function signAccessToken(payload) {
     });
 }
 
+function signRefreshToken(payload) {
+    return jwt.sign(payload, config.auth.jwtSecret, {
+        expiresIn: REFRESH_TOKEN_TTL_SECONDS,
+    });
+}
+
+function signOwnedRoomsToken(ownedRoomIds) {
+    return jwt.sign(
+        { ownedRoomIds },
+        config.auth.jwtSecret,
+        { expiresIn: OWNER_TOKEN_TTL_SECONDS }
+    );
+}
+
 function createAccessSession(role, roomId = null) {
     const issuedAt = new Date();
     const expiresAt = new Date(issuedAt.getTime() + AUTH_TOKEN_TTL_SECONDS * 1000);
@@ -178,6 +197,14 @@ function issueBootstrapCookies(res, authSession) {
         maxAge: AUTH_TOKEN_TTL_SECONDS,
         secure: config.port !== 3000,
     });
+    appendResponseCookie(res, AUTH_REFRESH_COOKIE_NAME, signRefreshToken({
+        role: authSession.role,
+        roomId: authSession.roomId,
+    }), {
+        httpOnly: true,
+        maxAge: REFRESH_TOKEN_TTL_SECONDS,
+        secure: config.port !== 3000,
+    });
     appendResponseCookie(
         res,
         BOOTSTRAP_COOKIE_NAME,
@@ -193,27 +220,134 @@ function issueBootstrapCookies(res, authSession) {
     );
 }
 
+function getOwnedRoomsFromRequest(req) {
+    const cookies = parseCookies(req);
+    const ownerToken = cookies[OWNER_COOKIE_NAME];
+    if (!ownerToken) {
+        return new Set();
+    }
+
+    try {
+        const decoded = jwt.verify(ownerToken, config.auth.jwtSecret);
+        const ownedRoomIds = Array.isArray(decoded?.ownedRoomIds)
+            ? decoded.ownedRoomIds.filter((roomId) => typeof roomId === 'string' && ROOM_ID_PATTERN.test(roomId))
+            : [];
+        return new Set(ownedRoomIds);
+    } catch (error) {
+        logger.warn({ err: error }, 'Ignoring invalid owner rooms cookie');
+        return new Set();
+    }
+}
+
+function getRefreshTokenFromRequest(req) {
+    const cookies = parseCookies(req);
+    return cookies[AUTH_REFRESH_COOKIE_NAME] || null;
+}
+
+function issueOwnedRoomsCookie(res, ownedRooms) {
+    if (!ownedRooms || ownedRooms.size === 0) {
+        return;
+    }
+
+    appendResponseCookie(
+        res,
+        OWNER_COOKIE_NAME,
+        signOwnedRoomsToken(Array.from(ownedRooms)),
+        {
+            httpOnly: true,
+            maxAge: OWNER_TOKEN_TTL_SECONDS,
+            secure: config.port !== 3000,
+        }
+    );
+}
+
+function getBootstrapSessionFromRequest(req) {
+    const cookies = parseCookies(req);
+    const rawBootstrap = cookies[BOOTSTRAP_COOKIE_NAME];
+    if (!rawBootstrap) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(rawBootstrap);
+        if (!parsed || typeof parsed !== 'object') {
+            return null;
+        }
+
+        return {
+            role: isRole(parsed.role) ? parsed.role : null,
+            roomId:
+                typeof parsed.roomId === 'string' && ROOM_ID_PATTERN.test(parsed.roomId)
+                    ? parsed.roomId
+                    : null,
+        };
+    } catch (error) {
+        logger.warn({ err: error }, 'Ignoring invalid bootstrap session cookie');
+        return null;
+    }
+}
+
+function getRequestedRoomIdForRequest(req) {
+    const candidateRoomIds = [
+        req.params?.sessionId,
+        req.query?.sessionId,
+        req.query?.roomId,
+        req.query?.room,
+        req.body?.sessionId,
+        req.body?.sessionProperties?.customSessionId,
+        getBootstrapSessionFromRequest(req)?.roomId,
+    ];
+
+    return candidateRoomIds.find(
+        (roomId) => typeof roomId === 'string' && ROOM_ID_PATTERN.test(roomId)
+    ) || null;
+}
+
+function tryRestoreOwnerAuthentication(req, res) {
+    const requestedRoomId = getRequestedRoomIdForRequest(req);
+    if (!requestedRoomId) {
+        return false;
+    }
+
+    const ownedRooms = getOwnedRoomsFromRequest(req);
+    if (!ownedRooms.has(requestedRoomId)) {
+        return false;
+    }
+
+    const authSession = createAccessSession(Role.HOST, requestedRoomId);
+    issueBootstrapCookies(res, authSession);
+    issueOwnedRoomsCookie(res, ownedRooms);
+    req.auth = {
+        role: Role.HOST,
+        roomId: requestedRoomId,
+    };
+    logger.info({ path: req.path, roomId: requestedRoomId }, 'Restored host authentication from owner cookie');
+    return true;
+}
+
 function resolveBootstrapSession(req, decodedToken) {
     const requestedRoomId =
         typeof req.query.room === 'string' && ROOM_ID_PATTERN.test(req.query.room)
             ? req.query.room
             : null;
-    const tokenRoomId =
-        typeof decodedToken?.roomId === 'string' && ROOM_ID_PATTERN.test(decodedToken.roomId)
-            ? decodedToken.roomId
-            : null;
+    const ownedRooms = getOwnedRoomsFromRequest(req);
 
     if (requestedRoomId) {
+        if (
+            (decodedToken?.role === Role.HOST &&
+                typeof decodedToken?.roomId === 'string' &&
+                decodedToken.roomId === requestedRoomId) ||
+            ownedRooms.has(requestedRoomId)
+        ) {
+            return {
+                role: Role.HOST,
+                roomId: requestedRoomId,
+            };
+        }
+
         return {
             role: Role.GUEST,
             roomId: requestedRoomId,
-        };
-    }
-
-    if (decodedToken?.role === Role.HOST && tokenRoomId) {
-        return {
-            role: Role.HOST,
-            roomId: tokenRoomId,
         };
     }
 
@@ -249,6 +383,28 @@ function authenticateRequest(req, res, next) {
     const token = getAccessTokenFromRequest(req);
 
     if (!token) {
+        const refreshToken = getRefreshTokenFromRequest(req);
+        if (refreshToken) {
+            try {
+                const decodedRefresh = jwt.verify(refreshToken, config.auth.jwtSecret);
+                if (decodedRefresh && typeof decodedRefresh === 'object' && isRole(decodedRefresh.role)) {
+                    const authSession = createAccessSession(decodedRefresh.role, decodedRefresh.roomId ?? null);
+                    issueBootstrapCookies(res, authSession);
+                    req.auth = {
+                        role: decodedRefresh.role,
+                        roomId: decodedRefresh.roomId ?? null,
+                    };
+                    return next();
+                }
+            } catch (error) {
+                logger.warn({ err: error, path: req.path }, 'Invalid refresh token');
+            }
+        }
+
+        if (tryRestoreOwnerAuthentication(req, res)) {
+            return next();
+        }
+
         return res.status(401).json({
             error: 'Missing authorization token',
             details: 'Bearer token is required',
@@ -267,6 +423,28 @@ function authenticateRequest(req, res, next) {
         req.auth = decoded;
         next();
     } catch (error) {
+        const refreshToken = getRefreshTokenFromRequest(req);
+        if (refreshToken) {
+            try {
+                const decodedRefresh = jwt.verify(refreshToken, config.auth.jwtSecret);
+                if (decodedRefresh && typeof decodedRefresh === 'object' && isRole(decodedRefresh.role)) {
+                    const authSession = createAccessSession(decodedRefresh.role, decodedRefresh.roomId ?? null);
+                    issueBootstrapCookies(res, authSession);
+                    req.auth = {
+                        role: decodedRefresh.role,
+                        roomId: decodedRefresh.roomId ?? null,
+                    };
+                    return next();
+                }
+            } catch (refreshError) {
+                logger.warn({ err: refreshError, path: req.path }, 'Invalid refresh token after access token failure');
+            }
+        }
+
+        if (tryRestoreOwnerAuthentication(req, res)) {
+            return next();
+        }
+
         logger.warn({ err: error, path: req.path }, 'Invalid or expired access token');
         res.status(401).json({
             error: 'Invalid authorization token',
@@ -291,15 +469,43 @@ function requirePermission(permission) {
     };
 }
 
-function getAuthorizationContextForRequest(req) {
+function getParticipantIdFromRequest(req) {
+    if (typeof req.query.participantId === 'string' && req.query.participantId.trim()) {
+        return req.query.participantId.trim();
+    }
+
+    const participantIdHeader = req.headers['x-participant-id'];
+    if (typeof participantIdHeader === 'string' && participantIdHeader.trim()) {
+        return participantIdHeader.trim();
+    }
+
+    return null;
+}
+
+async function getAuthorizationContextForRequest(req) {
+    const participantId = getParticipantIdFromRequest(req);
+    let grants = {};
+    let sessionFlags = {
+        chatEnabled: true,
+        whiteboardEnabled: true,
+        subtitlesEnabled: true,
+        aiInterpretationEnabled: false,
+    };
+
+    if (req.auth?.roomId) {
+        const storedSession = await sessionRepository.findById(req.auth.roomId);
+        if (storedSession) {
+            sessionFlags = storedSession.getFeatureFlags();
+            if (participantId) {
+                grants = storedSession.getParticipantPermissions(new ParticipantId(participantId));
+            }
+        }
+    }
+
     return {
         role: req.auth.role,
-        session: {
-            chatEnabled: true,
-            whiteboardEnabled: true,
-            subtitlesEnabled: true,
-            aiInterpretationEnabled: true,
-        },
+        session: sessionFlags,
+        grants,
     };
 }
 
@@ -431,6 +637,106 @@ async function getCachedOrRemoteOpenViduSession(sessionId) {
     return remoteSession;
 }
 
+function canManageRequestedPermissions(role, permissionPatch) {
+    const needsParticipantMediaManagement =
+        permissionPatch.mediaEnabled !== undefined ||
+        permissionPatch.audioEnabled !== undefined ||
+        permissionPatch.videoEnabled !== undefined ||
+        permissionPatch.screenShareEnabled !== undefined;
+    const needsWhiteboardManagement = permissionPatch.whiteboardEnabled !== undefined;
+
+    if (
+        needsParticipantMediaManagement &&
+        !canPerform({ role }, Permission.MANAGE_PARTICIPANT_MEDIA).allowed
+    ) {
+        return {
+            allowed: false,
+            reason: 'Current user cannot manage participant media permissions',
+        };
+    }
+
+    if (
+        needsWhiteboardManagement &&
+        !canPerform({ role }, Permission.MANAGE_WHITEBOARD).allowed
+    ) {
+        return {
+            allowed: false,
+            reason: 'Current user cannot manage whiteboard permissions',
+        };
+    }
+
+    return {
+        allowed: true,
+        reason: 'Permission update is allowed',
+    };
+}
+
+function normalizePermissionPatch(payload) {
+    const permissionPatch = {};
+    if (payload.mediaEnabled !== undefined) {
+        if (typeof payload.mediaEnabled !== 'boolean') {
+            throw new Error('Field mediaEnabled must be a boolean');
+        }
+
+        permissionPatch.audioEnabled = payload.mediaEnabled;
+        permissionPatch.videoEnabled = payload.mediaEnabled;
+    }
+
+    const supportedFields = [
+        'audioEnabled',
+        'videoEnabled',
+        'screenShareEnabled',
+        'whiteboardEnabled',
+    ];
+
+    for (const field of supportedFields) {
+        if (payload[field] === undefined) {
+            continue;
+        }
+
+        if (typeof payload[field] !== 'boolean') {
+            throw new Error(`Field ${field} must be a boolean`);
+        }
+
+        permissionPatch[field] = payload[field];
+    }
+
+    return permissionPatch;
+}
+
+function addPermissionSubscription(roomId, ws) {
+    if (!permissionSubscriptions.has(roomId)) {
+        permissionSubscriptions.set(roomId, new Set());
+    }
+
+    permissionSubscriptions.get(roomId).add(ws);
+}
+
+function removePermissionSubscription(roomId, ws) {
+    const subscribers = permissionSubscriptions.get(roomId);
+    if (!subscribers) {
+        return;
+    }
+
+    subscribers.delete(ws);
+    if (subscribers.size === 0) {
+        permissionSubscriptions.delete(roomId);
+    }
+}
+
+function broadcastPermissionUpdate(roomId, message) {
+    const subscribers = permissionSubscriptions.get(roomId);
+    if (!subscribers) {
+        return;
+    }
+
+    for (const ws of subscribers) {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(message));
+        }
+    }
+}
+
 // =============================================================================
 // API Routes
 // =============================================================================
@@ -500,19 +806,91 @@ app.get('/api/azure-speech-token', requirePermission(Permission.JOIN_SESSION), (
     });
 });
 
-app.get('/api/me/permissions', requirePermission(Permission.JOIN_SESSION), (req, res) => {
-    const authorizationContext = getAuthorizationContextForRequest(req);
-    const permissions = getEffectivePermissions(authorizationContext);
-    const authSession = createAccessSession(req.auth.role, req.auth.roomId ?? null);
-    issueBootstrapCookies(res, authSession);
+app.get('/api/me/permissions', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const authorizationContext = await getAuthorizationContextForRequest(req);
+        const permissions = getEffectivePermissions(authorizationContext);
+        const authSession = createAccessSession(req.auth.role, req.auth.roomId ?? null);
+        issueBootstrapCookies(res, authSession);
 
-    res.json({
-        role: req.auth.role,
-        roomId: req.auth.roomId ?? null,
-        permissions,
-        session: authorizationContext.session,
-        grants: authorizationContext.grants ?? {},
-    });
+        res.json({
+            role: req.auth.role,
+            roomId: req.auth.roomId ?? null,
+            permissions,
+            session: authorizationContext.session,
+            grants: authorizationContext.grants ?? {},
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to resolve current permissions');
+        res.status(500).json({
+            error: 'Failed to resolve current permissions',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.patch('/api/sessions/:sessionId/participants/:participantId/permissions', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const { sessionId, participantId } = req.params;
+
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const permissionPatch = normalizePermissionPatch(req.body ?? {});
+        if (Object.keys(permissionPatch).length === 0) {
+            return res.status(400).json({
+                error: 'Invalid permission patch',
+                details: 'At least one supported permission flag must be provided',
+            });
+        }
+
+        const authorization = canManageRequestedPermissions(req.auth.role, permissionPatch);
+        if (!authorization.allowed) {
+            return res.status(403).json({
+                error: 'Forbidden',
+                details: authorization.reason,
+            });
+        }
+
+        const storedSession = await sessionRepository.findById(sessionId);
+        if (!storedSession) {
+            return res.status(404).json({
+                error: 'Session not found',
+                details: `Session ${sessionId} is not registered in the repository`,
+            });
+        }
+
+        if (!storedSession.getParticipantIds().includes(participantId)) {
+            return res.status(404).json({
+                error: 'Participant not found',
+                details: `Participant ${participantId} is not registered in session ${sessionId}`,
+            });
+        }
+
+        const participantRef = new ParticipantId(participantId);
+        storedSession.updateParticipantPermissions(participantRef, permissionPatch);
+        await sessionRepository.save(storedSession);
+
+        const participantPermissions = storedSession.getParticipantPermissions(participantRef);
+        broadcastPermissionUpdate(sessionId, {
+            type: 'participant_access_updated',
+            sessionId,
+            participantId,
+            permissions: participantPermissions,
+        });
+
+        return res.json({
+            participantId,
+            permissions: participantPermissions,
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to update participant permissions');
+        return res.status(400).json({
+            error: 'Failed to update participant permissions',
+            details: getErrorMessage(error),
+        });
+    }
 });
 
 /**
@@ -587,6 +965,19 @@ app.post('/api/translate', requirePermission(Permission.JOIN_SESSION), async (re
  * Response: { sessionId: string }
  */
 app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (req, res) => {
+    const ownedRooms = getOwnedRoomsFromRequest(req);
+    const roomConfiguration = req.body?.roomConfiguration || {};
+    const normalizedRoomConfiguration = {
+        subtitlesEnabled:
+            typeof roomConfiguration.subtitlesEnabled === 'boolean'
+                ? roomConfiguration.subtitlesEnabled
+                : true,
+        aiInterpretationEnabled:
+            typeof roomConfiguration.aiInterpretationEnabled === 'boolean'
+                ? roomConfiguration.aiInterpretationEnabled
+                : false,
+    };
+
     try {
         const { sessionId, sessionProperties = {} } = req.body;
         const resolvedSessionId = sessionId || req.auth.roomId;
@@ -601,15 +992,25 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
         const existingSession = await getCachedOrRemoteOpenViduSession(sessionProperties.customSessionId);
 
         if (existingSession) {
+            let sessionModel = storedSession;
             if (!storedSession) {
-                await sessionRepository.save(DomainSession.create(existingSession.sessionId));
+                sessionModel = DomainSession.create(existingSession.sessionId, normalizedRoomConfiguration);
+                await sessionRepository.save(sessionModel);
+            } else {
+                storedSession.updateFeatureFlags(normalizedRoomConfiguration);
+                await sessionRepository.save(storedSession);
             }
 
             logger.info({ sessionId: existingSession.sessionId }, 'Returning existing session');
             const authSession = createAccessSession(req.auth.role, existingSession.sessionId);
             issueBootstrapCookies(res, authSession);
+            if (req.auth.role === Role.HOST) {
+                ownedRooms.add(existingSession.sessionId);
+                issueOwnedRoomsCookie(res, ownedRooms);
+            }
             return res.json({
                 sessionId: existingSession.sessionId,
+                roomConfiguration: sessionModel?.getFeatureFlags?.() || normalizedRoomConfiguration,
             });
         }
 
@@ -619,13 +1020,19 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
         );
         
         activeSessions.set(session.sessionId, session);
-        await sessionRepository.save(DomainSession.create(session.sessionId));
+        const domainSession = DomainSession.create(session.sessionId, normalizedRoomConfiguration);
+        await sessionRepository.save(domainSession);
         
         logger.info({ sessionId: session.sessionId }, 'Created new session');
         const authSession = createAccessSession(req.auth.role, session.sessionId);
         issueBootstrapCookies(res, authSession);
+        if (req.auth.role === Role.HOST) {
+            ownedRooms.add(session.sessionId);
+            issueOwnedRoomsCookie(res, ownedRooms);
+        }
         res.json({
             sessionId: session.sessionId,
+            roomConfiguration: domainSession.getFeatureFlags(),
         });
 
     } catch (error) {
@@ -635,12 +1042,18 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
                 req.body.sessionProperties?.customSessionId ||
                 req.auth.roomId;
 
-            await sessionRepository.save(DomainSession.create(sessionId));
+            const domainSession = DomainSession.create(sessionId, normalizedRoomConfiguration);
+            await sessionRepository.save(domainSession);
             logger.info({ sessionId }, 'Session already exists on server');
             const authSession = createAccessSession(req.auth.role, sessionId);
             issueBootstrapCookies(res, authSession);
+            if (req.auth.role === Role.HOST) {
+                ownedRooms.add(sessionId);
+                issueOwnedRoomsCookie(res, ownedRooms);
+            }
             return res.json({
                 sessionId,
+                roomConfiguration: domainSession.getFeatureFlags(),
             });
         }
         
@@ -675,6 +1088,7 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
         const connectionData = JSON.stringify({
             nickname: nickname || `User_${Date.now()}`,
             preferredLanguage: preferredLanguage || 'en',
+            role: req.auth.role,
             joinedAt: new Date().toISOString()
         });
 
@@ -707,7 +1121,9 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
                 () => session.createConnection(finalConnectionProperties)
             );
 
-            storedSession.addParticipant(new ParticipantId(connection.connectionId));
+            const participantId = new ParticipantId(connection.connectionId);
+            storedSession.addParticipant(participantId);
+            storedSession.setParticipantRole(participantId, req.auth.role);
             await sessionRepository.save(storedSession);
             
             logger.info({ sessionId, nickname, connectionId: connection.connectionId }, 'Generated connection token');
@@ -768,7 +1184,9 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
         res.json({
             sessionId: session.sessionId,
             createdAt: session.createdAt,
+            roomConfiguration: storedSession.getFeatureFlags(),
             persistedParticipants: storedSession.getParticipantIds(),
+            participantRoles: storedSession.getParticipantRoles(),
             connections: session.activeConnections.map(conn => ({
                 connectionId: conn.connectionId,
                 data: conn.data,
@@ -996,8 +1414,8 @@ let sessionCounter = 0;
 /**
  * Set up WebSocket server for interpretation
  */
-function setupInterpreterWebSocket(server) {
-    const wss = new WebSocket.Server({ server, path: '/ws/interpret' });
+function setupInterpreterWebSocket() {
+    const wss = new WebSocket.Server({ noServer: true });
     const wsLogger = logger.child({ scope: 'websocket' });
 
     wss.on('connection', (ws, req) => {
@@ -1029,6 +1447,83 @@ function setupInterpreterWebSocket(server) {
 
     logger.info({ path: '/ws/interpret' }, 'OpenAI Realtime proxy WebSocket enabled');
     return wss;
+}
+
+function setupPermissionsWebSocket() {
+    const wss = new WebSocket.Server({ noServer: true });
+    const wsLogger = logger.child({ scope: 'permissions-websocket' });
+
+    wss.on('connection', (ws, req) => {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        const requestedRoomId = url.searchParams.get('roomId');
+        const participantId = url.searchParams.get('participantId');
+        const token = getAccessTokenFromRequest(req);
+        if (!token) {
+            wsLogger.warn({ requestedRoomId, participantId }, 'Permissions WebSocket missing auth token');
+            ws.close(4001, 'Missing authorization token');
+            return;
+        }
+
+        try {
+            const decoded = jwt.verify(token, config.auth.jwtSecret);
+            if (!decoded || typeof decoded !== 'object' || !isRole(decoded.role) || !decoded.roomId) {
+                wsLogger.warn({ requestedRoomId, participantId }, 'Permissions WebSocket rejected invalid token payload');
+                ws.close(4003, 'Invalid authorization token');
+                return;
+            }
+
+            const roomId = decoded.roomId;
+            if (requestedRoomId && requestedRoomId !== roomId) {
+                wsLogger.warn({ requestedRoomId, roomId, participantId }, 'Permissions WebSocket room mismatch');
+                ws.close(4003, 'Room mismatch');
+                return;
+            }
+
+            addPermissionSubscription(roomId, ws);
+            wsLogger.info({ roomId, role: decoded.role, participantId }, 'Permissions WebSocket connected');
+            ws.send(JSON.stringify({ type: 'connected', roomId, participantId }));
+
+            ws.on('close', () => {
+                removePermissionSubscription(roomId, ws);
+                wsLogger.info({ roomId, participantId }, 'Permissions WebSocket disconnected');
+            });
+
+            ws.on('error', (error) => {
+                wsLogger.error({ err: error, roomId, participantId }, 'Permissions WebSocket error');
+            });
+        } catch (error) {
+            wsLogger.warn({ err: error, requestedRoomId, participantId }, 'Rejected permissions WebSocket connection');
+            ws.close(4003, 'Invalid authorization token');
+        }
+    });
+
+    logger.info({ path: '/ws/permissions' }, 'Permissions WebSocket enabled');
+    return wss;
+}
+
+function setupWebSockets(server) {
+    const interpreterWss = setupInterpreterWebSocket();
+    const permissionsWss = setupPermissionsWebSocket();
+
+    server.on('upgrade', (req, socket, head) => {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+
+        if (url.pathname === '/ws/interpret') {
+            interpreterWss.handleUpgrade(req, socket, head, (ws) => {
+                interpreterWss.emit('connection', ws, req);
+            });
+            return;
+        }
+
+        if (url.pathname === '/ws/permissions') {
+            permissionsWss.handleUpgrade(req, socket, head, (ws) => {
+                permissionsWss.emit('connection', ws, req);
+            });
+            return;
+        }
+
+        socket.destroy();
+    });
 }
 
 // =============================================================================
@@ -1065,6 +1560,11 @@ app.get('*', (req, res) => {
     );
 
     issueBootstrapCookies(res, authSession);
+    if (bootstrapSession.role === Role.HOST && bootstrapSession.roomId) {
+        const ownedRooms = getOwnedRoomsFromRequest(req);
+        ownedRooms.add(bootstrapSession.roomId);
+        issueOwnedRoomsCookie(res, ownedRooms);
+    }
     res.sendFile(frontendDocumentPath);
 });
 
@@ -1092,8 +1592,7 @@ const server = app.listen(config.port, () => {
         'Available endpoints'
     );
     
-    // Setup WebSocket for interpretation
-    setupInterpreterWebSocket(server);
+    setupWebSockets(server);
 });
 
 // Graceful shutdown

@@ -42,6 +42,7 @@ class ChatManager {
         this.session = session;
         this.localNickname = localNickname;
         this.localLanguage = localLanguage;
+        this.localConnectionId = session?.connection?.connectionId || null;
         this.messages = [];
         this.unreadCount = 0;
         
@@ -116,6 +117,18 @@ class ChatManager {
             const senderLanguage = data.language;
             const messageId = data.id;
             const timestamp = new Date(data.timestamp);
+            const messageType = data.messageType || 'group';
+            const recipientConnectionId = data.recipientConnectionId || null;
+            const recipientNickname = data.recipientNickname || null;
+            const senderConnectionId = event.from?.connectionId || data.senderConnectionId || null;
+
+            if (messageType === 'direct') {
+                const isLocalSender = senderConnectionId === this.localConnectionId;
+                const isDirectRecipient = recipientConnectionId === this.localConnectionId;
+                if (!isLocalSender && !isDirectRecipient) {
+                    return;
+                }
+            }
             
             // Check if we already have this message (avoid duplicates)
             if (this.messages.some(m => m.id === messageId)) {
@@ -139,7 +152,10 @@ class ChatManager {
                 language: senderLanguage,
                 color: color,
                 timestamp: timestamp,
-                isLocal: senderNickname === this.localNickname
+                isLocal: senderNickname === this.localNickname,
+                messageType,
+                recipientConnectionId,
+                recipientNickname,
             };
             
             this.messages.push(message);
@@ -165,10 +181,16 @@ class ChatManager {
     /**
      * Send a chat message
      */
-    async sendMessage(text) {
+    async sendMessage(text, options = {}) {
         if (!this.session || !text.trim()) {
             return false;
         }
+
+        const {
+            messageType = 'group',
+            recipientConnectionId = null,
+            recipientNickname = null,
+        } = options;
         
         const messageId = this.generateId();
         const timestamp = new Date();
@@ -178,7 +200,11 @@ class ChatManager {
             nickname: this.localNickname,
             message: text.trim(),
             language: this.localLanguage,
-            timestamp: timestamp.toISOString()
+            timestamp: timestamp.toISOString(),
+            messageType,
+            recipientConnectionId,
+            recipientNickname,
+            senderConnectionId: this.localConnectionId,
         };
         
         // Add to local messages BEFORE sending signal (to prevent duplicate when signal comes back)
@@ -191,7 +217,10 @@ class ChatManager {
             language: this.localLanguage,
             color: color,
             timestamp: timestamp,
-            isLocal: true
+            isLocal: true,
+            messageType,
+            recipientConnectionId,
+            recipientNickname,
         };
         
         this.messages.push(localMessage);

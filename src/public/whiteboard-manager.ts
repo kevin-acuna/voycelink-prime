@@ -11,6 +11,8 @@ class WhiteboardManager {
         this.session = null;
         this.isOpen = false;
         this.isDrawing = false;
+        this.canManage = false;
+        this.canDraw = false;
         
         // Drawing settings
         this.currentColor = '#ffffff';
@@ -45,6 +47,13 @@ class WhiteboardManager {
         setTimeout(() => {
             this.requestSync();
         }, 500);
+    }
+
+    setAccess({ canManage = false, canDraw = false } = {}) {
+        this.canManage = canManage;
+        this.canDraw = canDraw;
+        this.updateToolbarAccess();
+        this.updateCanvasAccess();
     }
 
     /**
@@ -152,13 +161,84 @@ class WhiteboardManager {
         document.getElementById('toolClear')?.addEventListener('click', () => this.clearAll());
 
         // Close button
-        document.getElementById('closeWhiteboardBtn')?.addEventListener('click', () => this.close());
+        document.getElementById('closeWhiteboardBtn')?.addEventListener('click', () => {
+            if (!this.canManage) return;
+            this.close();
+        });
+
+        this.updateToolbarAccess();
+    }
+
+    updateToolbarAccess() {
+        const wrapper = document.getElementById('whiteboardWrapper');
+        const toolbar = wrapper?.querySelector('.whiteboard-toolbar');
+        const closeBtn = document.getElementById('closeWhiteboardBtn');
+        const interactiveControls = [
+            'toolPencil',
+            'toolRectangle',
+            'toolCircle',
+            'toolLine',
+            'toolText',
+            'toolEraser',
+            'toolSelect',
+            'toolUndo',
+            'toolRedo',
+            'toolClear',
+            'strokeWidth',
+        ];
+
+        document.querySelectorAll('.color-btn').forEach((btn) => {
+            btn.disabled = !this.canDraw;
+        });
+
+        interactiveControls.forEach((id) => {
+            const element = document.getElementById(id);
+            if (element) {
+                element.disabled = !this.canDraw;
+            }
+        });
+
+        if (toolbar) {
+            toolbar.classList.toggle('whiteboard-toolbar-readonly', !this.canDraw);
+        }
+
+        if (closeBtn) {
+            closeBtn.style.display = this.canManage ? '' : 'none';
+        }
+    }
+
+    updateCanvasAccess() {
+        if (!this.canvas) return;
+
+        if (!this.canDraw) {
+            this.canvas.isDrawingMode = false;
+            this.canvas.selection = false;
+            this.canvas.forEachObject((obj) => {
+                obj.selectable = false;
+                obj.evented = false;
+            });
+            this.canvas.discardActiveObject();
+            this.canvas.renderAll();
+            this.updateStatus('Viewing');
+            return;
+        }
+
+        this.canvas.forEachObject((obj) => {
+            obj.selectable = true;
+            obj.evented = true;
+        });
+        this.setTool(this.currentTool || 'pencil');
+        this.canvas.renderAll();
     }
 
     /**
      * Set active tool
      */
     setTool(tool) {
+        if (!this.canDraw) {
+            return;
+        }
+
         this.currentTool = tool;
         
         // Update UI - remove active from all tool buttons
@@ -228,6 +308,7 @@ class WhiteboardManager {
      * Handle click for text tool - add editable text
      */
     onTextClick(opt) {
+        if (!this.canDraw) return;
         if (this.currentTool !== 'text') return;
         
         const pointer = this.canvas.getPointer(opt.e);
@@ -291,6 +372,7 @@ class WhiteboardManager {
      * Handle mouse down for shape drawing
      */
     onShapeMouseDown(opt) {
+        if (!this.canDraw) return;
         if (!['rectangle', 'circle', 'line'].includes(this.currentTool)) return;
         
         this.isDrawingShape = true;
@@ -336,6 +418,7 @@ class WhiteboardManager {
      * Handle mouse move for shape drawing
      */
     onShapeMouseMove(opt) {
+        if (!this.canDraw) return;
         if (!this.isDrawingShape || !this.currentShape) return;
         
         const pointer = this.canvas.getPointer(opt.e);
@@ -374,6 +457,7 @@ class WhiteboardManager {
      * Handle mouse up for shape drawing
      */
     onShapeMouseUp(opt) {
+        if (!this.canDraw) return;
         if (!this.isDrawingShape || !this.currentShape) return;
         
         this.isDrawingShape = false;
@@ -458,6 +542,7 @@ class WhiteboardManager {
         if (!this.canvas || !stateJson) return;
         
         this.canvas.loadFromJSON(JSON.parse(stateJson), () => {
+            this.updateCanvasAccess();
             this.canvas.renderAll();
         });
     }
@@ -584,6 +669,9 @@ class WhiteboardManager {
                     this.resizeCanvas();
                     this.requestSync();
                 }
+
+                this.updateToolbarAccess();
+                this.updateCanvasAccess();
                 
                 if (typeof lucide !== 'undefined') {
                     lucide.createIcons();
@@ -661,9 +749,11 @@ class WhiteboardManager {
 
         fabric.util.enlivenObjects([data.object], (objects) => {
             objects.forEach(obj => {
-                obj.selectable = true; // Allow selecting/moving remote objects
+                obj.selectable = this.canDraw;
+                obj.evented = this.canDraw;
                 this.canvas.add(obj);
             });
+            this.updateCanvasAccess();
             this.canvas.renderAll();
         });
     }
@@ -684,6 +774,10 @@ class WhiteboardManager {
      * Open the whiteboard (embedded in video grid)
      */
     open() {
+        if (!this.canManage) {
+            return;
+        }
+
         const wrapper = document.getElementById('whiteboardWrapper');
         const videoGrid = document.getElementById('videoGrid');
         const btn = document.getElementById('toggleWhiteboard');
@@ -703,6 +797,9 @@ class WhiteboardManager {
                     // Canvas exists, just resize it
                     this.resizeCanvas();
                 }
+
+                this.updateToolbarAccess();
+                this.updateCanvasAccess();
                 
                 // Refresh lucide icons
                 if (typeof lucide !== 'undefined') {
@@ -722,6 +819,10 @@ class WhiteboardManager {
      * Close the whiteboard
      */
     close() {
+        if (!this.canManage) {
+            return;
+        }
+
         const wrapper = document.getElementById('whiteboardWrapper');
         const videoGrid = document.getElementById('videoGrid');
         const btn = document.getElementById('toggleWhiteboard');
@@ -755,6 +856,10 @@ class WhiteboardManager {
      * Toggle whiteboard panel
      */
     toggle() {
+        if (!this.canManage) {
+            return;
+        }
+
         if (this.isOpen) {
             this.close();
         } else {

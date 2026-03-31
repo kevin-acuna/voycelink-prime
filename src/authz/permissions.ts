@@ -6,6 +6,7 @@ export const Permission = {
   MANAGE_PARTICIPANT_MEDIA: 'manage_participant_media',
   GRANT_AUDIO: 'grant_audio',
   GRANT_VIDEO: 'grant_video',
+  SHARE_SCREEN: 'share_screen',
   PUBLISH_AUDIO: 'publish_audio',
   PUBLISH_VIDEO: 'publish_video',
   MANAGE_CHAT: 'manage_chat',

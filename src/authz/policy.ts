@@ -21,6 +21,15 @@ function isConferenceConfigurationPermission(permission: PermissionType): boolea
   return permission === Permission.UPDATE_ROOM_CONFIGURATION;
 }
 
+function isCustomGrantPermission(permission: PermissionType): boolean {
+  return (
+    permission === Permission.PUBLISH_AUDIO ||
+    permission === Permission.PUBLISH_VIDEO ||
+    permission === Permission.SHARE_SCREEN ||
+    permission === Permission.USE_WHITEBOARD
+  );
+}
+
 export function getEffectivePermissions(context: AuthorizationContext): PermissionType[] {
   return Object.values(Permission).filter((permission) => canPerform(context, permission).allowed);
 }
@@ -30,6 +39,42 @@ export function canPerform(
   permission: PermissionType
 ): AuthorizationResult {
   const { role, session, grants } = context;
+  const requiresParticipantGrant = role !== Role.HOST && role !== Role.CO_HOST;
+
+  if (permission === Permission.PUBLISH_AUDIO && grants?.audioEnabled) {
+    return {
+      allowed: true,
+      reason: 'audio publishing enabled by custom access grant',
+    };
+  }
+
+  if (permission === Permission.PUBLISH_VIDEO && grants?.videoEnabled) {
+    return {
+      allowed: true,
+      reason: 'video publishing enabled by custom access grant',
+    };
+  }
+
+  if (permission === Permission.SHARE_SCREEN && grants?.screenShareEnabled) {
+    return {
+      allowed: true,
+      reason: 'screen sharing enabled by custom access grant',
+    };
+  }
+
+  if (permission === Permission.USE_WHITEBOARD && session?.whiteboardEnabled === false) {
+    return {
+      allowed: false,
+      reason: 'whiteboard is not currently enabled for the session',
+    };
+  }
+
+  if (permission === Permission.USE_WHITEBOARD && grants?.whiteboardEnabled) {
+    return {
+      allowed: true,
+      reason: 'whiteboard access enabled by custom access grant',
+    };
+  }
 
   if (!hasBasePermission(role, permission)) {
     return {
@@ -38,17 +83,39 @@ export function canPerform(
     };
   }
 
-  if (permission === Permission.PUBLISH_AUDIO && role === Role.PARTICIPANT && !grants?.audioEnabled) {
+  if (
+    permission === Permission.PUBLISH_AUDIO &&
+    requiresParticipantGrant &&
+    isCustomGrantPermission(permission) &&
+    !grants?.audioEnabled
+  ) {
     return {
       allowed: false,
-      reason: 'participant audio must be enabled by the host or a co-host',
+      reason: 'audio publishing has not been enabled for this participant',
     };
   }
 
-  if (permission === Permission.PUBLISH_VIDEO && role === Role.PARTICIPANT && !grants?.videoEnabled) {
+  if (
+    permission === Permission.PUBLISH_VIDEO &&
+    requiresParticipantGrant &&
+    isCustomGrantPermission(permission) &&
+    !grants?.videoEnabled
+  ) {
     return {
       allowed: false,
-      reason: 'participant video must be enabled by the host or a co-host',
+      reason: 'video publishing has not been enabled for this participant',
+    };
+  }
+
+  if (
+    permission === Permission.SHARE_SCREEN &&
+    requiresParticipantGrant &&
+    isCustomGrantPermission(permission) &&
+    !grants?.screenShareEnabled
+  ) {
+    return {
+      allowed: false,
+      reason: 'screen sharing has not been enabled for this participant',
     };
   }
 
@@ -83,18 +150,11 @@ export function canPerform(
     }
   }
 
-  if (permission === Permission.USE_WHITEBOARD) {
-    if (session?.whiteboardEnabled === false) {
+  if (permission === Permission.USE_WHITEBOARD && requiresParticipantGrant) {
+    if (grants?.whiteboardEnabled === false) {
       return {
         allowed: false,
-        reason: 'whiteboard is not currently enabled for the session',
-      };
-    }
-
-    if (role === Role.PARTICIPANT && grants?.whiteboardEnabled === false) {
-      return {
-        allowed: false,
-        reason: 'whiteboard access is disabled for this participant',
+        reason: 'whiteboard access has not been enabled for this participant',
       };
     }
   }

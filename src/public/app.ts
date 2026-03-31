@@ -143,7 +143,14 @@ const appState = {
     authRole: null,
     authRoomId: null,
     authTokenExpiresAt: null,
+    sessionFeatures: {
+        chatEnabled: true,
+        whiteboardEnabled: true,
+        subtitlesEnabled: true,
+        aiInterpretationEnabled: false,
+    },
     currentPermissions: [],
+    currentParticipantId: null,
     isConnected: false,
     isAudioEnabled: true,
     isVideoEnabled: true,
@@ -207,6 +214,7 @@ const elements = {
     toggleChatBtn: document.getElementById('toggleChat'),
     chatPanel: document.getElementById('chatPanel'),
     chatMessages: document.getElementById('chatMessages'),
+    chatRecipientSelect: document.getElementById('chatRecipientSelect'),
     chatInput: document.getElementById('chatInput'),
     sendChatBtn: document.getElementById('sendChatBtn'),
     closeChatBtn: document.getElementById('closeChatBtn'),
@@ -253,10 +261,18 @@ const Permission = {
     END_SESSION: 'end_session',
     KICK_PARTICIPANT: 'kick_participant',
     MANAGE_PARTICIPANT_MEDIA: 'manage_participant_media',
+    SHARE_SCREEN: 'share_screen',
+    PUBLISH_AUDIO: 'publish_audio',
+    PUBLISH_VIDEO: 'publish_video',
     SEND_GROUP_CHAT_MESSAGE: 'send_group_chat_message',
+    SEND_HOST_DIRECT_MESSAGE: 'send_host_direct_message',
     MANAGE_WHITEBOARD: 'manage_whiteboard',
+    USE_WHITEBOARD: 'use_whiteboard',
     UPDATE_ROOM_CONFIGURATION: 'update_room_configuration'
 };
+let permissionsSocket = null;
+let permissionsSocketReconnectTimeoutId = null;
+let activeParticipantAccessMenuId = null;
 
 // =============================================================================
 // Room Link Functions
@@ -364,10 +380,6 @@ function getRoomIdFromUrl() {
     return null;
 }
 
-function getCurrentUserRole() {
-    return appState.authRole || 'guest';
-}
-
 function hasPermission(permission) {
     return appState.currentPermissions.includes(permission);
 }
@@ -388,8 +400,36 @@ function canSendGroupMessages() {
     return hasPermission(Permission.SEND_GROUP_CHAT_MESSAGE);
 }
 
+function canSendDirectMessages() {
+    return hasPermission(Permission.SEND_HOST_DIRECT_MESSAGE);
+}
+
+function canPublishAudio() {
+    return hasPermission(Permission.PUBLISH_AUDIO);
+}
+
+function canPublishVideo() {
+    return hasPermission(Permission.PUBLISH_VIDEO);
+}
+
+function canShareScreen() {
+    return hasPermission(Permission.SHARE_SCREEN);
+}
+
 function canManageWhiteboard() {
     return hasPermission(Permission.MANAGE_WHITEBOARD);
+}
+
+function canUseWhiteboard() {
+    return canManageWhiteboard() || hasPermission(Permission.USE_WHITEBOARD);
+}
+
+function canSendAnyChatMessages() {
+    return canSendGroupMessages() || canSendDirectMessages();
+}
+
+function canModerateChatRecipients() {
+    return appState.authRole === 'host' || appState.authRole === 'co_host';
 }
 
 function canManageConferenceUi() {
@@ -399,13 +439,20 @@ function canManageConferenceUi() {
     );
 }
 
+function isInterpreterFeatureEnabled() {
+    return appState.sessionFeatures.aiInterpretationEnabled !== false;
+}
+
+function isSubtitlesFeatureEnabled() {
+    return appState.sessionFeatures.subtitlesEnabled !== false;
+}
+
 function setElementVisibility(element, isVisible, displayMode = '') {
     if (!element) return;
     element.style.display = isVisible ? displayMode : 'none';
 }
 
 function applyPermissionBasedUi() {
-    const canManageConference = canManageConferenceUi();
     const canCreateMeeting = canCreateMeetings();
     const isInConference = elements.conferenceContainer.style.display !== 'none';
     const isOnHomeView = elements.homeCard.style.display !== 'none';
@@ -415,14 +462,19 @@ function applyPermissionBasedUi() {
     }
 
     if (isInConference) {
-        setElementVisibility(elements.toggleInterpreterBtn, canManageConference, '');
-        setElementVisibility(elements.toggleTranscriptionBtn, canManageConference, '');
-        setElementVisibility(elements.toggleScreenShareBtn, canManageConference, '');
+        setElementVisibility(elements.toggleInterpreterBtn, isInterpreterFeatureEnabled(), '');
+        setElementVisibility(elements.toggleTranscriptionBtn, isSubtitlesFeatureEnabled(), '');
+        setElementVisibility(elements.toggleScreenShareBtn, canShareScreen(), '');
         setElementVisibility(elements.toggleWhiteboardBtn, canManageWhiteboard(), '');
         setElementVisibility(elements.toggleReactionsBtn, canSendGroupMessages(), '');
-        elements.sendChatBtn.disabled = !canSendGroupMessages();
-        elements.chatInput.disabled = !canSendGroupMessages();
-        elements.chatInput.placeholder = canSendGroupMessages()
+        elements.toggleAudioBtn.disabled = !canPublishAudio();
+        elements.toggleVideoBtn.disabled = !canPublishVideo();
+        elements.sendChatBtn.disabled = !canSendAnyChatMessages();
+        elements.chatInput.disabled = !canSendAnyChatMessages();
+        if (elements.chatRecipientSelect) {
+            elements.chatRecipientSelect.disabled = !canSendAnyChatMessages();
+        }
+        elements.chatInput.placeholder = canSendAnyChatMessages()
             ? 'Type a message...'
             : 'Messaging is disabled for your access level';
 
@@ -434,6 +486,144 @@ function applyPermissionBasedUi() {
     if (appState.isParticipantsOpen) {
         renderParticipantsList();
     }
+}
+
+function getDefaultParticipantPermissionState() {
+    return {
+        audioEnabled: false,
+        videoEnabled: false,
+        screenShareEnabled: false,
+        whiteboardEnabled: false,
+    };
+}
+
+function updateParticipantPermissionState(connectionId, permissions = {}) {
+    const participant = participantsData.get(connectionId);
+    if (!participant) {
+        return;
+    }
+
+    participant.permissions = {
+        ...(participant.permissions || getDefaultParticipantPermissionState()),
+        ...permissions,
+    };
+
+    participantsData.set(connectionId, participant);
+
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+}
+
+async function updateParticipantPermissions(connectionId, permissionsPatch) {
+    if (!appState.sessionId) {
+        showNotification('No active session available.', 'error');
+        return;
+    }
+
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.PARTICIPANT_PERMISSIONS(appState.sessionId, connectionId)}`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(permissionsPatch),
+        }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to update participant permissions');
+    }
+
+    const payload = await response.json();
+    updateParticipantPermissionState(connectionId, payload.permissions || permissionsPatch);
+    return payload;
+}
+
+function toggleParticipantAccessMenu(connectionId) {
+    activeParticipantAccessMenuId =
+        activeParticipantAccessMenuId === connectionId ? null : connectionId;
+    renderParticipantsList();
+}
+
+function closeParticipantAccessMenu() {
+    if (!activeParticipantAccessMenuId) {
+        return;
+    }
+
+    activeParticipantAccessMenuId = null;
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+}
+
+async function handleParticipantAccessAction(connectionId, action) {
+    const actionMap = {
+        enableMedia: { mediaEnabled: true },
+        disableMedia: { mediaEnabled: false },
+        enableScreenShare: { screenShareEnabled: true },
+        disableScreenShare: { screenShareEnabled: false },
+        enableWhiteboard: { whiteboardEnabled: true },
+        disableWhiteboard: { whiteboardEnabled: false },
+    };
+
+    const patch = actionMap[action];
+    if (!patch) {
+        return;
+    }
+
+    await updateParticipantPermissions(connectionId, patch);
+    closeParticipantAccessMenu();
+    showNotification('Participant access updated.', 'info');
+}
+
+async function handleParticipantPermissionToggle(connectionId, permissionKey, enabled) {
+    try {
+        await updateParticipantPermissions(connectionId, {
+            [permissionKey]: enabled,
+        });
+        showNotification('Participant permissions updated.', 'info');
+    } catch (error) {
+        showNotification(error.message || 'Failed to update participant permissions.', 'error');
+        renderParticipantsList();
+    }
+}
+
+async function enforceCurrentPermissions() {
+    if (typeof whiteboardManager.setAccess === 'function') {
+        whiteboardManager.setAccess({
+            canManage: canManageWhiteboard(),
+            canDraw: canUseWhiteboard(),
+        });
+    }
+
+    if (!openviduClient.publisher) {
+        return;
+    }
+
+    if (!canPublishAudio() && appState.isAudioEnabled && localPublisherHasTrack('audio')) {
+        appState.isAudioEnabled = openviduClient.toggleAudio();
+        elements.toggleAudioBtn.classList.add('muted');
+        elements.toggleAudioBtn.innerHTML = '<i data-lucide="mic-off"></i>';
+    }
+
+    if (!canPublishVideo() && appState.isVideoEnabled && localPublisherHasTrack('video')) {
+        appState.isVideoEnabled = openviduClient.toggleVideo();
+        elements.toggleVideoBtn.classList.add('muted');
+        elements.toggleVideoBtn.innerHTML = '<i data-lucide="video-off"></i>';
+        const localWrapper = document.getElementById('localVideoWrapper');
+        const localAvatar = document.getElementById('localAvatar');
+        if (localWrapper && localAvatar) {
+            localWrapper.classList.add('camera-off');
+            localAvatar.classList.add('visible');
+        }
+    }
+
+    if (!canShareScreen() && appState.isScreenSharing) {
+        await stopScreenShare();
+    }
+
+    lucide.createIcons();
 }
 
 /**
@@ -516,7 +706,12 @@ async function apiFetch(url, options = {}) {
         credentials: 'same-origin',
     });
 
-    if (response.status === 401) {
+    const shouldShowAuthExpiredNotice =
+        !options.suppressAuthExpiredNotice &&
+        !appState.isConnected &&
+        elements.conferenceContainer.style.display === 'none';
+
+    if (response.status === 401 && shouldShowAuthExpiredNotice) {
         showNotification('Your access session expired. Reload the page to continue.', 'error');
     }
 
@@ -528,14 +723,23 @@ window.voycelinkApiFetch = apiFetch;
 async function refreshCurrentPermissions(options = {}) {
     const { silent = false } = options;
 
-    if (!appState.authRole) {
+    if (!appState.authRoomId && !getCookieValue(BOOTSTRAP_COOKIE_NAME)) {
         appState.currentPermissions = [];
         applyPermissionBasedUi();
         return null;
     }
 
     try {
-        const response = await apiFetch(`${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.MY_PERMISSIONS}`);
+        const permissionsUrl = new URL(
+            `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.MY_PERMISSIONS}`,
+            window.location.origin
+        );
+
+        if (appState.currentParticipantId) {
+            permissionsUrl.searchParams.set('participantId', appState.currentParticipantId);
+        }
+
+        const response = await apiFetch(permissionsUrl.toString());
         if (!response.ok) {
             if (!silent) {
                 const error = await response.json().catch(() => ({}));
@@ -547,11 +751,13 @@ async function refreshCurrentPermissions(options = {}) {
         const authorization = await response.json();
         appState.authRole = authorization.role || appState.authRole;
         appState.authRoomId = authorization.roomId || appState.authRoomId;
+        appState.sessionFeatures = authorization.session || appState.sessionFeatures;
         appState.currentPermissions = Array.isArray(authorization.permissions)
             ? authorization.permissions
             : [];
         loadBootstrapSession();
         applyPermissionBasedUi();
+        await enforceCurrentPermissions();
         return authorization;
     } catch (error) {
         if (!silent) {
@@ -559,6 +765,87 @@ async function refreshCurrentPermissions(options = {}) {
         }
         return null;
     }
+}
+
+function getPermissionsWebSocketUrl() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = new URL(`${protocol}//${window.location.host}/ws/permissions`);
+    if (appState.authRoomId) {
+        url.searchParams.set('roomId', appState.authRoomId);
+    }
+    if (appState.currentParticipantId) {
+        url.searchParams.set('participantId', appState.currentParticipantId);
+    }
+    return url.toString();
+}
+
+function disconnectPermissionsWebSocket() {
+    if (permissionsSocketReconnectTimeoutId) {
+        clearTimeout(permissionsSocketReconnectTimeoutId);
+        permissionsSocketReconnectTimeoutId = null;
+    }
+
+    if (!permissionsSocket) {
+        return;
+    }
+
+    permissionsSocket.close();
+    permissionsSocket = null;
+}
+
+function connectPermissionsWebSocket() {
+    if (permissionsSocket || !appState.authRoomId) {
+        return;
+    }
+
+    permissionsSocket = new WebSocket(getPermissionsWebSocketUrl());
+
+    permissionsSocket.addEventListener('message', async (event) => {
+        try {
+            const payload = JSON.parse(event.data);
+            if (payload.type === 'connected') {
+                logEvent('info', 'Access updates channel connected');
+                return;
+            }
+
+            if (payload.type !== 'participant_access_updated') {
+                return;
+            }
+
+            if (payload.sessionId !== appState.authRoomId) {
+                return;
+            }
+
+            updateParticipantPermissionState(payload.participantId, payload.permissions || {});
+
+            if (!appState.currentParticipantId || payload.participantId !== appState.currentParticipantId) {
+                return;
+            }
+
+            await refreshCurrentPermissions({ silent: true });
+            showNotification('Your session access was updated.', 'info');
+        } catch (error) {
+            console.error('Error processing permissions WebSocket message:', error);
+        }
+    });
+
+    permissionsSocket.addEventListener('open', () => {
+        logEvent('info', 'Access updates channel opened');
+    });
+
+    permissionsSocket.addEventListener('close', () => {
+        permissionsSocket = null;
+        if (appState.isConnected) {
+            permissionsSocketReconnectTimeoutId = setTimeout(() => {
+                connectPermissionsWebSocket();
+            }, 1500);
+        }
+    });
+
+    permissionsSocket.addEventListener('error', () => {
+        logEvent('warn', 'Access updates channel error');
+        permissionsSocket = null;
+    });
 }
 
 
@@ -572,7 +859,11 @@ async function refreshCurrentPermissions(options = {}) {
 async function getToken(sessionId, nickname, preferredLanguage) {
     let resolvedSessionId = resolveBoundSessionId(sessionId);
 
-    if (appState.authRole !== 'guest') {
+    if (appState.currentPermissions.length === 0) {
+        await refreshCurrentPermissions({ silent: true });
+    }
+
+    if (canCreateMeetings()) {
         const sessionResponse = await apiFetch(`${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSIONS}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1188,8 +1479,101 @@ function parseOpenViduConnectionData(connection) {
     return {
         nickname: connectionData.nickname || 'Participant',
         preferredLanguage: connectionData.preferredLanguage || 'en',
+        role: connectionData.role || 'participant',
         isScreenShare: Boolean(connectionData.isScreenShare),
     };
+}
+
+function getParticipantRolePriority(role) {
+    if (role === 'host') return 0;
+    if (role === 'co_host') return 1;
+    return 2;
+}
+
+function compareParticipantsByRoleAndName(a, b) {
+    const rolePriority = getParticipantRolePriority(a.role) - getParticipantRolePriority(b.role);
+    if (rolePriority !== 0) {
+        return rolePriority;
+    }
+
+    if (a.isLocal && !b.isLocal) return -1;
+    if (!a.isLocal && b.isLocal) return 1;
+
+    return (a.nickname || '').localeCompare(b.nickname || '');
+}
+
+function reorderGalleryByParticipantRole() {
+    if (!elements.videoGrid) {
+        return;
+    }
+
+    const participantTiles = Array.from(
+        elements.videoGrid.querySelectorAll('.video-wrapper:not(.screen-share-video)')
+    );
+
+    participantTiles
+        .sort((a, b) =>
+            compareParticipantsByRoleAndName(
+                {
+                    role: a.dataset.role || 'participant',
+                    nickname: a.dataset.nickname || '',
+                    isLocal: a.classList.contains('local-video'),
+                },
+                {
+                    role: b.dataset.role || 'participant',
+                    nickname: b.dataset.nickname || '',
+                    isLocal: b.classList.contains('local-video'),
+                }
+            )
+        )
+        .forEach((tile) => {
+            elements.videoGrid.appendChild(tile);
+        });
+}
+
+async function syncParticipantRolesFromSession() {
+    if (!appState.sessionId) {
+        return;
+    }
+
+    try {
+        const response = await apiFetch(
+            `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION(appState.sessionId)}`
+        );
+
+        if (!response.ok) {
+            return;
+        }
+
+        const sessionData = await response.json();
+        const participantRoles = sessionData.participantRoles || {};
+
+        Object.entries(participantRoles).forEach(([connectionId, role]) => {
+            const participant = participantsData.get(connectionId);
+            if (participant) {
+                participant.role = role;
+                participantsData.set(connectionId, participant);
+            }
+
+            const wrapperId =
+                connectionId === appState.currentParticipantId
+                    ? 'localVideoWrapper'
+                    : `video-${connectionId}`;
+            const wrapper = document.getElementById(wrapperId);
+            if (wrapper) {
+                wrapper.dataset.role = role;
+            }
+        });
+
+        reorderGalleryByParticipantRole();
+        updateChatRecipientOptions();
+
+        if (appState.isParticipantsOpen) {
+            renderParticipantsList();
+        }
+    } catch (error) {
+        logEvent('warn', 'Could not sync participant roles');
+    }
 }
 
 function showConferenceRoom() {
@@ -1203,6 +1587,8 @@ function showConferenceRoom() {
     const localAvatar = document.getElementById('localAvatar');
     const localAvatarInitial = document.getElementById('localAvatarInitial');
     const localWrapper = document.getElementById('localVideoWrapper');
+    localWrapper.dataset.role = appState.authRole || 'participant';
+    localWrapper.dataset.nickname = appState.nickname || 'You';
     setupAvatar(localWrapper, appState.nickname, localAvatar, localAvatarInitial);
     
     // Sync button states with preview settings
@@ -1222,6 +1608,7 @@ function showConferenceRoom() {
         localAvatar.classList.add('visible');
     }
 
+    reorderGalleryByParticipantRole();
     updateVideoGridLayoutState();
     applyPermissionBasedUi();
 }
@@ -1300,16 +1687,18 @@ function createMockParticipant(index) {
     const connectionId = `${MOCK_PARTICIPANT_PREFIX}${index + 1}`;
     const languagePool = ['en', 'es', 'fr', 'de', 'pt'];
     const nickname = `Mock User ${index + 1}`;
+    const rolePool = ['participant', 'participant', 'guest', 'co_host'];
     const connection = {
         connectionId,
         data: JSON.stringify({
             nickname,
             preferredLanguage: languagePool[index % languagePool.length],
+            role: rolePool[index % rolePool.length],
         }),
     };
 
     createRemoteVideoElement(connection);
-    addParticipantToPanel(connectionId, nickname, false);
+    addParticipantToPanel(connectionId, nickname, false, rolePool[index % rolePool.length]);
 }
 
 function promptMockParticipantCount() {
@@ -1392,6 +1781,8 @@ function createRemoteVideoElement(subscriberOrConnection) {
             avatar.classList.toggle('visible', !stream || !stream.videoActive);
         }
         existingWrapper.classList.toggle('camera-off', !stream || !stream.videoActive);
+        existingWrapper.dataset.role = connectionData.role || 'participant';
+        existingWrapper.dataset.nickname = nickname;
 
         if (subscriber) {
             const video = document.getElementById(`video-element-${connectionId}`);
@@ -1400,6 +1791,8 @@ function createRemoteVideoElement(subscriberOrConnection) {
             }
         }
 
+        reorderGalleryByParticipantRole();
+
         return existingWrapper;
     }
     
@@ -1407,6 +1800,8 @@ function createRemoteVideoElement(subscriberOrConnection) {
     const wrapper = document.createElement('div');
     wrapper.className = 'video-wrapper remote-video';
     wrapper.id = `video-${connectionId}`;
+    wrapper.dataset.role = connectionData.role || 'participant';
+    wrapper.dataset.nickname = nickname;
     
     // Create avatar placeholder
     const avatar = document.createElement('div');
@@ -1469,6 +1864,8 @@ function createRemoteVideoElement(subscriberOrConnection) {
         wrapper.classList.add('camera-off');
         avatar.classList.add('visible');
     }
+
+    reorderGalleryByParticipantRole();
     
     return wrapper;
 }
@@ -1822,13 +2219,14 @@ function stopSpeakingDetection() {
  * Update the interpreter button state based on participants
  */
 function updateInterpreterButtonState() {
+    if (!isInterpreterFeatureEnabled()) {
+        elements.toggleInterpreterBtn.disabled = true;
+        return;
+    }
+
     const remoteParticipants = openviduClient.subscribers.size;
     const hasRemoteParticipant = remoteParticipants > 0;
-    
-    // Enable button only if there's exactly one remote participant (PoC limitation)
-    // TEMPORARILY DISABLED for 30-participant test - uncomment line below to re-enable
-    // elements.toggleInterpreterBtn.disabled = !hasRemoteParticipant;
-    elements.toggleInterpreterBtn.disabled = true;
+    elements.toggleInterpreterBtn.disabled = !hasRemoteParticipant;
     
     if (hasRemoteParticipant) {
         logEvent('info', 'Remote participant detected - AI Interpreter available');
@@ -1959,8 +2357,8 @@ function stopInterpreter() {
  * Toggle interpreter on/off
  */
 async function toggleInterpreter() {
-    if (!canManageConferenceUi()) {
-        showNotification('You do not have permission to control the AI interpreter.', 'error');
+    if (!isInterpreterFeatureEnabled()) {
+        showNotification('AI interpretation is not enabled for this room.', 'error');
         return;
     }
 
@@ -1979,6 +2377,11 @@ async function toggleInterpreter() {
  * Update transcription button state based on participants
  */
 function updateTranscriptionButtonState() {
+    if (!isSubtitlesFeatureEnabled()) {
+        elements.toggleTranscriptionBtn.disabled = true;
+        return;
+    }
+
     const remoteParticipants = openviduClient.subscribers.size;
     const hasRemoteParticipant = remoteParticipants > 0;
     elements.toggleTranscriptionBtn.disabled = !hasRemoteParticipant;
@@ -2041,8 +2444,8 @@ function stopTranscription() {
  * Toggle transcription on/off
  */
 async function toggleTranscription() {
-    if (!canManageConferenceUi()) {
-        showNotification('You do not have permission to control subtitles.', 'error');
+    if (!isSubtitlesFeatureEnabled()) {
+        showNotification('Subtitles are not enabled for this room.', 'error');
         return;
     }
 
@@ -2100,6 +2503,8 @@ function initializeChat(session) {
     chatManager.onUnreadChange = (count) => {
         updateChatBadge(count);
     };
+
+    updateChatRecipientOptions();
 }
 
 /**
@@ -2113,7 +2518,7 @@ function addChatMessageToUI(message) {
     }
     
     const messageEl = document.createElement('div');
-    messageEl.className = `chat-message ${message.isLocal ? 'local' : 'remote'}`;
+    messageEl.className = `chat-message ${message.isLocal ? 'local' : 'remote'} ${message.messageType === 'direct' ? 'chat-message-direct' : ''}`;
     messageEl.setAttribute('data-message-id', message.id);
     
     const time = message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -2124,6 +2529,9 @@ function addChatMessageToUI(message) {
     messageEl.innerHTML = `
         <div class="chat-message-header">
             <span class="chat-message-sender" style="color: ${message.color}">${message.nickname}</span>
+            ${message.messageType === 'direct'
+                ? `<span class="chat-message-meta">${message.isLocal ? `to ${escapeHtml(message.recipientNickname || 'Direct')}` : 'Direct message'}</span>`
+                : ''}
             <span class="chat-message-time">${time}</span>
         </div>
         <div class="chat-message-bubble">${escapeHtml(displayText)}</div>
@@ -2194,6 +2602,7 @@ function toggleChat() {
         elements.chatPanel.style.display = 'flex';
         elements.toggleChatBtn.classList.add('active');
         chatManager.setOpen(true);
+        updateChatRecipientOptions();
         elements.chatInput.focus();
     } else {
         elements.chatPanel.style.display = 'none';
@@ -2218,16 +2627,39 @@ function closeChat() {
  * Send chat message
  */
 async function sendChatMessage() {
-    if (!canSendGroupMessages()) {
+    if (!canSendAnyChatMessages()) {
         showNotification('You do not have permission to send messages.', 'error');
         return;
     }
 
     const text = elements.chatInput.value.trim();
     if (!text) return;
+
+    const selectedRecipient = elements.chatRecipientSelect?.value || 'everyone';
+    const selectedOption = elements.chatRecipientSelect?.selectedOptions?.[0];
+    const isDirectMessage = selectedRecipient !== 'everyone';
+
+    if (isDirectMessage && !canSendDirectMessages()) {
+        showNotification('You do not have permission to send direct messages.', 'error');
+        return;
+    }
+
+    if (!isDirectMessage && !canSendGroupMessages()) {
+        showNotification('You do not have permission to send messages to everyone.', 'error');
+        return;
+    }
     
     elements.chatInput.value = '';
-    await chatManager.sendMessage(text);
+    await chatManager.sendMessage(
+        text,
+        isDirectMessage
+            ? {
+                  messageType: 'direct',
+                  recipientConnectionId: selectedRecipient,
+                  recipientNickname: selectedOption?.dataset?.nickname || selectedOption?.textContent || 'Direct',
+              }
+            : { messageType: 'group' }
+    );
 }
 
 /**
@@ -2246,6 +2678,54 @@ function resetChatUI() {
     elements.chatPanel.style.display = 'none';
     elements.toggleChatBtn.classList.remove('active');
     appState.isChatOpen = false;
+    if (elements.chatRecipientSelect) {
+        elements.chatRecipientSelect.innerHTML = '<option value="everyone">Everyone</option>';
+    }
+}
+
+function getEligibleDirectMessageRecipients() {
+    const participants = Array.from(participantsData.values()).filter((participant) => !participant.isLocal);
+
+    if (canModerateChatRecipients()) {
+        return participants;
+    }
+
+    return participants.filter((participant) => participant.role === 'host' || participant.role === 'co_host');
+}
+
+function updateChatRecipientOptions() {
+    if (!elements.chatRecipientSelect) {
+        return;
+    }
+
+    const previousValue = elements.chatRecipientSelect.value;
+    const options = [];
+
+    if (canSendGroupMessages()) {
+        options.push('<option value="everyone">Everyone</option>');
+    }
+
+    if (canSendDirectMessages()) {
+        getEligibleDirectMessageRecipients().forEach((participant) => {
+            options.push(
+                `<option value="${participant.connectionId}" data-nickname="${escapeHtml(participant.nickname)}">Direct to ${escapeHtml(participant.nickname)}</option>`
+            );
+        });
+    }
+
+    if (options.length === 0) {
+        elements.chatRecipientSelect.innerHTML = '<option value="">No available destinations</option>';
+        elements.chatRecipientSelect.disabled = true;
+        return;
+    }
+
+    elements.chatRecipientSelect.innerHTML = options.join('');
+
+    const hasPreviousValue = Array.from(elements.chatRecipientSelect.options).some(
+        (option) => option.value === previousValue
+    );
+    elements.chatRecipientSelect.value = hasPreviousValue ? previousValue : elements.chatRecipientSelect.options[0].value;
+    elements.chatRecipientSelect.disabled = !canSendAnyChatMessages();
 }
 
 // =============================================================================
@@ -2277,7 +2757,7 @@ function toggleParticipants() {
 
 function toggleWhiteboardForCurrentRole() {
     if (!canManageWhiteboard()) {
-        showNotification('You do not have permission to control the whiteboard.', 'error');
+        showNotification('You do not have permission to manage the whiteboard.', 'error');
         return;
     }
 
@@ -2296,15 +2776,18 @@ function closeParticipants() {
 /**
  * Add participant to tracking
  */
-function addParticipantToPanel(connectionId, nickname, isLocal = false) {
+function addParticipantToPanel(connectionId, nickname, isLocal = false, role = null) {
     participantsData.set(connectionId, {
         connectionId,
         nickname,
         isLocal,
+        role: role || (isLocal ? (appState.authRole || 'participant') : 'participant'),
         isMuted: false,
-        isVideoOff: false
+        isVideoOff: false,
+        permissions: getDefaultParticipantPermissionState(),
     });
     updateParticipantsCount();
+    updateChatRecipientOptions();
     if (appState.isParticipantsOpen) {
         renderParticipantsList();
     }
@@ -2316,6 +2799,7 @@ function addParticipantToPanel(connectionId, nickname, isLocal = false) {
 function removeParticipantFromPanel(connectionId) {
     participantsData.delete(connectionId);
     updateParticipantsCount();
+    updateChatRecipientOptions();
     if (appState.isParticipantsOpen) {
         renderParticipantsList();
     }
@@ -2346,11 +2830,7 @@ function renderParticipantsList() {
     }
     
     // Sort: local user first, then alphabetically
-    const sortedParticipants = Array.from(participantsData.values()).sort((a, b) => {
-        if (a.isLocal) return -1;
-        if (b.isLocal) return 1;
-        return a.nickname.localeCompare(b.nickname);
-    });
+    const sortedParticipants = Array.from(participantsData.values()).sort(compareParticipantsByRoleAndName);
     
     elements.participantsList.innerHTML = sortedParticipants.map(p => {
         const initials = p.nickname.charAt(0).toUpperCase();
@@ -2358,6 +2838,9 @@ function renderParticipantsList() {
         const canMuteParticipant = canManageParticipantMedia() && !isYou;
         const canRemoveParticipant = canKickParticipants() && !isYou;
         const canModerateParticipant = canMuteParticipant || canRemoveParticipant;
+        const canManagePermissionGrants = (canManageParticipantMedia() || canManageWhiteboard()) && !isYou;
+        const participantPermissions = p.permissions || getDefaultParticipantPermissionState();
+        const isAccessMenuOpen = activeParticipantAccessMenuId === p.connectionId;
         
         return `
             <div class="participant-item ${isYou ? 'is-you' : ''}" data-connection-id="${p.connectionId}">
@@ -2372,6 +2855,31 @@ function renderParticipantsList() {
                             ? '<i data-lucide="mic-off"></i> Muted' 
                             : '<i data-lucide="mic"></i> Active'}
                     </div>
+                    ${canManagePermissionGrants ? `
+                        <div class="participant-access">
+                            <button class="participant-access-btn ${isAccessMenuOpen ? 'is-open' : ''}" data-connection-id="${p.connectionId}" title="Manage participant access" aria-expanded="${isAccessMenuOpen ? 'true' : 'false'}">
+                                <i data-lucide="sliders-horizontal"></i>
+                                <span>Access</span>
+                            </button>
+                            ${isAccessMenuOpen ? `
+                                <div class="participant-access-menu" data-connection-id="${p.connectionId}">
+                                    ${canManageParticipantMedia() ? `
+                                        <button class="participant-access-menu-item" data-connection-id="${p.connectionId}" data-action="${participantPermissions.audioEnabled || participantPermissions.videoEnabled ? 'disableMedia' : 'enableMedia'}">
+                                            ${participantPermissions.audioEnabled || participantPermissions.videoEnabled ? 'Disable mic and camera' : 'Enable mic and camera'}
+                                        </button>
+                                        <button class="participant-access-menu-item" data-connection-id="${p.connectionId}" data-action="${participantPermissions.screenShareEnabled ? 'disableScreenShare' : 'enableScreenShare'}">
+                                            ${participantPermissions.screenShareEnabled ? 'Disable screen sharing' : 'Enable screen sharing'}
+                                        </button>
+                                    ` : ''}
+                                    ${canManageWhiteboard() ? `
+                                        <button class="participant-access-menu-item" data-connection-id="${p.connectionId}" data-action="${participantPermissions.whiteboardEnabled ? 'disableWhiteboard' : 'enableWhiteboard'}">
+                                            ${participantPermissions.whiteboardEnabled ? 'Disable whiteboard access' : 'Enable whiteboard access'}
+                                        </button>
+                                    ` : ''}
+                                </div>
+                            ` : ''}
+                        </div>
+                    ` : ''}
                 </div>
                 ${canModerateParticipant ? `
                     <div class="participant-actions">
@@ -2407,6 +2915,20 @@ function renderParticipantsList() {
             e.stopPropagation();
             const connectionId = btn.dataset.connectionId;
             kickParticipant(connectionId);
+        });
+    });
+
+    elements.participantsList.querySelectorAll('.participant-access-btn').forEach((button) => {
+        button.addEventListener('click', (event) => {
+            event.stopPropagation();
+            toggleParticipantAccessMenu(button.dataset.connectionId);
+        });
+    });
+
+    elements.participantsList.querySelectorAll('.participant-access-menu-item').forEach((button) => {
+        button.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            await handleParticipantAccessAction(button.dataset.connectionId, button.dataset.action);
         });
     });
 }
@@ -2587,8 +3109,12 @@ function toggleReactionsPopup() {
         return;
     }
 
-    elements.reactionsPopup?.classList.toggle('show');
-    elements.toggleReactionsBtn?.classList.toggle('active');
+    const willShow = !elements.reactionsPopup?.classList.contains('show');
+    if (willShow) {
+        positionReactionsPopup();
+    }
+    elements.reactionsPopup?.classList.toggle('show', willShow);
+    elements.toggleReactionsBtn?.classList.toggle('active', willShow);
 }
 
 /**
@@ -2597,6 +3123,33 @@ function toggleReactionsPopup() {
 function hideReactionsPopup() {
     elements.reactionsPopup?.classList.remove('show');
     elements.toggleReactionsBtn?.classList.remove('active');
+}
+
+function positionReactionsPopup() {
+    if (!elements.reactionsPopup || !elements.toggleReactionsBtn) {
+        return;
+    }
+
+    const buttonRect = elements.toggleReactionsBtn.getBoundingClientRect();
+    const popup = elements.reactionsPopup;
+
+    popup.style.visibility = 'hidden';
+    popup.classList.add('show');
+
+    const popupRect = popup.getBoundingClientRect();
+    const viewportPadding = 12;
+    const centeredLeft = buttonRect.left + (buttonRect.width / 2) - (popupRect.width / 2);
+    const left = Math.min(
+        Math.max(centeredLeft, viewportPadding),
+        window.innerWidth - popupRect.width - viewportPadding
+    );
+    const top = Math.max(buttonRect.top - popupRect.height - 10, viewportPadding);
+
+    popup.style.left = `${left}px`;
+    popup.style.top = `${top}px`;
+
+    popup.classList.remove('show');
+    popup.style.visibility = '';
 }
 
 /**
@@ -2898,7 +3451,8 @@ function setupOpenViduCallbacks() {
             createRemoteVideoElement(subscriber);
             
             // Add to participants panel
-            addParticipantToPanel(connectionId, connectionData.nickname, false);
+            addParticipantToPanel(connectionId, connectionData.nickname, false, connectionData.role);
+            syncParticipantRolesFromSession();
             
             updateParticipantCount();
             updateAudioTracksDebug();
@@ -3007,7 +3561,8 @@ function setupOpenViduCallbacks() {
         const connectionData = parseOpenViduConnectionData(connection);
         if (!connectionData.isScreenShare) {
             createRemoteVideoElement(connection);
-            addParticipantToPanel(connection.connectionId, connectionData.nickname, false);
+            addParticipantToPanel(connection.connectionId, connectionData.nickname, false, connectionData.role);
+            syncParticipantRolesFromSession();
             playJoinSound();
         }
 
@@ -3196,7 +3751,11 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         
         // Initialize participants panel with local user
         const localConnectionId = openviduClient.session.connection.connectionId;
-        addParticipantToPanel(localConnectionId, nickname, true);
+        appState.currentParticipantId = localConnectionId;
+        addParticipantToPanel(localConnectionId, nickname, true, appState.authRole || 'participant');
+        await refreshCurrentPermissions({ silent: true });
+        await syncParticipantRolesFromSession();
+        connectPermissionsWebSocket();
         
         // Register signal handlers for participants panel (mute/kick)
         openviduClient.session.on('signal:requestMute', handleMuteRequest);
@@ -3214,7 +3773,7 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
  * Toggle screen sharing
  */
 async function toggleScreenShare() {
-    if (!canManageConferenceUi()) {
+    if (!canShareScreen()) {
         showNotification('You do not have permission to share to the stage.', 'error');
         return;
     }
@@ -3385,6 +3944,7 @@ async function stopScreenShare() {
 function leaveSession() {
     isLeavingSessionIntentional = true;
     clearReconnectTimeout();
+    disconnectPermissionsWebSocket();
 
     // Stop screen sharing if active
     if (appState.isScreenSharing) {
@@ -3420,10 +3980,17 @@ function leaveSession() {
     
     // Reset state
     appState.sessionId = null;
+    appState.currentParticipantId = null;
     appState.isAudioEnabled = true;
     appState.isVideoEnabled = true;
     appState.isInterpreterActive = false;
     appState.isTranscriptionActive = false;
+    appState.sessionFeatures = {
+        chatEnabled: true,
+        whiteboardEnabled: true,
+        subtitlesEnabled: true,
+        aiInterpretationEnabled: false,
+    };
     appState.isScreenSharing = false;
     appState.screenPublisher = null;
     appState.screenSession = null;
@@ -3476,6 +4043,11 @@ elements.joinForm.addEventListener('submit', async (e) => {
 
 // Audio toggle
 elements.toggleAudioBtn.addEventListener('click', async () => {
+    if (!canPublishAudio()) {
+        showNotification('You do not have permission to enable your microphone.', 'error');
+        return;
+    }
+
     if (!appState.isAudioEnabled && previewState.audioPermission !== 'granted') {
         const granted = await requestDevicePermission('audio');
         if (!granted) return;
@@ -3504,6 +4076,11 @@ elements.toggleAudioBtn.addEventListener('click', async () => {
 
 // Video toggle
 elements.toggleVideoBtn.addEventListener('click', async () => {
+    if (!canPublishVideo()) {
+        showNotification('You do not have permission to enable your camera.', 'error');
+        return;
+    }
+
     if (!appState.isVideoEnabled && previewState.videoPermission !== 'granted') {
         const granted = await requestDevicePermission('video');
         if (!granted) return;
@@ -3626,10 +4203,27 @@ document.addEventListener('click', (e) => {
             hideReactionsPopup();
         }
     }
+
+    if (!e.target.closest('.participant-access')) {
+        closeParticipantAccessMenu();
+    }
 });
+
+window.addEventListener('resize', () => {
+    if (elements.reactionsPopup?.classList.contains('show')) {
+        positionReactionsPopup();
+    }
+});
+
+window.addEventListener('scroll', () => {
+    if (elements.reactionsPopup?.classList.contains('show')) {
+        positionReactionsPopup();
+    }
+}, true);
 
 // Clean up on page unload
 window.addEventListener('beforeunload', () => {
+    disconnectPermissionsWebSocket();
     stopPreview();
     if (appState.isConnected) {
         openviduClient.disconnect();

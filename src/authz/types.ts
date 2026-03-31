@@ -4,6 +4,7 @@ import type { Role } from './roles';
 export type PermissionGrantSet = {
   audioEnabled?: boolean;
   videoEnabled?: boolean;
+  screenShareEnabled?: boolean;
   groupChatEnabled?: boolean;
   hostDirectMessageEnabled?: boolean;
   whiteboardEnabled?: boolean;
