@@ -74,6 +74,7 @@ const OWNER_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const AUTH_COOKIE_NAME = 'voycelink_auth';
 const AUTH_REFRESH_COOKIE_NAME = 'voycelink_auth_refresh';
 const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
+const PENDING_HOST_COOKIE_NAME = 'voycelink_pending_host';
 const OWNER_COOKIE_NAME = 'voycelink_owner_rooms';
 const ROOM_ID_PATTERN = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
 const OPENVIDU_RETRY_ATTEMPTS = 3;
@@ -169,6 +170,12 @@ function signRefreshToken(payload) {
     });
 }
 
+function signPendingHostToken(payload) {
+    return jwt.sign(payload, config.auth.jwtSecret, {
+        expiresIn: AUTH_TOKEN_TTL_SECONDS,
+    });
+}
+
 function signInviteToken(payload) {
     return jwt.sign(payload, config.auth.jwtSecret, {
         expiresIn: INVITE_TOKEN_TTL_SECONDS,
@@ -212,6 +219,10 @@ function issueBootstrapCookies(res, authSession) {
         maxAge: REFRESH_TOKEN_TTL_SECONDS,
         secure: config.port !== 3000,
     });
+    issueBootstrapStateCookie(res, authSession);
+}
+
+function issueBootstrapStateCookie(res, authSession) {
     appendResponseCookie(
         res,
         BOOTSTRAP_COOKIE_NAME,
@@ -225,6 +236,30 @@ function issueBootstrapCookies(res, authSession) {
             secure: config.port !== 3000,
         }
     );
+}
+
+function issuePendingHostCookie(res, roomId) {
+    appendResponseCookie(
+        res,
+        PENDING_HOST_COOKIE_NAME,
+        signPendingHostToken({
+            role: Role.HOST,
+            roomId,
+        }),
+        {
+            httpOnly: true,
+            maxAge: AUTH_TOKEN_TTL_SECONDS,
+            secure: config.port !== 3000,
+        }
+    );
+}
+
+function clearResponseCookie(res, name) {
+    appendResponseCookie(res, name, '', {
+        httpOnly: name !== BOOTSTRAP_COOKIE_NAME,
+        maxAge: 0,
+        secure: config.port !== 3000,
+    });
 }
 
 function getOwnedRoomsFromRequest(req) {
@@ -253,6 +288,35 @@ function getRefreshTokenFromRequest(req) {
 
 function getInviteTokenFromRequest(req) {
     return typeof req.query?.invite === 'string' ? req.query.invite : null;
+}
+
+function getPendingHostSessionFromRequest(req) {
+    const cookies = parseCookies(req);
+    const pendingHostToken = cookies[PENDING_HOST_COOKIE_NAME];
+    if (!pendingHostToken) {
+        return null;
+    }
+
+    try {
+        const decoded = jwt.verify(pendingHostToken, config.auth.jwtSecret);
+        if (
+            !decoded ||
+            typeof decoded !== 'object' ||
+            decoded.role !== Role.HOST ||
+            typeof decoded.roomId !== 'string' ||
+            !ROOM_ID_PATTERN.test(decoded.roomId)
+        ) {
+            return null;
+        }
+
+        return {
+            role: Role.HOST,
+            roomId: decoded.roomId,
+        };
+    } catch (error) {
+        logger.warn({ err: error }, 'Ignoring invalid pending host cookie');
+        return null;
+    }
 }
 
 function getInviteSessionFromRequest(req) {
@@ -330,18 +394,6 @@ function getBootstrapSessionFromRequest(req) {
     }
 }
 
-function isTopLevelUserNavigation(req) {
-    const secFetchMode = req.headers['sec-fetch-mode'];
-    const secFetchDest = req.headers['sec-fetch-dest'];
-    const secFetchUser = req.headers['sec-fetch-user'];
-
-    return (
-        secFetchMode === 'navigate' &&
-        secFetchDest === 'document' &&
-        secFetchUser === '?1'
-    );
-}
-
 function getRequestedRoomIdForRequest(req) {
     const candidateRoomIds = [
         req.params?.sessionId,
@@ -377,6 +429,33 @@ function tryRestoreOwnerAuthentication(req, res) {
         roomId: requestedRoomId,
     };
     logger.info({ path: req.path, roomId: requestedRoomId }, 'Restored host authentication from owner cookie');
+    return true;
+}
+
+function tryRestorePendingHostAuthentication(req, res) {
+    const pendingHostSession = getPendingHostSessionFromRequest(req);
+    if (!pendingHostSession) {
+        return false;
+    }
+
+    const requestedRoomId = getRequestedRoomIdForRequest(req);
+    const bootstrapSession = getBootstrapSessionFromRequest(req);
+    const effectiveRoomId = requestedRoomId || bootstrapSession?.roomId || null;
+
+    if (effectiveRoomId && effectiveRoomId !== pendingHostSession.roomId) {
+        return false;
+    }
+
+    const authSession = createAccessSession(Role.HOST, pendingHostSession.roomId);
+    issueBootstrapCookies(res, authSession);
+    req.auth = {
+        role: Role.HOST,
+        roomId: pendingHostSession.roomId,
+    };
+    logger.info(
+        { path: req.path, roomId: pendingHostSession.roomId },
+        'Restored host authentication from pending host cookie'
+    );
     return true;
 }
 
@@ -421,7 +500,6 @@ function resolveBootstrapSession(req, decodedToken) {
             ? req.query.room
             : null;
     const ownedRooms = getOwnedRoomsFromRequest(req);
-    const bootstrapSession = getBootstrapSessionFromRequest(req);
 
     if (requestedRoomId) {
         const inviteSession = getInviteSessionFromRequest(req);
@@ -444,30 +522,6 @@ function resolveBootstrapSession(req, decodedToken) {
         return {
             role: Role.GUEST,
             roomId: requestedRoomId,
-        };
-    }
-
-    if (
-        !isTopLevelUserNavigation(req) &&
-        decodedToken?.role === Role.HOST &&
-        typeof decodedToken?.roomId === 'string' &&
-        ROOM_ID_PATTERN.test(decodedToken.roomId)
-    ) {
-        return {
-            role: Role.HOST,
-            roomId: decodedToken.roomId,
-        };
-    }
-
-    if (
-        !isTopLevelUserNavigation(req) &&
-        bootstrapSession?.role === Role.HOST &&
-        typeof bootstrapSession?.roomId === 'string' &&
-        ROOM_ID_PATTERN.test(bootstrapSession.roomId)
-    ) {
-        return {
-            role: Role.HOST,
-            roomId: bootstrapSession.roomId,
         };
     }
 
@@ -591,6 +645,10 @@ function authenticateRequest(req, res, next) {
             }
         }
 
+        if (tryRestorePendingHostAuthentication(req, res)) {
+            return next();
+        }
+
         if (tryRestoreLinkAuthentication(req, res)) {
             return next();
         }
@@ -684,6 +742,10 @@ function authenticateRequest(req, res, next) {
             } catch (refreshError) {
                 logger.warn({ err: refreshError, path: req.path }, 'Invalid refresh token after access token failure');
             }
+        }
+
+        if (tryRestorePendingHostAuthentication(req, res)) {
+            return next();
         }
 
         if (tryRestoreLinkAuthentication(req, res)) {
@@ -1883,11 +1945,18 @@ app.get('*', (req, res) => {
         'Issued bootstrap session'
     );
 
-    issueBootstrapCookies(res, authSession);
-    if (bootstrapSession.role === Role.HOST && bootstrapSession.roomId) {
-        const ownedRooms = getOwnedRoomsFromRequest(req);
-        ownedRooms.add(bootstrapSession.roomId);
-        issueOwnedRoomsCookie(res, ownedRooms);
+    if (hasExplicitRoom) {
+        issueBootstrapCookies(res, authSession);
+        if (bootstrapSession.role === Role.HOST && bootstrapSession.roomId) {
+            const ownedRooms = getOwnedRoomsFromRequest(req);
+            ownedRooms.add(bootstrapSession.roomId);
+            issueOwnedRoomsCookie(res, ownedRooms);
+        }
+    } else {
+        clearResponseCookie(res, AUTH_COOKIE_NAME);
+        clearResponseCookie(res, AUTH_REFRESH_COOKIE_NAME);
+        issueBootstrapStateCookie(res, authSession);
+        issuePendingHostCookie(res, bootstrapSession.roomId);
     }
     res.sendFile(frontendDocumentPath);
 });
