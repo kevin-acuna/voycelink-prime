@@ -12,7 +12,7 @@ import jwt from 'jsonwebtoken';
 import path from 'path';
 import { OpenVidu } from 'openvidu-node-client';
 import WebSocket from 'ws';
-import { canPerform } from './authz';
+import { canPerform, getEffectivePermissions } from './authz';
 import { Permission } from './authz/permissions';
 import { Role, isRole } from './authz/roles';
 import { config, validateServerConfig } from './config';
@@ -285,6 +285,18 @@ function requirePermission(permission) {
     };
 }
 
+function getAuthorizationContextForRequest(req) {
+    return {
+        role: req.auth.role,
+        session: {
+            chatEnabled: true,
+            whiteboardEnabled: true,
+            subtitlesEnabled: true,
+            aiInterpretationEnabled: true,
+        },
+    };
+}
+
 // =============================================================================
 // API Routes
 // =============================================================================
@@ -325,6 +337,21 @@ app.get('/api/azure-speech-token', requirePermission(Permission.JOIN_SESSION), (
     res.json({
         token: config.azure.speechKey,
         region: config.azure.speechRegion
+    });
+});
+
+app.get('/api/me/permissions', requirePermission(Permission.JOIN_SESSION), (req, res) => {
+    const authorizationContext = getAuthorizationContextForRequest(req);
+    const permissions = getEffectivePermissions(authorizationContext);
+    const authSession = createAccessSession(req.auth.role, req.auth.roomId ?? null);
+    issueBootstrapCookies(res, authSession);
+
+    res.json({
+        role: req.auth.role,
+        roomId: req.auth.roomId ?? null,
+        permissions,
+        session: authorizationContext.session,
+        grants: authorizationContext.grants ?? {},
     });
 });
 

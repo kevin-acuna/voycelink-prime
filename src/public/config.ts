@@ -15,6 +15,7 @@ const CONFIG = {
     // API Endpoints
     ENDPOINTS: {
         HEALTH: '/api/health',
+        MY_PERMISSIONS: '/api/me/permissions',
         SESSIONS: '/api/sessions',
         CONNECTIONS: (sessionId) => `/api/sessions/${sessionId}/connections`
     },

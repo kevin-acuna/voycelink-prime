@@ -143,6 +143,7 @@ const appState = {
     authRole: null,
     authRoomId: null,
     authTokenExpiresAt: null,
+    currentPermissions: [],
     isConnected: false,
     isAudioEnabled: true,
     isVideoEnabled: true,
@@ -246,6 +247,16 @@ let hasHandledConnectionLoss = false;
 const ENABLE_LAYOUT_TESTER = CONFIG.DEBUG || window.location.hostname === 'localhost';
 const MOCK_PARTICIPANT_PREFIX = 'mock-participant-';
 const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
+const Permission = {
+    CREATE_SESSION: 'create_session',
+    JOIN_SESSION: 'join_session',
+    END_SESSION: 'end_session',
+    KICK_PARTICIPANT: 'kick_participant',
+    MANAGE_PARTICIPANT_MEDIA: 'manage_participant_media',
+    SEND_GROUP_CHAT_MESSAGE: 'send_group_chat_message',
+    MANAGE_WHITEBOARD: 'manage_whiteboard',
+    UPDATE_ROOM_CONFIGURATION: 'update_room_configuration'
+};
 
 // =============================================================================
 // Room Link Functions
@@ -272,14 +283,18 @@ async function ensureHostSessionExists(sessionId) {
 }
 
 async function createNewMeeting() {
+    if (appState.currentPermissions.length === 0) {
+        await refreshCurrentPermissions({ silent: true });
+    }
+
     const roomId = appState.authRoomId;
     if (!roomId) {
         showNotification('Unable to create meeting. Please reload the page.', 'error');
         return;
     }
 
-    if (appState.authRole !== 'host') {
-        showNotification('Only the host can create a new meeting from the home page.', 'error');
+    if (!canCreateMeetings()) {
+        showNotification('You do not have permission to create a meeting.', 'error');
         return;
     }
 
@@ -349,6 +364,78 @@ function getRoomIdFromUrl() {
     return null;
 }
 
+function getCurrentUserRole() {
+    return appState.authRole || 'guest';
+}
+
+function hasPermission(permission) {
+    return appState.currentPermissions.includes(permission);
+}
+
+function canCreateMeetings() {
+    return hasPermission(Permission.CREATE_SESSION);
+}
+
+function canManageParticipantMedia() {
+    return hasPermission(Permission.MANAGE_PARTICIPANT_MEDIA);
+}
+
+function canKickParticipants() {
+    return hasPermission(Permission.KICK_PARTICIPANT);
+}
+
+function canSendGroupMessages() {
+    return hasPermission(Permission.SEND_GROUP_CHAT_MESSAGE);
+}
+
+function canManageWhiteboard() {
+    return hasPermission(Permission.MANAGE_WHITEBOARD);
+}
+
+function canManageConferenceUi() {
+    return (
+        hasPermission(Permission.UPDATE_ROOM_CONFIGURATION) ||
+        canManageWhiteboard()
+    );
+}
+
+function setElementVisibility(element, isVisible, displayMode = '') {
+    if (!element) return;
+    element.style.display = isVisible ? displayMode : 'none';
+}
+
+function applyPermissionBasedUi() {
+    const canManageConference = canManageConferenceUi();
+    const canCreateMeeting = canCreateMeetings();
+    const isInConference = elements.conferenceContainer.style.display !== 'none';
+    const isOnHomeView = elements.homeCard.style.display !== 'none';
+
+    if (isOnHomeView) {
+        setElementVisibility(elements.createMeetingBtn, canCreateMeeting, '');
+    }
+
+    if (isInConference) {
+        setElementVisibility(elements.toggleInterpreterBtn, canManageConference, '');
+        setElementVisibility(elements.toggleTranscriptionBtn, canManageConference, '');
+        setElementVisibility(elements.toggleScreenShareBtn, canManageConference, '');
+        setElementVisibility(elements.toggleWhiteboardBtn, canManageWhiteboard(), '');
+        setElementVisibility(elements.toggleReactionsBtn, canSendGroupMessages(), '');
+        elements.sendChatBtn.disabled = !canSendGroupMessages();
+        elements.chatInput.disabled = !canSendGroupMessages();
+        elements.chatInput.placeholder = canSendGroupMessages()
+            ? 'Type a message...'
+            : 'Messaging is disabled for your access level';
+
+        if (!canSendGroupMessages()) {
+            hideReactionsPopup();
+        }
+    }
+
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+}
+
 /**
  * Initialize the page based on URL
  */
@@ -371,6 +458,8 @@ function initializePage() {
         elements.homeCard.style.display = 'block';
         elements.joinCard.style.display = 'none';
     }
+
+    applyPermissionBasedUi();
 }
 
 function resolveBoundSessionId(sessionId) {
@@ -401,6 +490,8 @@ function loadBootstrapSession() {
         appState.authRole = null;
         appState.authRoomId = null;
         appState.authTokenExpiresAt = null;
+        appState.currentPermissions = [];
+        applyPermissionBasedUi();
         return;
     }
 
@@ -413,7 +504,10 @@ function loadBootstrapSession() {
         appState.authRole = null;
         appState.authRoomId = null;
         appState.authTokenExpiresAt = null;
+        appState.currentPermissions = [];
     }
+
+    applyPermissionBasedUi();
 }
 
 async function apiFetch(url, options = {}) {
@@ -430,6 +524,43 @@ async function apiFetch(url, options = {}) {
 }
 
 window.voycelinkApiFetch = apiFetch;
+
+async function refreshCurrentPermissions(options = {}) {
+    const { silent = false } = options;
+
+    if (!appState.authRole) {
+        appState.currentPermissions = [];
+        applyPermissionBasedUi();
+        return null;
+    }
+
+    try {
+        const response = await apiFetch(`${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.MY_PERMISSIONS}`);
+        if (!response.ok) {
+            if (!silent) {
+                const error = await response.json().catch(() => ({}));
+                throw new Error(error.details || 'Failed to load permissions');
+            }
+            return null;
+        }
+
+        const authorization = await response.json();
+        appState.authRole = authorization.role || appState.authRole;
+        appState.authRoomId = authorization.roomId || appState.authRoomId;
+        appState.currentPermissions = Array.isArray(authorization.permissions)
+            ? authorization.permissions
+            : [];
+        loadBootstrapSession();
+        applyPermissionBasedUi();
+        return authorization;
+    } catch (error) {
+        if (!silent) {
+            showNotification(error.message || 'Failed to load permissions.', 'error');
+        }
+        return null;
+    }
+}
+
 
 // =============================================================================
 // API Functions
@@ -455,6 +586,7 @@ async function getToken(sessionId, nickname, preferredLanguage) {
         
         const sessionData = await sessionResponse.json();
         loadBootstrapSession();
+        await refreshCurrentPermissions({ silent: true });
         resolvedSessionId = sessionData.sessionId;
     }
     
@@ -475,6 +607,7 @@ async function getToken(sessionId, nickname, preferredLanguage) {
     
     const tokenData = await tokenResponse.json();
     loadBootstrapSession();
+    await refreshCurrentPermissions({ silent: true });
     
     return {
         sessionId: resolvedSessionId,
@@ -1090,6 +1223,7 @@ function showConferenceRoom() {
     }
 
     updateVideoGridLayoutState();
+    applyPermissionBasedUi();
 }
 
 function showJoinForm() {
@@ -1100,6 +1234,7 @@ function showJoinForm() {
     
     // Restart preview when returning to join form
     initPreview();
+    applyPermissionBasedUi();
 }
 
 function updateParticipantCount() {
@@ -1824,6 +1959,11 @@ function stopInterpreter() {
  * Toggle interpreter on/off
  */
 async function toggleInterpreter() {
+    if (!canManageConferenceUi()) {
+        showNotification('You do not have permission to control the AI interpreter.', 'error');
+        return;
+    }
+
     if (appState.isInterpreterActive) {
         stopInterpreter();
     } else {
@@ -1901,6 +2041,11 @@ function stopTranscription() {
  * Toggle transcription on/off
  */
 async function toggleTranscription() {
+    if (!canManageConferenceUi()) {
+        showNotification('You do not have permission to control subtitles.', 'error');
+        return;
+    }
+
     if (appState.isTranscriptionActive) {
         stopTranscription();
     } else {
@@ -2073,6 +2218,11 @@ function closeChat() {
  * Send chat message
  */
 async function sendChatMessage() {
+    if (!canSendGroupMessages()) {
+        showNotification('You do not have permission to send messages.', 'error');
+        return;
+    }
+
     const text = elements.chatInput.value.trim();
     if (!text) return;
     
@@ -2123,6 +2273,15 @@ function toggleParticipants() {
     }
     
     lucide.createIcons();
+}
+
+function toggleWhiteboardForCurrentRole() {
+    if (!canManageWhiteboard()) {
+        showNotification('You do not have permission to control the whiteboard.', 'error');
+        return;
+    }
+
+    whiteboardManager.toggle();
 }
 
 /**
@@ -2196,6 +2355,9 @@ function renderParticipantsList() {
     elements.participantsList.innerHTML = sortedParticipants.map(p => {
         const initials = p.nickname.charAt(0).toUpperCase();
         const isYou = p.isLocal;
+        const canMuteParticipant = canManageParticipantMedia() && !isYou;
+        const canRemoveParticipant = canKickParticipants() && !isYou;
+        const canModerateParticipant = canMuteParticipant || canRemoveParticipant;
         
         return `
             <div class="participant-item ${isYou ? 'is-you' : ''}" data-connection-id="${p.connectionId}">
@@ -2211,18 +2373,18 @@ function renderParticipantsList() {
                             : '<i data-lucide="mic"></i> Active'}
                     </div>
                 </div>
-                ${!isYou ? `
+                ${canModerateParticipant ? `
                     <div class="participant-actions">
-                        <button class="participant-action-btn mute-btn" 
+                        ${canMuteParticipant ? `<button class="participant-action-btn mute-btn" 
                                 data-connection-id="${p.connectionId}" 
                                 title="Request mute">
                             <i data-lucide="mic-off"></i>
-                        </button>
-                        <button class="participant-action-btn kick-btn" 
+                        </button>` : ''}
+                        ${canRemoveParticipant ? `<button class="participant-action-btn kick-btn" 
                                 data-connection-id="${p.connectionId}" 
                                 title="Remove from call">
                             <i data-lucide="user-x"></i>
-                        </button>
+                        </button>` : ''}
                     </div>
                 ` : ''}
             </div>
@@ -2254,6 +2416,10 @@ function renderParticipantsList() {
  */
 function requestMuteParticipant(connectionId) {
     if (!openviduClient.session) return;
+    if (!canManageParticipantMedia()) {
+        showNotification('You do not have permission to manage participant media.', 'error');
+        return;
+    }
     
     const participant = participantsData.get(connectionId);
     if (!participant) return;
@@ -2277,6 +2443,10 @@ function requestMuteParticipant(connectionId) {
  */
 function kickParticipant(connectionId) {
     if (!openviduClient.session) return;
+    if (!canKickParticipants()) {
+        showNotification('You do not have permission to remove participants.', 'error');
+        return;
+    }
     
     const participant = participantsData.get(connectionId);
     if (!participant) return;
@@ -2412,6 +2582,11 @@ function escapeHtml(text) {
  * Toggle reactions popup visibility
  */
 function toggleReactionsPopup() {
+    if (!canSendGroupMessages()) {
+        showNotification('You do not have permission to send reactions.', 'error');
+        return;
+    }
+
     elements.reactionsPopup?.classList.toggle('show');
     elements.toggleReactionsBtn?.classList.toggle('active');
 }
@@ -2428,6 +2603,11 @@ function hideReactionsPopup() {
  * Send a reaction to all participants
  */
 function sendReaction(reaction) {
+    if (!canSendGroupMessages()) {
+        showNotification('You do not have permission to send reactions.', 'error');
+        return;
+    }
+
     if (!openviduClient.session) {
         console.error('[Reactions] No session available');
         return;
@@ -3034,6 +3214,11 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
  * Toggle screen sharing
  */
 async function toggleScreenShare() {
+    if (!canManageConferenceUi()) {
+        showNotification('You do not have permission to share to the stage.', 'error');
+        return;
+    }
+
     if (appState.isScreenSharing) {
         // Stop screen sharing
         await stopScreenShare();
@@ -3422,7 +3607,7 @@ elements.toggleParticipantsBtn.addEventListener('click', toggleParticipants);
 elements.closeParticipantsBtn.addEventListener('click', closeParticipants);
 
 // Whiteboard controls
-elements.toggleWhiteboardBtn.addEventListener('click', () => whiteboardManager.toggle());
+elements.toggleWhiteboardBtn.addEventListener('click', toggleWhiteboardForCurrentRole);
 
 // Reactions controls
 elements.toggleReactionsBtn?.addEventListener('click', toggleReactionsPopup);
@@ -3466,6 +3651,7 @@ lucide.createIcons();
 // Initialize page based on URL (home vs room)
 loadBootstrapSession();
 initializePage();
+refreshCurrentPermissions({ silent: true });
 
 // Initialize preview
 initPreview();
