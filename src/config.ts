@@ -5,6 +5,10 @@ const env = process.env;
 export const config = {
   port: Number(env.PORT || 3000),
   logLevel: env.LOG_LEVEL || 'info',
+  auth: {
+    jwtSecret: env.AUTH_JWT_SECRET || env.OPENVIDU_SECRET,
+    tokenTtl: '15m',
+  },
   openvidu: {
     url: env.OPENVIDU_URL,
     secret: env.OPENVIDU_SECRET,
@@ -23,9 +27,9 @@ export const config = {
 };
 
 export function validateServerConfig() {
-  if (!config.openvidu.url || !config.openvidu.secret) {
+  if (!config.openvidu.url || !config.openvidu.secret || !config.auth.jwtSecret) {
     process.stderr.write('ERROR: Missing required environment variables.\n');
-    process.stderr.write('Please ensure OPENVIDU_URL and OPENVIDU_SECRET are set in your .env file.\n');
+    process.stderr.write('Please ensure OPENVIDU_URL, OPENVIDU_SECRET, and optionally AUTH_JWT_SECRET are set in your .env file.\n');
     process.exit(1);
   }
 }

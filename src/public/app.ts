@@ -140,6 +140,9 @@ const appState = {
     sessionId: null,
     nickname: null,
     preferredLanguage: 'en',
+    authRole: null,
+    authRoomId: null,
+    authTokenExpiresAt: null,
     isConnected: false,
     isAudioEnabled: true,
     isVideoEnabled: true,
@@ -242,41 +245,55 @@ let isLeavingSessionIntentional = false;
 let hasHandledConnectionLoss = false;
 const ENABLE_LAYOUT_TESTER = CONFIG.DEBUG || window.location.hostname === 'localhost';
 const MOCK_PARTICIPANT_PREFIX = 'mock-participant-';
+const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
 
 // =============================================================================
 // Room Link Functions
 // =============================================================================
 
 /**
- * Generate a random room ID in format: xxx-xxxx-xxx (like Google Meet)
+ * Create a new meeting using the server-assigned bootstrap room ID
  */
-function generateRoomId() {
-    const chars = 'abcdefghijklmnopqrstuvwxyz';
-    const getSegment = (len) => {
-        let result = '';
-        for (let i = 0; i < len; i++) {
-            result += chars.charAt(Math.floor(Math.random() * chars.length));
-        }
-        return result;
-    };
-    return `${getSegment(3)}-${getSegment(4)}-${getSegment(3)}`;
+async function ensureHostSessionExists(sessionId) {
+    const sessionResponse = await apiFetch(`${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSIONS}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId })
+    });
+
+    if (!sessionResponse.ok) {
+        const error = await sessionResponse.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to create session');
+    }
+
+    const sessionData = await sessionResponse.json();
+    loadBootstrapSession();
+    return sessionData.sessionId;
 }
 
-/**
- * Create a new meeting - generate room ID and show join form
- */
-function createNewMeeting() {
-    const roomId = generateRoomId();
+async function createNewMeeting() {
+    const roomId = appState.authRoomId;
+    if (!roomId) {
+        showNotification('Unable to create meeting. Please reload the page.', 'error');
+        return;
+    }
+
+    if (appState.authRole !== 'host') {
+        showNotification('Only the host can create a new meeting from the home page.', 'error');
+        return;
+    }
+
+    const resolvedRoomId = await ensureHostSessionExists(roomId);
     
     // Update URL without reloading (using query param for compatibility)
-    const newUrl = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
-    window.history.pushState({ roomId }, '', newUrl);
+    const newUrl = `${window.location.origin}${window.location.pathname}?room=${resolvedRoomId}`;
+    window.history.pushState({ roomId: resolvedRoomId }, '', newUrl);
     
     // Show join form with room ID
     elements.homeCard.style.display = 'none';
     elements.joinCard.style.display = 'block';
-    elements.sessionIdInput.value = roomId;
-    elements.roomIdDisplay.textContent = roomId;
+    elements.sessionIdInput.value = resolvedRoomId;
+    elements.roomIdDisplay.textContent = resolvedRoomId;
     
     // Focus on name input
     elements.nicknameInput.focus();
@@ -337,19 +354,82 @@ function getRoomIdFromUrl() {
  */
 function initializePage() {
     const roomId = getRoomIdFromUrl();
+    const bootstrapRoomId = appState.authRoomId;
     
     if (roomId) {
-        // We have a room in URL - show join form
+        const effectiveRoomId = bootstrapRoomId || roomId;
+        if (bootstrapRoomId && roomId !== bootstrapRoomId) {
+            const newUrl = `${window.location.origin}${window.location.pathname}?room=${bootstrapRoomId}`;
+            window.history.replaceState({ roomId: bootstrapRoomId }, '', newUrl);
+        }
         elements.homeCard.style.display = 'none';
         elements.joinCard.style.display = 'block';
-        elements.sessionIdInput.value = roomId;
-        elements.roomIdDisplay.textContent = roomId;
+        elements.sessionIdInput.value = effectiveRoomId;
+        elements.roomIdDisplay.textContent = effectiveRoomId;
     } else {
         // No room - show create meeting button
         elements.homeCard.style.display = 'block';
         elements.joinCard.style.display = 'none';
     }
 }
+
+function resolveBoundSessionId(sessionId) {
+    if (appState.authRoomId && sessionId !== appState.authRoomId) {
+        return appState.authRoomId;
+    }
+
+    return sessionId;
+}
+
+function getCookieValue(name) {
+    const cookiePrefix = `${name}=`;
+    const match = document.cookie
+        .split(';')
+        .map((entry) => entry.trim())
+        .find((entry) => entry.startsWith(cookiePrefix));
+
+    if (!match) {
+        return null;
+    }
+
+    return decodeURIComponent(match.slice(cookiePrefix.length));
+}
+
+function loadBootstrapSession() {
+    const rawBootstrapCookie = getCookieValue(BOOTSTRAP_COOKIE_NAME);
+    if (!rawBootstrapCookie) {
+        appState.authRole = null;
+        appState.authRoomId = null;
+        appState.authTokenExpiresAt = null;
+        return;
+    }
+
+    try {
+        const authSession = JSON.parse(rawBootstrapCookie);
+        appState.authRole = authSession.role || null;
+        appState.authRoomId = authSession.roomId || null;
+        appState.authTokenExpiresAt = authSession.expiresAt || null;
+    } catch (error) {
+        appState.authRole = null;
+        appState.authRoomId = null;
+        appState.authTokenExpiresAt = null;
+    }
+}
+
+async function apiFetch(url, options = {}) {
+    const response = await fetch(url, {
+        ...options,
+        credentials: 'same-origin',
+    });
+
+    if (response.status === 401) {
+        showNotification('Your access session expired. Reload the page to continue.', 'error');
+    }
+
+    return response;
+}
+
+window.voycelinkApiFetch = apiFetch;
 
 // =============================================================================
 // API Functions
@@ -359,23 +439,28 @@ function initializePage() {
  * Request a session and connection token from the backend
  */
 async function getToken(sessionId, nickname, preferredLanguage) {
-    // Step 1: Create or get session
-    const sessionResponse = await fetch(`${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSIONS}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId })
-    });
-    
-    if (!sessionResponse.ok) {
-        const error = await sessionResponse.json();
-        throw new Error(error.details || 'Failed to create session');
+    let resolvedSessionId = resolveBoundSessionId(sessionId);
+
+    if (appState.authRole !== 'guest') {
+        const sessionResponse = await apiFetch(`${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSIONS}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: resolvedSessionId })
+        });
+        
+        if (!sessionResponse.ok) {
+            const error = await sessionResponse.json();
+            throw new Error(error.details || 'Failed to create session');
+        }
+        
+        const sessionData = await sessionResponse.json();
+        loadBootstrapSession();
+        resolvedSessionId = sessionData.sessionId;
     }
     
-    const sessionData = await sessionResponse.json();
-    
     // Step 2: Get connection token
-    const tokenResponse = await fetch(
-        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.CONNECTIONS(sessionData.sessionId)}`,
+    const tokenResponse = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.CONNECTIONS(resolvedSessionId)}`,
         {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -389,9 +474,10 @@ async function getToken(sessionId, nickname, preferredLanguage) {
     }
     
     const tokenData = await tokenResponse.json();
+    loadBootstrapSession();
     
     return {
-        sessionId: sessionData.sessionId,
+        sessionId: resolvedSessionId,
         token: tokenData.token
     };
 }
@@ -2848,13 +2934,20 @@ function handleConnectionLost(reason = 'Connection lost') {
  */
 async function joinSession(sessionId, nickname, preferredLanguage) {
     try {
+        const resolvedSessionId = resolveBoundSessionId(sessionId);
+        if (resolvedSessionId !== sessionId) {
+            elements.sessionIdInput.value = resolvedSessionId;
+            elements.roomIdDisplay.textContent = resolvedSessionId;
+            logEvent('warn', `Room mismatch detected. Using bound room ${resolvedSessionId} instead of ${sessionId}`);
+        }
+
         isLeavingSessionIntentional = false;
         hasHandledConnectionLoss = false;
         clearReconnectTimeout();
-        logEvent('info', `Joining session: ${sessionId}`);
+        logEvent('info', `Joining session: ${resolvedSessionId}`);
         
         // Update state from preview settings
-        appState.sessionId = sessionId;
+        appState.sessionId = resolvedSessionId;
         appState.nickname = nickname;
         appState.preferredLanguage = preferredLanguage;
         appState.isAudioEnabled =
@@ -2871,7 +2964,7 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         
         // Get token from backend
         logEvent('info', 'Requesting token from backend...');
-        const { token } = await getToken(sessionId, nickname, preferredLanguage);
+        const { token } = await getToken(resolvedSessionId, nickname, preferredLanguage);
         logEvent('info', 'Token received');
         
         // Initialize OpenVidu
@@ -3298,7 +3391,11 @@ elements.cameraSelect.addEventListener('change', () => handleDeviceChange('camer
 elements.speakerSelect.addEventListener('change', () => handleDeviceChange('speaker'));
 
 // Meeting controls
-elements.createMeetingBtn.addEventListener('click', createNewMeeting);
+elements.createMeetingBtn.addEventListener('click', async () => {
+    await withButtonProtection(elements.createMeetingBtn, async () => {
+        await createNewMeeting();
+    }, { loadingText: '<i data-lucide="loader-2" class="animate-spin"></i> Creating...' });
+});
 elements.shareMeetingBtn.addEventListener('click', copyMeetingLink);
 
 // Transcription toggle
@@ -3367,6 +3464,7 @@ if (CONFIG.DEBUG) {
 lucide.createIcons();
 
 // Initialize page based on URL (home vs room)
+loadBootstrapSession();
 initializePage();
 
 // Initialize preview

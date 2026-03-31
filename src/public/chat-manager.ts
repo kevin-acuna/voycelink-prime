@@ -80,7 +80,8 @@ class ChatManager {
      */
     async translateText(text, targetLanguage) {
         try {
-            const response = await fetch(`${CONFIG.BACKEND_URL}/api/translate`, {
+            const apiFetch = window.voycelinkApiFetch || window.fetch.bind(window);
+            const response = await apiFetch(`${CONFIG.BACKEND_URL}/api/translate`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'

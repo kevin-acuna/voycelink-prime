@@ -3,6 +3,9 @@ import { Role } from './roles';
 import type { RolePermissionMap } from './types';
 
 export const ROLE_PERMISSIONS: RolePermissionMap = {
+  [Role.GUEST]: [
+    Permission.JOIN_SESSION,
+  ],
   [Role.HOST]: [
     Permission.CREATE_SESSION,
     Permission.JOIN_SESSION,

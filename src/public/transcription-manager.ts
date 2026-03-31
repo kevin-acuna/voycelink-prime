@@ -36,7 +36,8 @@ class TranscriptionManager {
     async initialize() {
         try {
             // Fetch Azure credentials from backend
-            const response = await fetch(`${CONFIG.BACKEND_URL}/api/azure-speech-token`);
+            const apiFetch = window.voycelinkApiFetch || window.fetch.bind(window);
+            const response = await apiFetch(`${CONFIG.BACKEND_URL}/api/azure-speech-token`);
             if (!response.ok) {
                 throw new Error('Failed to get Azure Speech credentials');
             }

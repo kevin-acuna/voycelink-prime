@@ -10,15 +10,17 @@
     "build": "rm -rf dist && tsc && mkdir -p dist/public && cp public/index.html public/styles.css dist/public/",
     "prestart": "npm run build",
     "start": "node dist/server.js",
-    "dev": "tsx watch src/server.ts",
+    "dev": "npm run build && concurrently -k \"tsc --watch --preserveWatchOutput\" \"tsx watch src/server.ts\"",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix"
   },
   "dependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.3",
     "openvidu-node-client": "^2.29.0",
     "pino": "^10.3.1",
     "ws": "^8.16.0"
@@ -29,6 +31,7 @@
     "@types/express": "^5.0.3",
     "@types/node": "^24.8.1",
     "@types/ws": "^8.18.1",
+    "concurrently": "^9.2.1",
     "eslint": "^10.1.0",
     "globals": "^17.4.0",
     "nodemon": "^3.0.2",

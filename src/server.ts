@@ -8,13 +8,25 @@
 
 import cors from 'cors';
 import express from 'express';
+import jwt from 'jsonwebtoken';
 import path from 'path';
 import { OpenVidu } from 'openvidu-node-client';
 import WebSocket from 'ws';
+import { canPerform } from './authz';
+import { Permission } from './authz/permissions';
+import { Role, isRole } from './authz/roles';
 import { config, validateServerConfig } from './config';
 import { logger } from './logger';
 
 const app = express();
+const projectRoot = process.cwd();
+const isProduction = process.env.NODE_ENV === 'production';
+const staticAssetDirectories = isProduction
+    ? [path.join(__dirname, 'public')]
+    : [path.join(projectRoot, 'public'), path.join(projectRoot, 'dist', 'public')];
+const frontendDocumentPath = isProduction
+    ? path.join(__dirname, 'public', 'index.html')
+    : path.join(projectRoot, 'public', 'index.html');
 
 // Validate required environment variables
 validateServerConfig();
@@ -30,12 +42,15 @@ const openvidu = new OpenVidu(config.openvidu.url, config.openvidu.secret);
 app.use(cors({
     origin: '*', // In production, restrict this to your frontend domain
     methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type']
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
 }));
 app.use(express.json());
 
-// Serve static files from the public folder (frontend)
-app.use(express.static(path.join(__dirname, 'public')));
+// Serve static assets from the public folder (frontend)
+staticAssetDirectories.forEach((directory) => {
+    app.use(express.static(directory, { index: false }));
+});
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -48,6 +63,227 @@ app.use((req, res, next) => {
 // Map<sessionId, Session> - Tracks active OpenVidu sessions
 // =============================================================================
 const activeSessions = new Map();
+const AUTH_TOKEN_TTL_SECONDS = 15 * 60;
+const AUTH_COOKIE_NAME = 'voycelink_auth';
+const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
+const ROOM_ID_PATTERN = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
+
+function generateRoomId() {
+    const chars = 'abcdefghijklmnopqrstuvwxyz';
+    const createSegment = (length) =>
+        Array.from({ length }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+
+    return `${createSegment(3)}-${createSegment(4)}-${createSegment(3)}`;
+}
+
+function parseCookies(req) {
+    const cookieHeader = req.headers.cookie;
+    if (!cookieHeader) {
+        return {};
+    }
+
+    return Object.fromEntries(
+        cookieHeader
+            .split(';')
+            .map((part) => part.trim())
+            .filter(Boolean)
+            .map((part) => {
+                const separatorIndex = part.indexOf('=');
+                const key = separatorIndex >= 0 ? part.slice(0, separatorIndex) : part;
+                const value = separatorIndex >= 0 ? part.slice(separatorIndex + 1) : '';
+                return [key, decodeURIComponent(value)];
+            })
+    );
+}
+
+function appendResponseCookie(res, name, value, options = {}) {
+    const mergedOptions = {
+        path: '/',
+        sameSite: 'Lax',
+        ...options,
+    };
+    const parts = [`${name}=${encodeURIComponent(value)}`];
+
+    if (mergedOptions.maxAge !== undefined) {
+        parts.push(`Max-Age=${mergedOptions.maxAge}`);
+    }
+    if (mergedOptions.path) {
+        parts.push(`Path=${mergedOptions.path}`);
+    }
+    if (mergedOptions.httpOnly) {
+        parts.push('HttpOnly');
+    }
+    if (mergedOptions.sameSite) {
+        parts.push(`SameSite=${mergedOptions.sameSite}`);
+    }
+    if (mergedOptions.secure) {
+        parts.push('Secure');
+    }
+
+    const existingCookies = res.getHeader('Set-Cookie');
+    const nextCookie = parts.join('; ');
+    if (!existingCookies) {
+        res.setHeader('Set-Cookie', nextCookie);
+        return;
+    }
+
+    const cookieList = Array.isArray(existingCookies) ? existingCookies : [String(existingCookies)];
+    res.setHeader('Set-Cookie', [...cookieList, nextCookie]);
+}
+
+function getAccessTokenFromRequest(req) {
+    const cookies = parseCookies(req);
+    if (cookies[AUTH_COOKIE_NAME]) {
+        return cookies[AUTH_COOKIE_NAME];
+    }
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+        return null;
+    }
+
+    return authHeader.slice('Bearer '.length);
+}
+
+function signAccessToken(payload) {
+    return jwt.sign(payload, config.auth.jwtSecret, {
+        expiresIn: config.auth.tokenTtl,
+    });
+}
+
+function createAccessSession(role, roomId = null) {
+    const issuedAt = new Date();
+    const expiresAt = new Date(issuedAt.getTime() + AUTH_TOKEN_TTL_SECONDS * 1000);
+
+    return {
+        token: signAccessToken({
+            role,
+            roomId,
+        }),
+        role,
+        roomId,
+        expiresAt: expiresAt.toISOString(),
+    };
+}
+
+function issueBootstrapCookies(res, authSession) {
+    appendResponseCookie(res, AUTH_COOKIE_NAME, authSession.token, {
+        httpOnly: true,
+        maxAge: AUTH_TOKEN_TTL_SECONDS,
+        secure: config.port !== 3000,
+    });
+    appendResponseCookie(
+        res,
+        BOOTSTRAP_COOKIE_NAME,
+        JSON.stringify({
+            role: authSession.role,
+            roomId: authSession.roomId,
+            expiresAt: authSession.expiresAt,
+        }),
+        {
+            maxAge: AUTH_TOKEN_TTL_SECONDS,
+            secure: config.port !== 3000,
+        }
+    );
+}
+
+function resolveBootstrapSession(req, decodedToken) {
+    const requestedRoomId =
+        typeof req.query.room === 'string' && ROOM_ID_PATTERN.test(req.query.room)
+            ? req.query.room
+            : null;
+    const tokenRoomId =
+        typeof decodedToken?.roomId === 'string' && ROOM_ID_PATTERN.test(decodedToken.roomId)
+            ? decodedToken.roomId
+            : null;
+
+    if (requestedRoomId) {
+        return {
+            role: Role.GUEST,
+            roomId: requestedRoomId,
+        };
+    }
+
+    if (decodedToken?.role === Role.HOST && tokenRoomId) {
+        return {
+            role: Role.HOST,
+            roomId: tokenRoomId,
+        };
+    }
+
+    return {
+        role: Role.HOST,
+        roomId: generateRoomId(),
+    };
+}
+
+function validateRoomBinding(req, res, sessionId) {
+    const boundRoomId = req.auth?.roomId;
+
+    if (!boundRoomId) {
+        res.status(403).json({
+            error: 'Forbidden',
+            details: 'Authenticated session is not bound to a room',
+        });
+        return false;
+    }
+
+    if (boundRoomId !== sessionId) {
+        res.status(403).json({
+            error: 'Forbidden',
+            details: `Authenticated session is bound to ${boundRoomId}, not ${sessionId}`,
+        });
+        return false;
+    }
+
+    return true;
+}
+
+function authenticateRequest(req, res, next) {
+    const token = getAccessTokenFromRequest(req);
+
+    if (!token) {
+        return res.status(401).json({
+            error: 'Missing authorization token',
+            details: 'Bearer token is required',
+        });
+    }
+
+    try {
+        const decoded = jwt.verify(token, config.auth.jwtSecret);
+        if (!decoded || typeof decoded !== 'object' || !isRole(decoded.role)) {
+            return res.status(401).json({
+                error: 'Invalid authorization token',
+                details: 'Access token payload does not contain a valid role',
+            });
+        }
+
+        req.auth = decoded;
+        next();
+    } catch (error) {
+        logger.warn({ err: error, path: req.path }, 'Invalid or expired access token');
+        res.status(401).json({
+            error: 'Invalid authorization token',
+            details: 'Access token is invalid or expired',
+        });
+    }
+}
+
+function requirePermission(permission) {
+    return (req, res, next) => {
+        const role = req.auth?.role;
+        const authorization = canPerform({ role }, permission);
+
+        if (!authorization.allowed) {
+            return res.status(403).json({
+                error: 'Forbidden',
+                details: authorization.reason,
+            });
+        }
+
+        next();
+    };
+}
 
 // =============================================================================
 // API Routes
@@ -64,11 +300,19 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+app.use('/api', (req, res, next) => {
+    if (req.path === '/health') {
+        return next();
+    }
+
+    return authenticateRequest(req, res, next);
+});
+
 /**
  * GET /api/azure-speech-token
  * Returns Azure Speech credentials for client-side transcription
  */
-app.get('/api/azure-speech-token', (req, res) => {
+app.get('/api/azure-speech-token', requirePermission(Permission.JOIN_SESSION), (req, res) => {
     if (!config.azure.speechKey) {
         logger.error('AZURE_SPEECH_KEY not configured');
         return res.status(500).json({ 
@@ -88,7 +332,7 @@ app.get('/api/azure-speech-token', (req, res) => {
  * POST /api/translate
  * Translates text using Azure Translator API
  */
-app.post('/api/translate', async (req, res) => {
+app.post('/api/translate', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
     const { text, targetLanguage } = req.body;
     
     if (!text || !targetLanguage) {
@@ -155,20 +399,26 @@ app.post('/api/translate', async (req, res) => {
  * Body: { sessionId?: string, sessionProperties?: object }
  * Response: { sessionId: string }
  */
-app.post('/api/sessions', async (req, res) => {
+app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (req, res) => {
     try {
         const { sessionId, sessionProperties = {} } = req.body;
-        
-        // If sessionId provided, try to use it as customSessionId
-        if (sessionId) {
-            sessionProperties.customSessionId = sessionId;
+        const resolvedSessionId = sessionId || req.auth.roomId;
+
+        if (!validateRoomBinding(req, res, resolvedSessionId)) {
+            return;
         }
+        
+        sessionProperties.customSessionId = resolvedSessionId;
 
         // Check if session already exists in our cache
         const existingSession = activeSessions.get(sessionProperties.customSessionId);
         if (existingSession) {
             logger.info({ sessionId: existingSession.sessionId }, 'Returning existing session');
-            return res.json({ sessionId: existingSession.sessionId });
+            const authSession = createAccessSession(req.auth.role, existingSession.sessionId);
+            issueBootstrapCookies(res, authSession);
+            return res.json({
+                sessionId: existingSession.sessionId,
+            });
         }
 
         // Create new session on Azure OpenVidu Server
@@ -178,14 +428,25 @@ app.post('/api/sessions', async (req, res) => {
         activeSessions.set(session.sessionId, session);
         
         logger.info({ sessionId: session.sessionId }, 'Created new session');
-        res.json({ sessionId: session.sessionId });
+        const authSession = createAccessSession(req.auth.role, session.sessionId);
+        issueBootstrapCookies(res, authSession);
+        res.json({
+            sessionId: session.sessionId,
+        });
 
     } catch (error) {
         // Handle case where session already exists on server but not in our cache
         if (error.message && error.message.includes('409')) {
-            const sessionId = req.body.sessionId || req.body.sessionProperties?.customSessionId;
+            const sessionId =
+                req.body.sessionId ||
+                req.body.sessionProperties?.customSessionId ||
+                req.auth.roomId;
             logger.info({ sessionId }, 'Session already exists on server');
-            return res.json({ sessionId });
+            const authSession = createAccessSession(req.auth.role, sessionId);
+            issueBootstrapCookies(res, authSession);
+            return res.json({
+                sessionId,
+            });
         }
         
         logger.error({ err: error }, 'Failed to create session');
@@ -208,10 +469,14 @@ app.post('/api/sessions', async (req, res) => {
  * }
  * Response: { token: string }
  */
-app.post('/api/sessions/:sessionId/connections', async (req, res) => {
+app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
     try {
         const { sessionId } = req.params;
         const { nickname, preferredLanguage, connectionProperties = {} } = req.body;
+
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
 
         // Build connection data - this will be available to all participants
         // Crucial for AI dubbing: we store language preference in connection data
@@ -231,9 +496,16 @@ app.post('/api/sessions/:sessionId/connections', async (req, res) => {
         let session = activeSessions.get(sessionId);
         
         if (!session) {
-            // Session might exist on server but not in our cache - create/fetch it
-            logger.info({ sessionId }, 'Session not in cache, creating');
-            session = await openvidu.createSession({ customSessionId: sessionId });
+            await openvidu.fetch();
+            session = openvidu.activeSessions.find((candidate) => candidate.sessionId === sessionId);
+
+            if (!session) {
+                return res.status(404).json({
+                    error: 'Session not found',
+                    details: `Session ${sessionId} does not exist`,
+                });
+            }
+
             activeSessions.set(sessionId, session);
         }
 
@@ -242,29 +514,22 @@ app.post('/api/sessions/:sessionId/connections', async (req, res) => {
             const connection = await session.createConnection(finalConnectionProperties);
             
             logger.info({ sessionId, nickname, connectionId: connection.connectionId }, 'Generated connection token');
+            const authSession = createAccessSession(req.auth.role, sessionId);
+            issueBootstrapCookies(res, authSession);
             
             return res.json({ 
                 token: connection.token,
-                connectionId: connection.connectionId
+                connectionId: connection.connectionId,
             });
         } catch (connectionError) {
-            // If session was closed/destroyed, remove from cache and recreate
+            // If session was closed/destroyed, remove from cache and return not found
             if (connectionError.message && connectionError.message.includes('404')) {
-                logger.warn({ sessionId }, 'Session was closed, recreating');
+                logger.warn({ sessionId }, 'Session was closed before connection creation');
                 activeSessions.delete(sessionId);
-                
-                // Create a fresh session with the same ID
-                session = await openvidu.createSession({ customSessionId: sessionId });
-                activeSessions.set(sessionId, session);
-                
-                // Now create the connection
-                const connection = await session.createConnection(finalConnectionProperties);
-                
-                logger.info({ sessionId, nickname, connectionId: connection.connectionId }, 'Generated token for recreated session');
-                
-                return res.json({ 
-                    token: connection.token,
-                    connectionId: connection.connectionId
+
+                return res.status(404).json({
+                    error: 'Session not found',
+                    details: `Session ${sessionId} is no longer active`,
                 });
             }
             throw connectionError;
@@ -284,9 +549,13 @@ app.post('/api/sessions/:sessionId/connections', async (req, res) => {
  * GET /api/sessions/:sessionId
  * Get session information (useful for debugging)
  */
-app.get('/api/sessions/:sessionId', async (req, res) => {
+app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
     try {
         const { sessionId } = req.params;
+
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
         
         // Fetch fresh session data from OpenVidu server
         await openvidu.fetch();
@@ -566,8 +835,38 @@ function setupInterpreterWebSocket(server) {
 // =============================================================================
 // Catch-all route - Serve frontend for any non-API routes
 // =============================================================================
+app.get('/favicon.ico', (req, res) => {
+    res.status(204).end();
+});
+
 app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    const acceptHeader = req.headers.accept || '';
+    const isDocumentRequest = acceptHeader.includes('text/html');
+    const hasFileExtension = path.extname(req.path) !== '';
+
+    if (!isDocumentRequest || hasFileExtension) {
+        return res.status(404).end();
+    }
+
+    let decodedToken = null;
+    const incomingToken = getAccessTokenFromRequest(req);
+
+    if (incomingToken) {
+        try {
+            decodedToken = jwt.verify(incomingToken, config.auth.jwtSecret);
+        } catch (error) {
+            logger.warn({ err: error }, 'Ignoring invalid bootstrap auth cookie');
+        }
+    }
+
+    const bootstrapSession = resolveBootstrapSession(req, decodedToken);
+    const authSession = createAccessSession(
+        bootstrapSession.role,
+        bootstrapSession.roomId
+    );
+
+    issueBootstrapCookies(res, authSession);
+    res.sendFile(frontendDocumentPath);
 });
 
 // =============================================================================
