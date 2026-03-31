@@ -148,7 +148,8 @@ const appState = {
     isChatOpen: false,
     isParticipantsOpen: false,
     isScreenSharing: false,
-    screenPublisher: null
+    screenPublisher: null,
+    activeScreenShareConnectionId: null
 };
 
 // =============================================================================
@@ -1261,6 +1262,25 @@ function removeRemoteVideoElement(connectionId) {
     }
 }
 
+function setActiveScreenShare(connectionId) {
+    const screenShares = Array.from(elements.videoGrid.querySelectorAll('.screen-share-video'));
+    if (screenShares.length === 0) {
+        appState.activeScreenShareConnectionId = null;
+        elements.videoGrid.classList.remove('presentation-mode');
+        return;
+    }
+
+    const nextActiveId = connectionId || screenShares[0].id.replace('screen-share-', '');
+    appState.activeScreenShareConnectionId = nextActiveId;
+    elements.videoGrid.classList.add('presentation-mode');
+
+    screenShares.forEach((wrapper) => {
+        const isActive = wrapper.id === `screen-share-${nextActiveId}`;
+        wrapper.classList.toggle('screen-share-active', isActive);
+        wrapper.classList.toggle('screen-share-inactive', !isActive);
+    });
+}
+
 /**
  * Create video element for a remote screen share
  */
@@ -1290,6 +1310,16 @@ function createRemoteScreenShareElement(subscriber) {
     let nickname = connectionData.nickname || 'Participant';
     nickname = nickname.replace(/\s*\(Screen\)\s*$/, '');
     
+    const existingWrapper = document.getElementById(`screen-share-${connectionId}`);
+    if (existingWrapper) {
+        const video = existingWrapper.querySelector('video');
+        if (video) {
+            subscriber.addVideoElement(video);
+        }
+        setActiveScreenShare(connectionId);
+        return existingWrapper;
+    }
+
     // Create wrapper for screen share
     const wrapper = document.createElement('div');
     wrapper.className = 'video-wrapper screen-share-video remote-screen-share';
@@ -1313,6 +1343,11 @@ function createRemoteScreenShareElement(subscriber) {
     
     wrapper.appendChild(video);
     wrapper.appendChild(label);
+    wrapper.addEventListener('click', () => {
+        if (appState.activeScreenShareConnectionId !== connectionId) {
+            setActiveScreenShare(connectionId);
+        }
+    });
     
     // Insert at the beginning of the grid
     elements.videoGrid.insertBefore(wrapper, elements.videoGrid.firstChild);
@@ -1320,8 +1355,7 @@ function createRemoteScreenShareElement(subscriber) {
     // Attach subscriber's stream to video element
     subscriber.addVideoElement(video);
     
-    // Enable presentation mode
-    elements.videoGrid.classList.add('presentation-mode');
+    setActiveScreenShare(connectionId);
     
     return wrapper;
 }
@@ -1331,14 +1365,20 @@ function createRemoteScreenShareElement(subscriber) {
  */
 function removeRemoteScreenShareElement(connectionId) {
     const wrapper = document.getElementById(`screen-share-${connectionId}`);
+    const wasActive = appState.activeScreenShareConnectionId === connectionId;
     if (wrapper) {
         wrapper.remove();
     }
-    
-    // Check if there are any other screen shares, if not remove presentation mode
+
+    if (wasActive) {
+        const nextScreenShare = elements.videoGrid.querySelector('.screen-share-video');
+        setActiveScreenShare(nextScreenShare?.id.replace('screen-share-', '') || null);
+        return;
+    }
+
     const remainingScreenShares = document.querySelectorAll('.screen-share-video');
     if (remainingScreenShares.length === 0) {
-        elements.videoGrid.classList.remove('presentation-mode');
+        setActiveScreenShare(null);
     }
 }
 
@@ -3041,6 +3081,7 @@ async function stopScreenShare() {
         appState.screenConnectionId = null;
         
         appState.isScreenSharing = false;
+        appState.activeScreenShareConnectionId = null;
         
         // Only remove presentation mode if there are no other screen shares
         const remainingScreenShares = document.querySelectorAll('.screen-share-video');
@@ -3110,6 +3151,7 @@ function leaveSession() {
     appState.screenSession = null;
     appState.screenOV = null;
     appState.screenConnectionId = null;
+    appState.activeScreenShareConnectionId = null;
     elements.toggleAudioBtn.classList.remove('muted');
     elements.toggleVideoBtn.classList.remove('muted');
     elements.toggleScreenShareBtn.classList.remove('sharing');
