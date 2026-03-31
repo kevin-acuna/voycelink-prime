@@ -229,8 +229,16 @@ const previewState = {
     isVideoEnabled: true,
     selectedMicId: null,
     selectedCameraId: null,
-    selectedSpeakerId: null
+    selectedSpeakerId: null,
+    hasAudioInput: true,
+    hasVideoInput: true,
+    audioPermission: 'unknown',
+    videoPermission: 'unknown'
 };
+
+let reconnectTimeoutId = null;
+let isLeavingSessionIntentional = false;
+let hasHandledConnectionLoss = false;
 
 // =============================================================================
 // Room Link Functions
@@ -394,12 +402,9 @@ async function getToken(sessionId, nickname, preferredLanguage) {
  */
 async function initPreview() {
     try {
-        // Request permissions first
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        stream.getTracks().forEach(track => track.stop());
-        
         // Enumerate devices
         await enumerateDevices();
+        await requestAvailableDevicePermissions();
         
         // Start preview with default devices
         await startPreview();
@@ -422,6 +427,133 @@ function cleanDeviceLabel(label) {
     return label.replace(/\s*\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)\s*$/, '').trim();
 }
 
+function isPermissionDeniedError(error) {
+    return error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+}
+
+function getDeviceAccessError(kind) {
+    const isAudio = kind === 'audio';
+    const hasDevice = isAudio ? previewState.hasAudioInput : previewState.hasVideoInput;
+    const permission = isAudio ? previewState.audioPermission : previewState.videoPermission;
+
+    if (!hasDevice) {
+        return isAudio
+            ? 'No microphone detected'
+            : 'No camera detected';
+    }
+
+    if (permission === 'denied') {
+        return isAudio
+            ? 'Microphone access is blocked. Enable it in your browser site settings.'
+            : 'Camera access is blocked. Enable it in your browser site settings.';
+    }
+
+    return null;
+}
+
+async function requestAvailableDevicePermissions() {
+    if (previewState.hasAudioInput) {
+        try {
+            const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            previewState.audioPermission = 'granted';
+            audioStream.getTracks().forEach(track => track.stop());
+        } catch (error) {
+            if (isPermissionDeniedError(error)) {
+                previewState.audioPermission = 'denied';
+                previewState.isAudioEnabled = false;
+            }
+            console.error('Error requesting microphone permissions:', error);
+        }
+    }
+
+    if (previewState.hasVideoInput) {
+        try {
+            const videoStream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+            previewState.videoPermission = 'granted';
+            videoStream.getTracks().forEach(track => track.stop());
+        } catch (error) {
+            if (isPermissionDeniedError(error)) {
+                previewState.videoPermission = 'denied';
+                previewState.isVideoEnabled = false;
+            }
+            console.error('Error requesting camera permissions:', error);
+        }
+    }
+
+    await enumerateDevices();
+    await syncDevicePermissionStates();
+}
+
+async function syncDevicePermissionStates() {
+    if (!navigator.permissions?.query) {
+        return;
+    }
+
+    try {
+        if (previewState.hasAudioInput) {
+            const audioPermission = await navigator.permissions.query({ name: 'microphone' });
+            previewState.audioPermission = audioPermission.state;
+            if (audioPermission.state === 'denied') {
+                previewState.isAudioEnabled = false;
+            }
+        }
+
+        if (previewState.hasVideoInput) {
+            const videoPermission = await navigator.permissions.query({ name: 'camera' });
+            previewState.videoPermission = videoPermission.state;
+            if (videoPermission.state === 'denied') {
+                previewState.isVideoEnabled = false;
+            }
+        }
+    } catch (error) {
+        console.error('Error querying media permissions:', error);
+    } finally {
+        updateMediaAvailabilityUI();
+    }
+}
+
+async function requestDevicePermission(kind) {
+    const isAudio = kind === 'audio';
+    const hasDevice = isAudio ? previewState.hasAudioInput : previewState.hasVideoInput;
+
+    if (!hasDevice) {
+        showNotification(getDeviceAccessError(kind), 'error');
+        return false;
+    }
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia(
+            isAudio ? { audio: true, video: false } : { audio: false, video: true }
+        );
+        stream.getTracks().forEach(track => track.stop());
+
+        if (isAudio) {
+            previewState.audioPermission = 'granted';
+        } else {
+            previewState.videoPermission = 'granted';
+        }
+
+        await enumerateDevices();
+        await syncDevicePermissionStates();
+        return true;
+    } catch (error) {
+        if (isPermissionDeniedError(error)) {
+            if (isAudio) {
+                previewState.audioPermission = 'denied';
+                previewState.isAudioEnabled = false;
+            } else {
+                previewState.videoPermission = 'denied';
+                previewState.isVideoEnabled = false;
+            }
+            updateMediaAvailabilityUI();
+        }
+
+        console.error(`Error requesting ${kind} permission:`, error);
+        showNotification(getDeviceAccessError(kind) || 'Device permission not granted', 'error');
+        return false;
+    }
+}
+
 /**
  * Enumerate available media devices
  */
@@ -432,11 +564,18 @@ async function enumerateDevices() {
         const microphones = devices.filter(d => d.kind === 'audioinput');
         const speakers = devices.filter(d => d.kind === 'audiooutput');
         const cameras = devices.filter(d => d.kind === 'videoinput');
+
+        previewState.hasAudioInput = microphones.length > 0;
+        previewState.hasVideoInput = cameras.length > 0;
+        if (!previewState.hasAudioInput) previewState.audioPermission = 'unknown';
+        if (!previewState.hasVideoInput) previewState.videoPermission = 'unknown';
         
         // Populate microphone select
-        elements.microphoneSelect.innerHTML = microphones.map((mic, i) => 
-            `<option value="${mic.deviceId}">${cleanDeviceLabel(mic.label) || `Microphone ${i + 1}`}</option>`
-        ).join('');
+        elements.microphoneSelect.innerHTML = microphones.length > 0
+            ? microphones.map((mic, i) => 
+                `<option value="${mic.deviceId}">${cleanDeviceLabel(mic.label) || `Microphone ${i + 1}`}</option>`
+            ).join('')
+            : '<option value="">No microphone detected</option>';
         
         // Populate speaker select
         if (speakers.length > 0) {
@@ -448,17 +587,24 @@ async function enumerateDevices() {
         }
         
         // Populate camera select
-        elements.cameraSelect.innerHTML = cameras.map((cam, i) => 
-            `<option value="${cam.deviceId}">${cleanDeviceLabel(cam.label) || `Camera ${i + 1}`}</option>`
-        ).join('');
+        elements.cameraSelect.innerHTML = cameras.length > 0
+            ? cameras.map((cam, i) => 
+                `<option value="${cam.deviceId}">${cleanDeviceLabel(cam.label) || `Camera ${i + 1}`}</option>`
+            ).join('')
+            : '<option value="">No camera detected</option>';
         
         // Store selected devices
-        if (microphones.length > 0) previewState.selectedMicId = microphones[0].deviceId;
-        if (cameras.length > 0) previewState.selectedCameraId = cameras[0].deviceId;
+        previewState.selectedMicId = microphones.length > 0 ? microphones[0].deviceId : null;
+        previewState.selectedCameraId = cameras.length > 0 ? cameras[0].deviceId : null;
         if (speakers.length > 0) previewState.selectedSpeakerId = speakers[0].deviceId;
+        if (!previewState.hasAudioInput) previewState.isAudioEnabled = false;
+        if (!previewState.hasVideoInput) previewState.isVideoEnabled = false;
+        if (previewState.audioPermission === 'denied') previewState.isAudioEnabled = false;
+        if (previewState.videoPermission === 'denied') previewState.isVideoEnabled = false;
         
         // Update visible labels
         updateDeviceLabels();
+        updateMediaAvailabilityUI();
         
     } catch (error) {
         console.error('Error enumerating devices:', error);
@@ -473,16 +619,23 @@ async function startPreview() {
         // Stop existing stream
         if (previewState.stream) {
             previewState.stream.getTracks().forEach(track => track.stop());
+            previewState.stream = null;
         }
         
         const constraints = {
-            video: previewState.isVideoEnabled ? {
+            video: previewState.hasVideoInput && previewState.videoPermission === 'granted' && previewState.isVideoEnabled ? {
                 deviceId: previewState.selectedCameraId ? { exact: previewState.selectedCameraId } : undefined
             } : false,
-            audio: {
+            audio: previewState.hasAudioInput && previewState.audioPermission === 'granted' ? {
                 deviceId: previewState.selectedMicId ? { exact: previewState.selectedMicId } : undefined
-            }
+            } : false
         };
+
+        if (!constraints.audio && !constraints.video) {
+            elements.previewVideo.srcObject = null;
+            updatePreviewVideoState();
+            return;
+        }
         
         previewState.stream = await navigator.mediaDevices.getUserMedia(constraints);
         
@@ -499,6 +652,17 @@ async function startPreview() {
         updatePreviewVideoState();
         
     } catch (error) {
+        if (isPermissionDeniedError(error)) {
+            if (previewState.isAudioEnabled) {
+                previewState.audioPermission = 'denied';
+                previewState.isAudioEnabled = false;
+            }
+            if (previewState.isVideoEnabled) {
+                previewState.videoPermission = 'denied';
+                previewState.isVideoEnabled = false;
+            }
+            updateMediaAvailabilityUI();
+        }
         console.error('Error starting preview:', error);
         elements.previewAvatar.classList.add('visible');
     }
@@ -518,7 +682,18 @@ function stopPreview() {
 /**
  * Toggle preview microphone
  */
-function togglePreviewMic() {
+async function togglePreviewMic() {
+    if (!previewState.isAudioEnabled && previewState.audioPermission !== 'granted') {
+        const granted = await requestDevicePermission('audio');
+        if (!granted) return;
+    }
+
+    const audioError = getDeviceAccessError('audio');
+    if (audioError) {
+        showNotification(audioError, 'error');
+        return;
+    }
+
     previewState.isAudioEnabled = !previewState.isAudioEnabled;
     
     if (previewState.stream) {
@@ -539,6 +714,17 @@ function togglePreviewMic() {
  * Toggle preview camera
  */
 async function togglePreviewVideo() {
+    if (!previewState.isVideoEnabled && previewState.videoPermission !== 'granted') {
+        const granted = await requestDevicePermission('video');
+        if (!granted) return;
+    }
+
+    const videoError = getDeviceAccessError('video');
+    if (videoError) {
+        showNotification(videoError, 'error');
+        return;
+    }
+
     previewState.isVideoEnabled = !previewState.isVideoEnabled;
     
     elements.previewToggleVideo.classList.toggle('muted', !previewState.isVideoEnabled);
@@ -584,6 +770,111 @@ function updateDeviceLabels() {
     elements.cameraLabel.textContent = cameraOption ? cameraOption.text : 'No camera';
 }
 
+function updateMediaAvailabilityUI() {
+    const audioUnavailable = !previewState.hasAudioInput;
+    const videoUnavailable = !previewState.hasVideoInput;
+    const audioPermissionDenied = previewState.audioPermission === 'denied';
+    const videoPermissionDenied = previewState.videoPermission === 'denied';
+
+    elements.previewToggleMic.disabled = false;
+    elements.previewToggleVideo.disabled = false;
+    elements.toggleAudioBtn.disabled = false;
+    elements.toggleVideoBtn.disabled = false;
+    elements.microphoneSelect.disabled = audioUnavailable;
+    elements.cameraSelect.disabled = videoUnavailable;
+
+    elements.previewToggleMic.title = audioUnavailable
+        ? 'No microphone detected'
+        : audioPermissionDenied
+        ? 'Microphone permission denied'
+        : 'Toggle Microphone';
+    elements.previewToggleVideo.title = videoUnavailable
+        ? 'No camera detected'
+        : videoPermissionDenied
+        ? 'Camera permission denied'
+        : 'Toggle Camera';
+    elements.toggleAudioBtn.title = audioUnavailable
+        ? 'No microphone detected'
+        : audioPermissionDenied
+        ? 'Microphone permission denied'
+        : 'Toggle Microphone';
+    elements.toggleVideoBtn.title = videoUnavailable
+        ? 'No camera detected'
+        : videoPermissionDenied
+        ? 'Camera permission denied'
+        : 'Toggle Camera';
+
+    elements.previewToggleMic.classList.toggle('muted', audioUnavailable || audioPermissionDenied || !previewState.isAudioEnabled);
+    elements.previewToggleVideo.classList.toggle('muted', videoUnavailable || videoPermissionDenied || !previewState.isVideoEnabled);
+    elements.toggleAudioBtn.classList.toggle('muted', audioUnavailable || audioPermissionDenied || !appState.isAudioEnabled);
+    elements.toggleVideoBtn.classList.toggle('muted', videoUnavailable || videoPermissionDenied || !appState.isVideoEnabled);
+
+    if (audioUnavailable || audioPermissionDenied) {
+        elements.previewToggleMic.innerHTML = '<i data-lucide="mic-off"></i>';
+        elements.toggleAudioBtn.innerHTML = '<i data-lucide="mic-off"></i>';
+    }
+
+    if (videoUnavailable || videoPermissionDenied) {
+        elements.previewToggleVideo.innerHTML = '<i data-lucide="video-off"></i>';
+        elements.toggleVideoBtn.innerHTML = '<i data-lucide="video-off"></i>';
+    }
+
+    lucide.createIcons();
+}
+
+function localPublisherHasTrack(kind) {
+    if (!openviduClient.publisher || !openviduClient.publisher.stream) {
+        return false;
+    }
+
+    const mediaStream = openviduClient.publisher.stream.getMediaStream();
+    if (!mediaStream) {
+        return false;
+    }
+
+    return kind === 'audio'
+        ? mediaStream.getAudioTracks().length > 0
+        : mediaStream.getVideoTracks().length > 0;
+}
+
+async function publishLocalStreamWithCurrentPermissions() {
+    const canPublishAudio =
+        previewState.hasAudioInput && previewState.audioPermission === 'granted';
+    const canPublishVideo =
+        previewState.hasVideoInput && previewState.videoPermission === 'granted';
+
+    if (!canPublishAudio && !canPublishVideo) {
+        return false;
+    }
+
+    if (openviduClient.publisher && openviduClient.session) {
+        try {
+            openviduClient.session.unpublish(openviduClient.publisher);
+        } catch (error) {
+            console.error('Error unpublishing local stream:', error);
+        }
+        openviduClient.publisher = null;
+    }
+
+    const publishOptions = {
+        audioSource: canPublishAudio ? previewState.selectedMicId || undefined : false,
+        videoSource: canPublishVideo ? previewState.selectedCameraId || undefined : false,
+        publishAudio: appState.isAudioEnabled,
+        publishVideo: appState.isVideoEnabled
+    };
+
+    await openviduClient.publish(elements.localVideo, publishOptions);
+
+    if (openviduClient.publisher && openviduClient.publisher.stream) {
+        const mediaStream = openviduClient.publisher.stream.getMediaStream();
+        if (mediaStream) {
+            setupLocalSpeakingDetection(mediaStream);
+        }
+    }
+
+    return true;
+}
+
 /**
  * Handle device selection change
  */
@@ -614,6 +905,7 @@ function updateConnectionStatus(connected) {
     appState.isConnected = connected;
     elements.connectionStatus.textContent = connected ? 'Connected' : 'Disconnected';
     elements.connectionStatus.classList.toggle('connected', connected);
+    elements.connectionStatus.style.background = '';
 }
 
 /**
@@ -655,6 +947,27 @@ function setupAvatar(wrapper, nickname, avatarElement, initialElement) {
     wrapper.style.backgroundColor = color;
     avatarElement.style.backgroundColor = color;
     initialElement.textContent = getInitial(nickname);
+}
+
+function parseOpenViduConnectionData(connection) {
+    let connectionData = {};
+
+    try {
+        const rawData = connection?.data || '';
+        const dataParts = rawData.split('%/%');
+        for (const part of dataParts) {
+            try {
+                const parsed = JSON.parse(part);
+                connectionData = { ...connectionData, ...parsed };
+            } catch (e) {}
+        }
+    } catch (e) {}
+
+    return {
+        nickname: connectionData.nickname || 'Participant',
+        preferredLanguage: connectionData.preferredLanguage || 'en',
+        isScreenShare: Boolean(connectionData.isScreenShare),
+    };
 }
 
 function showConferenceRoom() {
@@ -705,27 +1018,44 @@ function updateParticipantCount() {
 /**
  * Create video element for a remote participant
  */
-function createRemoteVideoElement(subscriber) {
-    const stream = subscriber.stream;
-    const connectionId = stream.connection.connectionId;
-    
-    // Parse connection data
-    // OpenVidu concatenates client and server data with '%/%' separator
-    let connectionData = {};
-    try {
-        const rawData = stream.connection.data;
-        const dataParts = rawData.split('%/%');
-        for (const part of dataParts) {
-            try {
-                const parsed = JSON.parse(part);
-                connectionData = { ...connectionData, ...parsed };
-            } catch (e) {}
+function createRemoteVideoElement(subscriberOrConnection) {
+    const isSubscriber =
+        subscriberOrConnection &&
+        typeof subscriberOrConnection.addVideoElement === 'function' &&
+        subscriberOrConnection.stream;
+    const stream = isSubscriber ? subscriberOrConnection.stream : null;
+    const connection = stream?.connection || subscriberOrConnection;
+    const subscriber = isSubscriber ? subscriberOrConnection : null;
+    const connectionId = connection.connectionId;
+    const connectionData = parseOpenViduConnectionData(connection);
+    const nickname = connectionData.nickname;
+
+    const existingWrapper = document.getElementById(`video-${connectionId}`);
+    if (existingWrapper) {
+        const labelName = existingWrapper.querySelector('.video-label-left span:last-child');
+        const languageBadge = existingWrapper.querySelector('.language-badge');
+        const avatar = document.getElementById(`avatar-${connectionId}`);
+
+        if (labelName) {
+            labelName.textContent = nickname;
         }
-    } catch (e) {
-        connectionData = { nickname: 'Unknown', preferredLanguage: 'en' };
+        if (languageBadge) {
+            languageBadge.textContent = connectionData.preferredLanguage.toUpperCase();
+        }
+        if (avatar) {
+            avatar.classList.toggle('visible', !stream || !stream.videoActive);
+        }
+        existingWrapper.classList.toggle('camera-off', !stream || !stream.videoActive);
+
+        if (subscriber) {
+            const video = document.getElementById(`video-element-${connectionId}`);
+            if (video) {
+                subscriber.addVideoElement(video);
+            }
+        }
+
+        return existingWrapper;
     }
-    
-    const nickname = connectionData.nickname || 'Participant';
     
     // Create wrapper
     const wrapper = document.createElement('div');
@@ -756,7 +1086,7 @@ function createRemoteVideoElement(subscriber) {
             <span class="speaking-indicator" id="speaking-${connectionId}"></span>
             <span>${nickname}</span>
         </div>
-        <span class="language-badge">${(connectionData.preferredLanguage || 'en').toUpperCase()}</span>
+        <span class="language-badge">${connectionData.preferredLanguage.toUpperCase()}</span>
     `;
     
     // Create subtitle container
@@ -783,11 +1113,13 @@ function createRemoteVideoElement(subscriber) {
     // Set up avatar with earthy color
     setupAvatar(wrapper, nickname, avatar, avatarCircle);
     
-    // Attach subscriber's stream to video element
-    subscriber.addVideoElement(video);
+    // Attach subscriber's stream to video element when available
+    if (subscriber) {
+        subscriber.addVideoElement(video);
+    }
     
     // Check if video is enabled and show avatar if not
-    if (!stream.videoActive) {
+    if (!stream || !stream.videoActive) {
         wrapper.classList.add('camera-off');
         avatar.classList.add('visible');
     }
@@ -2108,6 +2440,7 @@ function setupOpenViduCallbacks() {
     openviduClient.onStreamCreated = (event, subscriber) => {
         const stream = event.stream;
         const connectionId = stream.connection.connectionId;
+        const connectionData = parseOpenViduConnectionData(stream.connection);
         
         // Detailed logging for debugging
         logEvent('info', `=== Stream Created Event ===`);
@@ -2124,12 +2457,6 @@ function setupOpenViduCallbacks() {
             createRemoteScreenShareElement(subscriber);
             logEvent('info', `Screen share displayed from ${connectionId}`);
         } else {
-            // Check if this is a screen share connection (by parsing connection data)
-            let connectionData = {};
-            try {
-                connectionData = JSON.parse(stream.connection.data);
-            } catch (e) {}
-            
             // Skip creating camera element for screen share connections (they only publish SCREEN)
             if (connectionData.isScreenShare) {
                 logEvent('info', `Skipping camera element for screen share connection`);
@@ -2141,18 +2468,7 @@ function setupOpenViduCallbacks() {
             createRemoteVideoElement(subscriber);
             
             // Add to participants panel
-            let nickname = 'Participant';
-            try {
-                const rawData = stream.connection.data;
-                const dataParts = rawData.split('%/%');
-                for (const part of dataParts) {
-                    try {
-                        const parsed = JSON.parse(part);
-                        if (parsed.nickname) nickname = parsed.nickname;
-                    } catch (e) {}
-                }
-            } catch (e) {}
-            addParticipantToPanel(connectionId, nickname, false);
+            addParticipantToPanel(connectionId, connectionData.nickname, false);
             
             updateParticipantCount();
             updateAudioTracksDebug();
@@ -2223,19 +2539,19 @@ function setupOpenViduCallbacks() {
             removeRemoteScreenShareElement(connectionId);
             logEvent('info', `Remote screen share ended from ${connectionId}`);
         } else {
-            // Regular camera stream
-            removeRemoteVideoElement(connectionId);
+            // Regular camera stream: keep participant visible, just fall back to avatar
+            const wrapper = document.getElementById(`video-${connectionId}`);
+            const avatar = document.getElementById(`avatar-${connectionId}`);
+            if (wrapper) {
+                wrapper.classList.add('camera-off');
+            }
+            if (avatar) {
+                avatar.classList.add('visible');
+            }
             cleanupRemoteSpeakingDetection(connectionId);
-            
-            // Remove from participants panel
-            removeParticipantFromPanel(connectionId);
-            
             updateParticipantCount();
             updateAudioTracksDebug();
             updateInterpreterButtonState();
-            
-            // Play notification sound for participant leaving
-            playLeaveSound();
             
             // Update transcription button state
             updateTranscriptionButtonState();
@@ -2253,12 +2569,34 @@ function setupOpenViduCallbacks() {
     };
     
     openviduClient.onConnectionCreated = (event) => {
+        const { connection } = event;
+        const localConnectionId = openviduClient.session?.connection?.connectionId;
+
+        if (!connection || connection.connectionId === localConnectionId) {
+            updateParticipantCount();
+            return;
+        }
+
+        const connectionData = parseOpenViduConnectionData(connection);
+        if (!connectionData.isScreenShare) {
+            createRemoteVideoElement(connection);
+            addParticipantToPanel(connection.connectionId, connectionData.nickname, false);
+            playJoinSound();
+        }
+
         updateParticipantCount();
+        updateInterpreterButtonState();
+        updateTranscriptionButtonState();
     };
     
     openviduClient.onConnectionDestroyed = (event) => {
         const connectionId = event.connection.connectionId;
+        const connectionData = parseOpenViduConnectionData(event.connection);
         removeRemoteVideoElement(connectionId);
+        if (!connectionData.isScreenShare) {
+            removeParticipantFromPanel(connectionId);
+            playLeaveSound();
+        }
         updateParticipantCount();
         updateAudioTracksDebug();
     };
@@ -2268,9 +2606,8 @@ function setupOpenViduCallbacks() {
         
         // Don't show alert for ICE disconnections - they're usually temporary
         if (exception.name !== 'ICE_CONNECTION_DISCONNECTED') {
-            // For serious errors, show alert
             if (exception.name === 'ICE_CONNECTION_FAILED') {
-                showReconnectPrompt();
+                handleConnectionLost('Connection failed');
             }
         }
     };
@@ -2285,38 +2622,57 @@ function setupOpenViduCallbacks() {
         elements.connectionStatus.textContent = 'Reconnecting...';
         elements.connectionStatus.style.background = '#f59e0b'; // Orange
         logEvent('warn', 'Attempting to reconnect...');
+        clearReconnectTimeout();
+        reconnectTimeoutId = setTimeout(() => {
+            handleConnectionLost('Connection lost');
+        }, 12000);
     };
 
     openviduClient.onReconnected = () => {
+        clearReconnectTimeout();
         updateConnectionStatus(true);
         logEvent('info', 'Connection restored!');
     };
 
     openviduClient.onIceFailure = (exception) => {
-        showReconnectPrompt();
+        handleConnectionLost('Connection failed');
+    };
+
+    openviduClient.onSessionDisconnected = (event) => {
+        if (isLeavingSessionIntentional) {
+            return;
+        }
+
+        const reason = event?.reason === 'networkDisconnect'
+            ? 'Connection lost'
+            : 'Session disconnected';
+        handleConnectionLost(reason);
     };
 }
 
-/**
- * Show reconnection prompt to user
- */
-function showReconnectPrompt() {
-    // Stop interpreter if active
+function clearReconnectTimeout() {
+    if (reconnectTimeoutId) {
+        clearTimeout(reconnectTimeoutId);
+        reconnectTimeoutId = null;
+    }
+}
+
+function handleConnectionLost(reason = 'Connection lost') {
+    if (isLeavingSessionIntentional || hasHandledConnectionLoss) {
+        return;
+    }
+
+    hasHandledConnectionLoss = true;
+    clearReconnectTimeout();
+
     if (appState.isInterpreterActive) {
         stopInterpreter();
     }
-    
-    const shouldReconnect = confirm(
-        'Connection lost. Would you like to rejoin the session?'
-    );
-    
-    if (shouldReconnect && appState.sessionId) {
-        // Attempt to rejoin
-        leaveSession();
-        joinSession(appState.sessionId, appState.nickname, appState.preferredLanguage);
-    } else {
-        leaveSession();
-    }
+
+    updateConnectionStatus(false);
+    showNotification(`${reason}. You have been returned to the waiting room.`, 'error');
+    logEvent('error', `${reason}. Returned to waiting room.`);
+    leaveSession();
 }
 
 // =============================================================================
@@ -2328,14 +2684,23 @@ function showReconnectPrompt() {
  */
 async function joinSession(sessionId, nickname, preferredLanguage) {
     try {
+        isLeavingSessionIntentional = false;
+        hasHandledConnectionLoss = false;
+        clearReconnectTimeout();
         logEvent('info', `Joining session: ${sessionId}`);
         
         // Update state from preview settings
         appState.sessionId = sessionId;
         appState.nickname = nickname;
         appState.preferredLanguage = preferredLanguage;
-        appState.isAudioEnabled = previewState.isAudioEnabled;
-        appState.isVideoEnabled = previewState.isVideoEnabled;
+        appState.isAudioEnabled =
+            previewState.hasAudioInput &&
+            previewState.audioPermission !== 'denied' &&
+            previewState.isAudioEnabled;
+        appState.isVideoEnabled =
+            previewState.hasVideoInput &&
+            previewState.videoPermission !== 'denied' &&
+            previewState.isVideoEnabled;
         
         // Stop preview stream before joining
         stopPreview();
@@ -2357,15 +2722,19 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         // Show conference UI
         showConferenceRoom();
         
-        // Publish local stream with selected devices
-        logEvent('info', 'Publishing local stream...');
-        const publishOptions = {
-            audioSource: previewState.selectedMicId || undefined,
-            videoSource: previewState.selectedCameraId || undefined,
-            publishAudio: appState.isAudioEnabled,
-            publishVideo: appState.isVideoEnabled
-        };
-        await openviduClient.publish(elements.localVideo, publishOptions);
+        const canPublishAudio =
+            previewState.hasAudioInput && previewState.audioPermission === 'granted';
+        const canPublishVideo =
+            previewState.hasVideoInput && previewState.videoPermission === 'granted';
+
+        if (canPublishAudio || canPublishVideo) {
+            logEvent('info', 'Publishing local stream...');
+            await publishLocalStreamWithCurrentPermissions();
+        } else {
+            logEvent('info', 'Joined session without local media devices');
+        }
+
+        updateMediaAvailabilityUI();
         logEvent('info', 'Successfully joined session!');
         
         // Set up local speaking detection
@@ -2571,6 +2940,9 @@ async function stopScreenShare() {
  * Leave the current session
  */
 function leaveSession() {
+    isLeavingSessionIntentional = true;
+    clearReconnectTimeout();
+
     // Stop screen sharing if active
     if (appState.isScreenSharing) {
         stopScreenShare();
@@ -2627,6 +2999,7 @@ function leaveSession() {
     
     showJoinForm();
     logEvent('info', 'Left session');
+    isLeavingSessionIntentional = false;
 }
 
 // =============================================================================
@@ -2658,8 +3031,26 @@ elements.joinForm.addEventListener('submit', async (e) => {
 });
 
 // Audio toggle
-elements.toggleAudioBtn.addEventListener('click', () => {
-    appState.isAudioEnabled = openviduClient.toggleAudio();
+elements.toggleAudioBtn.addEventListener('click', async () => {
+    if (!appState.isAudioEnabled && previewState.audioPermission !== 'granted') {
+        const granted = await requestDevicePermission('audio');
+        if (!granted) return;
+
+        appState.isAudioEnabled = true;
+        if (!openviduClient.publisher || !localPublisherHasTrack('audio')) {
+            await publishLocalStreamWithCurrentPermissions();
+        }
+    }
+
+    const audioError = getDeviceAccessError('audio');
+    if (audioError) {
+        showNotification(audioError, 'error');
+        return;
+    }
+
+    if (openviduClient.publisher && localPublisherHasTrack('audio')) {
+        appState.isAudioEnabled = openviduClient.toggleAudio();
+    }
     elements.toggleAudioBtn.classList.toggle('muted', !appState.isAudioEnabled);
     elements.toggleAudioBtn.innerHTML = appState.isAudioEnabled 
         ? '<i data-lucide="mic"></i>' 
@@ -2668,8 +3059,26 @@ elements.toggleAudioBtn.addEventListener('click', () => {
 });
 
 // Video toggle
-elements.toggleVideoBtn.addEventListener('click', () => {
-    appState.isVideoEnabled = openviduClient.toggleVideo();
+elements.toggleVideoBtn.addEventListener('click', async () => {
+    if (!appState.isVideoEnabled && previewState.videoPermission !== 'granted') {
+        const granted = await requestDevicePermission('video');
+        if (!granted) return;
+
+        appState.isVideoEnabled = true;
+        if (!openviduClient.publisher || !localPublisherHasTrack('video')) {
+            await publishLocalStreamWithCurrentPermissions();
+        }
+    }
+
+    const videoError = getDeviceAccessError('video');
+    if (videoError) {
+        showNotification(videoError, 'error');
+        return;
+    }
+
+    if (openviduClient.publisher && localPublisherHasTrack('video')) {
+        appState.isVideoEnabled = openviduClient.toggleVideo();
+    }
     elements.toggleVideoBtn.classList.toggle('muted', !appState.isVideoEnabled);
     elements.toggleVideoBtn.innerHTML = appState.isVideoEnabled 
         ? '<i data-lucide="video"></i>' 

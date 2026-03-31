@@ -24,6 +24,7 @@ class OpenViduClient {
         this.onConnectionDestroyed = null;
         this.onException = null;
         this.onLog = null;
+        this.onSessionDisconnected = null;
     }
 
     /**
@@ -171,6 +172,13 @@ class OpenViduClient {
             this.log('info', 'Successfully reconnected!');
             if (this.onReconnected) {
                 this.onReconnected();
+            }
+        });
+
+        this.session.on('sessionDisconnected', (event) => {
+            this.log('warn', `Session disconnected: ${event.reason}`);
+            if (this.onSessionDisconnected) {
+                this.onSessionDisconnected(event);
             }
         });
     }

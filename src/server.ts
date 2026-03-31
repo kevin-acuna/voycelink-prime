@@ -416,12 +416,6 @@ class InterpreterSession {
                 input_audio_transcription: {
                     model: 'whisper-1'
                 },
-                // turn_detection: {
-                //     type: 'server_vad',
-                //     threshold: 0.5,
-                //     prefix_padding_ms: 300,
-                //     silence_duration_ms: 500
-                // }
                 turn_detection: {
                     type: 'semantic_vad',
                     eagerness: 'auto'
@@ -580,17 +574,25 @@ app.get('*', (req, res) => {
 // Server Startup
 // =============================================================================
 const server = app.listen(config.port, () => {
-    logger.info({
-        port: config.port,
-        openviduUrl: config.openvidu.url,
-        openaiConfigured: Boolean(config.openai.apiKey),
-        endpoints: [
-            'GET /api/health',
-            'POST /api/sessions',
-            'POST /api/sessions/:id/connections',
-            'GET /api/sessions/:id',
-        ],
-    }, 'Backend server started');
+    logger.info(
+        {
+            port: config.port,
+            openviduUrl: config.openvidu.url,
+            openaiConfigured: Boolean(config.openai.apiKey),
+        },
+        `Server is running on http://localhost:${config.port}`
+    );
+    logger.info(
+        {
+            endpoints: [
+                'GET /api/health',
+                'POST /api/sessions',
+                'POST /api/sessions/:id/connections',
+                'GET /api/sessions/:id',
+            ],
+        },
+        'Available endpoints'
+    );
     
     // Setup WebSocket for interpretation
     setupInterpreterWebSocket(server);
