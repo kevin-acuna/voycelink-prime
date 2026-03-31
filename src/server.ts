@@ -477,6 +477,24 @@ function resolveBootstrapSession(req, decodedToken) {
     };
 }
 
+function getBootstrapDebugMetadata(req) {
+    return {
+        originalUrl: req.originalUrl,
+        path: req.path,
+        roomQuery: typeof req.query?.room === 'string' ? req.query.room : null,
+        roomIdQuery: typeof req.query?.roomId === 'string' ? req.query.roomId : null,
+        sessionIdQuery: typeof req.query?.sessionId === 'string' ? req.query.sessionId : null,
+        secFetchMode: req.headers['sec-fetch-mode'] || null,
+        secFetchDest: req.headers['sec-fetch-dest'] || null,
+        secFetchUser: req.headers['sec-fetch-user'] || null,
+        referer: req.headers.referer || null,
+        hasAccessCookie: Boolean(parseCookies(req)[AUTH_COOKIE_NAME]),
+        hasRefreshCookie: Boolean(parseCookies(req)[AUTH_REFRESH_COOKIE_NAME]),
+        hasBootstrapCookie: Boolean(parseCookies(req)[BOOTSTRAP_COOKIE_NAME]),
+        hasOwnerCookie: Boolean(parseCookies(req)[OWNER_COOKIE_NAME]),
+    };
+}
+
 function isPrimaryDocumentNavigation(req) {
     const mode = req.headers['sec-fetch-mode'];
     const dest = req.headers['sec-fetch-dest'];
@@ -516,6 +534,18 @@ function validateRoomBinding(req, res, sessionId) {
 function authenticateRequest(req, res, next) {
     const requestedRoomId = getRequestedRoomIdForRequest(req);
     const token = getAccessTokenFromRequest(req);
+    logger.info(
+        {
+            path: req.path,
+            method: req.method,
+            requestedRoomId,
+            hasAccessToken: Boolean(token),
+            hasRefreshToken: Boolean(getRefreshTokenFromRequest(req)),
+            bootstrapRoomId: getBootstrapSessionFromRequest(req)?.roomId ?? null,
+            bootstrapRole: getBootstrapSessionFromRequest(req)?.role ?? null,
+        },
+        'Authenticating request'
+    );
 
     if (!token) {
         const refreshToken = getRefreshTokenFromRequest(req);
@@ -523,6 +553,16 @@ function authenticateRequest(req, res, next) {
             try {
                 const decodedRefresh = jwt.verify(refreshToken, config.auth.jwtSecret);
                 if (decodedRefresh && typeof decodedRefresh === 'object' && isRole(decodedRefresh.role)) {
+                    logger.info(
+                        {
+                            path: req.path,
+                            method: req.method,
+                            requestedRoomId,
+                            refreshRole: decodedRefresh.role,
+                            refreshRoomId: decodedRefresh.roomId ?? null,
+                        },
+                        'Recovered authentication candidate from refresh token'
+                    );
                     if (
                         requestedRoomId &&
                         decodedRefresh.roomId &&
@@ -570,6 +610,17 @@ function authenticateRequest(req, res, next) {
             });
         }
 
+        logger.info(
+            {
+                path: req.path,
+                method: req.method,
+                requestedRoomId,
+                tokenRole: decoded.role,
+                tokenRoomId: decoded.roomId ?? null,
+            },
+            'Recovered authentication from access token'
+        );
+
         if (requestedRoomId && decoded.roomId && decoded.roomId !== requestedRoomId) {
             logger.warn(
                 {
@@ -597,6 +648,16 @@ function authenticateRequest(req, res, next) {
             try {
                 const decodedRefresh = jwt.verify(refreshToken, config.auth.jwtSecret);
                 if (decodedRefresh && typeof decodedRefresh === 'object' && isRole(decodedRefresh.role)) {
+                    logger.info(
+                        {
+                            path: req.path,
+                            method: req.method,
+                            requestedRoomId,
+                            refreshRole: decodedRefresh.role,
+                            refreshRoomId: decodedRefresh.roomId ?? null,
+                        },
+                        'Recovered authentication candidate from refresh token after access token failure'
+                    );
                     if (
                         requestedRoomId &&
                         decodedRefresh.roomId &&
@@ -1192,6 +1253,18 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
     try {
         const { sessionId, sessionProperties = {} } = req.body;
         const resolvedSessionId = sessionId || req.auth.roomId;
+        logger.info(
+            {
+                path: req.path,
+                authRole: req.auth?.role ?? null,
+                authRoomId: req.auth?.roomId ?? null,
+                bodySessionId: sessionId ?? null,
+                resolvedSessionId,
+                bootstrapRoomId: getBootstrapSessionFromRequest(req)?.roomId ?? null,
+                bootstrapRole: getBootstrapSessionFromRequest(req)?.role ?? null,
+            },
+            'Handling create session request'
+        );
 
         if (!validateRoomBinding(req, res, resolvedSessionId)) {
             return;
@@ -1780,6 +1853,18 @@ app.get('*', (req, res) => {
     }
 
     const bootstrapSession = resolveBootstrapSession(req, decodedToken);
+    logger.info(
+        {
+            ...getBootstrapDebugMetadata(req),
+            decodedTokenRole: decodedToken?.role ?? null,
+            decodedTokenRoomId: decodedToken?.roomId ?? null,
+            bootstrapCookieRoomId: getBootstrapSessionFromRequest(req)?.roomId ?? null,
+            bootstrapCookieRole: getBootstrapSessionFromRequest(req)?.role ?? null,
+            resolvedBootstrapRole: bootstrapSession.role,
+            resolvedBootstrapRoomId: bootstrapSession.roomId,
+        },
+        'Resolved bootstrap session for document request'
+    );
     const authSession = createAccessSession(
         bootstrapSession.role,
         bootstrapSession.roomId
