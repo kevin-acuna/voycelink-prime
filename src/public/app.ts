@@ -239,6 +239,8 @@ const previewState = {
 let reconnectTimeoutId = null;
 let isLeavingSessionIntentional = false;
 let hasHandledConnectionLoss = false;
+const ENABLE_LAYOUT_TESTER = CONFIG.DEBUG || window.location.hostname === 'localhost';
+const MOCK_PARTICIPANT_PREFIX = 'mock-participant-';
 
 // =============================================================================
 // Room Link Functions
@@ -999,11 +1001,14 @@ function showConferenceRoom() {
         localWrapper.classList.add('camera-off');
         localAvatar.classList.add('visible');
     }
+
+    updateVideoGridLayoutState();
 }
 
 function showJoinForm() {
     elements.conferenceContainer.style.display = 'none';
     elements.joinContainer.style.display = 'flex';
+    clearMockParticipants();
     updateParticipantCount();
     
     // Restart preview when returning to join form
@@ -1011,8 +1016,127 @@ function showJoinForm() {
 }
 
 function updateParticipantCount() {
-    const count = openviduClient.subscribers.size + 1; // +1 for local user
+    const count = participantsData.size > 0
+        ? participantsData.size
+        : appState.isConnected || appState.sessionId
+        ? 1
+        : 0;
     elements.participantCount.textContent = count;
+    updateVideoGridLayoutState();
+}
+
+function updateVideoGridLayoutState() {
+    const grid = elements.videoGrid;
+    if (!grid) return;
+
+    const participantTiles = grid.querySelectorAll('.video-wrapper:not(.screen-share-video)').length;
+    const galleryClasses = [
+        'gallery-count-0',
+        'gallery-count-1',
+        'gallery-count-2',
+        'gallery-count-3',
+        'gallery-count-4',
+        'gallery-count-5',
+        'gallery-count-6',
+        'gallery-count-7-plus'
+    ];
+
+    grid.classList.remove(...galleryClasses);
+
+    if (participantTiles <= 0) {
+        grid.classList.add('gallery-count-0');
+        return;
+    }
+
+    if (participantTiles >= 7) {
+        grid.classList.add('gallery-count-7-plus');
+        return;
+    }
+
+    grid.classList.add(`gallery-count-${participantTiles}`);
+}
+
+// =============================================================================
+// Layout Test Helpers (easy to remove)
+// =============================================================================
+
+function clearMockParticipants() {
+    const mockIds = Array.from(participantsData.keys()).filter((id) =>
+        id.startsWith(MOCK_PARTICIPANT_PREFIX)
+    );
+
+    mockIds.forEach((connectionId) => {
+        removeRemoteVideoElement(connectionId);
+        removeParticipantFromPanel(connectionId);
+    });
+
+    updateParticipantCount();
+    updateAudioTracksDebug();
+}
+
+function createMockParticipant(index) {
+    const connectionId = `${MOCK_PARTICIPANT_PREFIX}${index + 1}`;
+    const languagePool = ['en', 'es', 'fr', 'de', 'pt'];
+    const nickname = `Mock User ${index + 1}`;
+    const connection = {
+        connectionId,
+        data: JSON.stringify({
+            nickname,
+            preferredLanguage: languagePool[index % languagePool.length],
+        }),
+    };
+
+    createRemoteVideoElement(connection);
+    addParticipantToPanel(connectionId, nickname, false);
+}
+
+function promptMockParticipantCount() {
+    if (elements.conferenceContainer.style.display === 'none') {
+        showNotification('Join a room before generating mock participants.', 'info');
+        return;
+    }
+
+    const response = window.prompt('How many mock participants do you want to generate?', '10');
+    if (response === null) return;
+
+    const count = Number.parseInt(response, 10);
+    if (!Number.isFinite(count) || count < 0) {
+        showNotification('Please enter a valid participant count.', 'error');
+        return;
+    }
+
+    clearMockParticipants();
+    for (let i = 0; i < count; i += 1) {
+        createMockParticipant(i);
+    }
+
+    updateParticipantCount();
+    showNotification(`Generated ${count} mock participant${count === 1 ? '' : 's'}.`, 'info');
+}
+
+function initializeLayoutTester() {
+    if (!ENABLE_LAYOUT_TESTER) return;
+    if (document.getElementById('layoutTestFab')) return;
+
+    const tester = document.createElement('div');
+    tester.id = 'layoutTestFab';
+    tester.className = 'layout-test-fab';
+    tester.innerHTML = `
+        <button type="button" class="layout-test-btn primary" id="layoutTestGenerate">
+            Test Layout
+        </button>
+        <button type="button" class="layout-test-btn" id="layoutTestClear">
+            Clear
+        </button>
+    `;
+
+    document.body.appendChild(tester);
+
+    document.getElementById('layoutTestGenerate')?.addEventListener('click', promptMockParticipantCount);
+    document.getElementById('layoutTestClear')?.addEventListener('click', () => {
+        clearMockParticipants();
+        showNotification('Mock participants cleared.', 'info');
+    });
 }
 
 /**
@@ -3205,6 +3329,9 @@ initializePage();
 
 // Initialize preview
 initPreview();
+
+// Local-only layout tester for gallery/presentation verification
+initializeLayoutTester();
 
 logEvent('info', 'Application initialized');
 logEvent('info', `Backend URL: ${CONFIG.BACKEND_URL}`);
