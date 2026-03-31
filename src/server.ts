@@ -368,6 +368,41 @@ function tryRestoreOwnerAuthentication(req, res) {
     return true;
 }
 
+function tryRestoreLinkAuthentication(req, res) {
+    const requestedRoomId = getRequestedRoomIdForRequest(req);
+    if (!requestedRoomId) {
+        return false;
+    }
+
+    if (tryRestoreOwnerAuthentication(req, res)) {
+        return true;
+    }
+
+    const inviteSession = getInviteSessionFromRequest(req);
+    if (inviteSession) {
+        const authSession = createAccessSession(inviteSession.role, inviteSession.roomId);
+        issueBootstrapCookies(res, authSession);
+        req.auth = {
+            role: inviteSession.role,
+            roomId: inviteSession.roomId,
+        };
+        logger.info(
+            { path: req.path, roomId: inviteSession.roomId },
+            'Restored participant authentication from invite token'
+        );
+        return true;
+    }
+
+    const authSession = createAccessSession(Role.GUEST, requestedRoomId);
+    issueBootstrapCookies(res, authSession);
+    req.auth = {
+        role: Role.GUEST,
+        roomId: requestedRoomId,
+    };
+    logger.info({ path: req.path, roomId: requestedRoomId }, 'Restored guest authentication from room link');
+    return true;
+}
+
 function resolveBootstrapSession(req, decodedToken) {
     const requestedRoomId =
         typeof req.query.room === 'string' && ROOM_ID_PATTERN.test(req.query.room)
@@ -465,7 +500,7 @@ function authenticateRequest(req, res, next) {
             }
         }
 
-        if (tryRestoreOwnerAuthentication(req, res)) {
+        if (tryRestoreLinkAuthentication(req, res)) {
             return next();
         }
 
@@ -493,7 +528,7 @@ function authenticateRequest(req, res, next) {
                 },
                 'Ignoring access token bound to a different room'
             );
-            if (tryRestoreOwnerAuthentication(req, res)) {
+            if (tryRestoreLinkAuthentication(req, res)) {
                 return next();
             }
 
@@ -539,7 +574,7 @@ function authenticateRequest(req, res, next) {
             }
         }
 
-        if (tryRestoreOwnerAuthentication(req, res)) {
+        if (tryRestoreLinkAuthentication(req, res)) {
             return next();
         }
 
