@@ -1,4 +1,8 @@
-process.loadEnvFile();
+import fs from 'fs';
+
+if (fs.existsSync('.env')) {
+  process.loadEnvFile('.env');
+}
 
 const env = process.env;
 
@@ -42,7 +46,7 @@ export function validateServerConfig() {
   ) {
     process.stderr.write('ERROR: Missing required environment variables.\n');
     process.stderr.write(
-      'Please ensure OPENVIDU_URL, OPENVIDU_SECRET, COSMOS_DB_CONNECTION_STRING, and optionally AUTH_JWT_SECRET are set in your .env file.\n'
+      'Please ensure OPENVIDU_URL, OPENVIDU_SECRET, COSMOS_DB_CONNECTION_STRING, and optionally AUTH_JWT_SECRET are set in the environment or local .env file.\n'
     );
     process.exit(1);
   }
