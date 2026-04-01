@@ -171,6 +171,7 @@ const elements = {
     joinForm: document.getElementById('joinForm'),
     sessionIdInput: document.getElementById('sessionId'),
     nicknameInput: document.getElementById('nickname'),
+    editNicknameBtn: document.getElementById('editNicknameBtn'),
     languageSelect: document.getElementById('preferredLanguage'),
     connectionStatus: document.getElementById('connectionStatus'),
     videoGrid: document.getElementById('videoGrid'),
@@ -220,7 +221,11 @@ const elements = {
     chatBadge: document.getElementById('chatBadge'),
     chatTranslateToggle: document.getElementById('chatTranslateToggle'),
     // Whiteboard elements
+    whiteboardActions: document.getElementById('whiteboardActions'),
     toggleWhiteboardBtn: document.getElementById('toggleWhiteboard'),
+    toggleWhiteboardMenuBtn: document.getElementById('toggleWhiteboardMenu'),
+    whiteboardMenu: document.getElementById('whiteboardMenu'),
+    advancedWhiteboardLink: document.getElementById('advancedWhiteboardLink'),
     whiteboardWrapper: document.getElementById('whiteboardWrapper'),
     closeWhiteboardBtn: document.getElementById('closeWhiteboardBtn'),
     // Reactions elements
@@ -254,6 +259,7 @@ let hasHandledConnectionLoss = false;
 const ENABLE_LAYOUT_TESTER = CONFIG.DEBUG || window.location.hostname === 'localhost';
 const MOCK_PARTICIPANT_PREFIX = 'mock-participant-';
 const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
+const NICKNAME_STORAGE_KEY = 'voycelink_nickname';
 const Permission = {
     CREATE_SESSION: 'create_session',
     JOIN_SESSION: 'join_session',
@@ -272,6 +278,7 @@ const Permission = {
 let permissionsSocket = null;
 let permissionsSocketReconnectTimeoutId = null;
 let activeParticipantAccessMenuId = null;
+let isWhiteboardMenuOpen = false;
 
 // =============================================================================
 // Room Link Functions
@@ -491,6 +498,54 @@ function setElementVisibility(element, isVisible, displayMode = '') {
     element.style.display = isVisible ? displayMode : 'none';
 }
 
+function closeWhiteboardMenu() {
+    isWhiteboardMenuOpen = false;
+    elements.whiteboardMenu?.classList.remove('show');
+    elements.toggleWhiteboardMenuBtn?.classList.remove('is-open');
+    elements.toggleWhiteboardMenuBtn?.setAttribute('aria-expanded', 'false');
+}
+
+function positionWhiteboardMenu() {
+    if (!elements.whiteboardMenu || !elements.toggleWhiteboardMenuBtn) {
+        return;
+    }
+
+    const buttonRect = elements.toggleWhiteboardMenuBtn.getBoundingClientRect();
+    const menu = elements.whiteboardMenu;
+
+    menu.style.visibility = 'hidden';
+    menu.classList.add('show');
+
+    const menuRect = menu.getBoundingClientRect();
+    const viewportPadding = 12;
+    const left = Math.min(
+        Math.max(buttonRect.right - menuRect.width, viewportPadding),
+        window.innerWidth - menuRect.width - viewportPadding
+    );
+    const top = Math.max(buttonRect.top - menuRect.height - 10, viewportPadding);
+
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+
+    menu.classList.remove('show');
+    menu.style.visibility = '';
+}
+
+function toggleWhiteboardMenu(event) {
+    event?.stopPropagation?.();
+    if (elements.toggleWhiteboardMenuBtn?.style.display === 'none') {
+        return;
+    }
+
+    isWhiteboardMenuOpen = !isWhiteboardMenuOpen;
+    if (isWhiteboardMenuOpen) {
+        positionWhiteboardMenu();
+    }
+    elements.whiteboardMenu?.classList.toggle('show', isWhiteboardMenuOpen);
+    elements.toggleWhiteboardMenuBtn?.classList.toggle('is-open', isWhiteboardMenuOpen);
+    elements.toggleWhiteboardMenuBtn?.setAttribute('aria-expanded', isWhiteboardMenuOpen ? 'true' : 'false');
+}
+
 function applyPermissionBasedUi() {
     const canCreateMeeting = canCreateMeetings() || !getRoomIdFromUrl();
     const isInConference = elements.conferenceContainer.style.display !== 'none';
@@ -505,6 +560,9 @@ function applyPermissionBasedUi() {
         setElementVisibility(elements.toggleTranscriptionBtn, isSubtitlesFeatureEnabled(), '');
         setElementVisibility(elements.toggleScreenShareBtn, canShareScreen(), '');
         setElementVisibility(elements.toggleWhiteboardBtn, canManageWhiteboard(), '');
+        setElementVisibility(elements.whiteboardActions, canManageWhiteboard(), 'inline-flex');
+        setElementVisibility(elements.toggleWhiteboardMenuBtn, appState.authRole === 'host', 'inline-flex');
+        setElementVisibility(elements.advancedWhiteboardLink, appState.authRole === 'host', 'flex');
         setElementVisibility(elements.toggleReactionsBtn, canSendGroupMessages(), '');
         elements.sendChatBtn.disabled = !canSendAnyChatMessages();
         elements.chatInput.disabled = !canSendAnyChatMessages();
@@ -517,6 +575,10 @@ function applyPermissionBasedUi() {
 
         if (!canSendGroupMessages()) {
             hideReactionsPopup();
+        }
+
+        if (appState.authRole !== 'host') {
+            closeWhiteboardMenu();
         }
     }
 
@@ -667,6 +729,7 @@ async function enforceCurrentPermissions() {
  * Initialize the page based on URL
  */
 function initializePage() {
+    applyStoredNickname();
     const roomId = getRoomIdFromUrl();
     logEvent(
         'info',
@@ -712,6 +775,47 @@ function getCookieValue(name) {
     }
 
     return decodeURIComponent(match.slice(cookiePrefix.length));
+}
+
+function getStoredNickname() {
+    try {
+        return localStorage.getItem(NICKNAME_STORAGE_KEY)?.trim() || '';
+    } catch (error) {
+        return '';
+    }
+}
+
+function persistNickname(nickname) {
+    try {
+        localStorage.setItem(NICKNAME_STORAGE_KEY, nickname);
+    } catch (error) {
+        logEvent('error', `Failed to persist nickname: ${error?.message || error}`);
+    }
+}
+
+function applyStoredNickname() {
+    if (!elements.nicknameInput) {
+        return;
+    }
+
+    const storedNickname = getStoredNickname();
+
+    if (storedNickname) {
+        elements.nicknameInput.value = storedNickname;
+        elements.nicknameInput.readOnly = true;
+        setElementVisibility(elements.editNicknameBtn, true, 'inline-flex');
+    } else {
+        elements.nicknameInput.readOnly = false;
+        setElementVisibility(elements.editNicknameBtn, false);
+    }
+
+    updatePreviewAvatar();
+}
+
+function enableNicknameEditing() {
+    elements.nicknameInput.readOnly = false;
+    elements.nicknameInput.focus();
+    elements.nicknameInput.select();
 }
 
 function loadBootstrapSession() {
@@ -986,9 +1090,6 @@ async function initPreview() {
         
         // Start preview with default devices
         await startPreview();
-        
-        // Update avatar initial when nickname changes
-        elements.nicknameInput.addEventListener('input', updatePreviewAvatar);
         
     } catch (error) {
         console.error('Error initializing preview:', error);
@@ -1705,6 +1806,7 @@ function showJoinForm() {
     elements.joinContainer.style.display = 'flex';
     clearMockParticipants();
     updateParticipantCount();
+    applyStoredNickname();
     
     // Restart preview when returning to join form
     initPreview();
@@ -4127,6 +4229,11 @@ elements.joinForm.addEventListener('submit', async (e) => {
         alert('Please enter both Room Name and Your Name');
         return;
     }
+
+    persistNickname(nickname);
+    elements.nicknameInput.readOnly = true;
+    setElementVisibility(elements.editNicknameBtn, true, 'inline-flex');
+    updatePreviewAvatar();
     
     // Find submit button and protect against multiple clicks
     const submitBtn = elements.joinForm.querySelector('button[type="submit"]');
@@ -4137,6 +4244,10 @@ elements.joinForm.addEventListener('submit', async (e) => {
     } else {
         await joinSession(sessionId, nickname, preferredLanguage);
     }
+});
+
+elements.editNicknameBtn?.addEventListener('click', () => {
+    enableNicknameEditing();
 });
 
 // Audio toggle
@@ -4244,6 +4355,7 @@ elements.toggleDebugBtn.addEventListener('click', () => {
 // Preview controls
 elements.previewToggleMic.addEventListener('click', togglePreviewMic);
 elements.previewToggleVideo.addEventListener('click', togglePreviewVideo);
+elements.nicknameInput.addEventListener('input', updatePreviewAvatar);
 
 // Device selectors
 elements.microphoneSelect.addEventListener('change', () => handleDeviceChange('microphone'));
@@ -4283,6 +4395,10 @@ elements.closeParticipantsBtn.addEventListener('click', closeParticipants);
 
 // Whiteboard controls
 elements.toggleWhiteboardBtn.addEventListener('click', toggleWhiteboardForCurrentRole);
+elements.toggleWhiteboardMenuBtn?.addEventListener('click', toggleWhiteboardMenu);
+elements.advancedWhiteboardLink?.addEventListener('click', () => {
+    closeWhiteboardMenu();
+});
 
 // Reactions controls
 elements.toggleReactionsBtn?.addEventListener('click', toggleReactionsPopup);
@@ -4304,6 +4420,10 @@ document.addEventListener('click', (e) => {
 
     if (!e.target.closest('.participant-access')) {
         closeParticipantAccessMenu();
+    }
+
+    if (!e.target.closest('.whiteboard-actions')) {
+        closeWhiteboardMenu();
     }
 });
 

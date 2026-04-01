@@ -80,11 +80,17 @@
                 <form id="joinForm">
                     <input type="hidden" id="sessionId">
                     <div class="form-group">
-                        <label for="nickname">Your Name</label>
-                        <input 
-                            type="text" 
-                            id="nickname" 
-                            placeholder="e.g., John Doe" 
+                        <div class="form-label-row">
+                            <label for="nickname">Your Name</label>
+                            <button type="button" class="btn-inline-edit" id="editNicknameBtn" title="Edit saved name" style="display: none;">
+                                <i data-lucide="pencil"></i>
+                                <span>Edit</span>
+                            </button>
+                        </div>
+                        <input
+                            type="text"
+                            id="nickname"
+                            placeholder="e.g., John Doe"
                             required
                             autocomplete="off"
                         >
@@ -234,10 +240,34 @@
                     <i data-lucide="users"></i>
                     <span>Participants</span>
                 </button>
-                <button class="btn btn-whiteboard" id="toggleWhiteboard" title="Toggle Whiteboard">
-                    <i data-lucide="pencil-ruler"></i>
-                    <span>Whiteboard</span>
-                </button>
+                <div class="whiteboard-actions" id="whiteboardActions">
+                    <button class="btn btn-whiteboard" id="toggleWhiteboard" title="Toggle Whiteboard">
+                        <i data-lucide="pencil-ruler"></i>
+                        <span>Whiteboard</span>
+                    </button>
+                    <button
+                        class="btn btn-whiteboard-more"
+                        id="toggleWhiteboardMenu"
+                        title="More whiteboard options"
+                        aria-expanded="false"
+                        aria-haspopup="true"
+                    >
+                        <span class="split-caret" aria-hidden="true">▾</span>
+                    </button>
+                    <div class="whiteboard-menu" id="whiteboardMenu">
+                        <a
+                            class="whiteboard-menu-item"
+                            id="advancedWhiteboardLink"
+                            href="https://openboard.ch/index.en.html"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="Open OpenBoard advanced whiteboard"
+                        >
+                            <i data-lucide="external-link"></i>
+                            <span>Advanced Whiteboard</span>
+                        </a>
+                    </div>
+                </div>
                 <div class="reactions-container">
                     <button class="btn btn-reactions" id="toggleReactions" title="Send Reaction">
                         <i data-lucide="smile-plus"></i>
