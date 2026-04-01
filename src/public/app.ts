@@ -299,18 +299,24 @@ async function ensureHostSessionExists(sessionId) {
 }
 
 async function createNewMeeting() {
-    if (appState.currentPermissions.length === 0) {
-        await refreshCurrentPermissions({ silent: true });
+    logEvent('info', 'Create meeting clicked: requesting new host room');
+    const bootstrapResponse = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.HOST_SESSION_BOOTSTRAP}`,
+        { method: 'POST' }
+    );
+
+    if (!bootstrapResponse.ok) {
+        const error = await bootstrapResponse.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to initialize host session');
     }
 
-    const roomId = appState.authRoomId;
+    const bootstrapData = await bootstrapResponse.json();
+    loadBootstrapSession();
+    await refreshCurrentPermissions({ silent: true });
+
+    const roomId = bootstrapData.roomId || appState.authRoomId;
     if (!roomId) {
         showNotification('Unable to create meeting. Please reload the page.', 'error');
-        return;
-    }
-
-    if (!canCreateMeetings()) {
-        showNotification('You do not have permission to create a meeting.', 'error');
         return;
     }
 
@@ -475,7 +481,7 @@ function setElementVisibility(element, isVisible, displayMode = '') {
 }
 
 function applyPermissionBasedUi() {
-    const canCreateMeeting = canCreateMeetings();
+    const canCreateMeeting = canCreateMeetings() || !getRoomIdFromUrl();
     const isInConference = elements.conferenceContainer.style.display !== 'none';
     const isOnHomeView = elements.homeCard.style.display !== 'none';
 
@@ -653,6 +659,10 @@ async function enforceCurrentPermissions() {
  */
 function initializePage() {
     const roomId = getRoomIdFromUrl();
+    logEvent(
+        'info',
+        `Initialize page: urlRoom=${roomId || 'none'}, authRoom=${appState.authRoomId || 'none'}, authRole=${appState.authRole || 'none'}`
+    );
     
     if (roomId) {
         elements.homeCard.style.display = 'none';
@@ -711,6 +721,10 @@ function loadBootstrapSession() {
         appState.authRole = authSession.role || null;
         appState.authRoomId = authSession.roomId || null;
         appState.authTokenExpiresAt = authSession.expiresAt || null;
+        logEvent(
+            'info',
+            `Loaded bootstrap session: role=${appState.authRole || 'none'}, room=${appState.authRoomId || 'none'}`
+        );
     } catch (error) {
         appState.authRole = null;
         appState.authRoomId = null;
@@ -892,12 +906,20 @@ function connectPermissionsWebSocket() {
  */
 async function getToken(sessionId, nickname, preferredLanguage) {
     let resolvedSessionId = resolveBoundSessionId(sessionId);
+    logEvent(
+        'info',
+        `Get token start: inputRoom=${sessionId}, resolvedRoom=${resolvedSessionId}, authRoom=${appState.authRoomId || 'none'}, authRole=${appState.authRole || 'none'}, urlRoom=${getRoomIdFromUrl() || 'none'}`
+    );
 
     if (appState.currentPermissions.length === 0) {
         await refreshCurrentPermissions({ silent: true });
     }
 
     if (canCreateMeetings()) {
+        logEvent(
+            'info',
+            `Creating session from frontend: resolvedRoom=${resolvedSessionId}, permissions=${appState.currentPermissions.join(',') || 'none'}`
+        );
         const sessionResponse = await apiFetch(`${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSIONS}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

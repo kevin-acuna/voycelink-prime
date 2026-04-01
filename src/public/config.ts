@@ -16,6 +16,7 @@ const CONFIG = {
     ENDPOINTS: {
         HEALTH: '/api/health',
         MY_PERMISSIONS: '/api/me/permissions',
+        HOST_SESSION_BOOTSTRAP: '/api/bootstrap/host-session',
         SESSIONS: '/api/sessions',
         SESSION_INVITE_LINK: (sessionId) => `/api/sessions/${sessionId}/invite-link`,
         CONNECTIONS: (sessionId) => `/api/sessions/${sessionId}/connections`,
