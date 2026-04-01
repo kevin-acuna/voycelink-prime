@@ -4,9 +4,6 @@
  * 
  * Orchestrates the UI and OpenVidu client
  */
-
-import { OpenVidu } from 'openvidu-browser';
-
 // =============================================================================
 // Button Click Protection (Prevent Multiple Clicks)
 // =============================================================================
