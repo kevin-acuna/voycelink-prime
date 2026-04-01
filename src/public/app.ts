@@ -439,6 +439,18 @@ function canPublishVideo() {
     return hasPermission(Permission.PUBLISH_VIDEO);
 }
 
+function getMediaPermissionRestriction(kind) {
+    if (kind === 'audio' && !canPublishAudio()) {
+        return 'The host has not enabled microphone access for you.';
+    }
+
+    if (kind === 'video' && !canPublishVideo()) {
+        return 'The host has not enabled camera access for you.';
+    }
+
+    return null;
+}
+
 function canShareScreen() {
     return hasPermission(Permission.SHARE_SCREEN);
 }
@@ -494,8 +506,6 @@ function applyPermissionBasedUi() {
         setElementVisibility(elements.toggleScreenShareBtn, canShareScreen(), '');
         setElementVisibility(elements.toggleWhiteboardBtn, canManageWhiteboard(), '');
         setElementVisibility(elements.toggleReactionsBtn, canSendGroupMessages(), '');
-        elements.toggleAudioBtn.disabled = !canPublishAudio();
-        elements.toggleVideoBtn.disabled = !canPublishVideo();
         elements.sendChatBtn.disabled = !canSendAnyChatMessages();
         elements.chatInput.disabled = !canSendAnyChatMessages();
         if (elements.chatRecipientSelect) {
@@ -1251,6 +1261,12 @@ function stopPreview() {
  * Toggle preview microphone
  */
 async function togglePreviewMic() {
+    const accessRestriction = getMediaPermissionRestriction('audio');
+    if (accessRestriction) {
+        showNotification(accessRestriction, 'error');
+        return;
+    }
+
     if (!previewState.isAudioEnabled && previewState.audioPermission !== 'granted') {
         const granted = await requestDevicePermission('audio');
         if (!granted) return;
@@ -1282,6 +1298,12 @@ async function togglePreviewMic() {
  * Toggle preview camera
  */
 async function togglePreviewVideo() {
+    const accessRestriction = getMediaPermissionRestriction('video');
+    if (accessRestriction) {
+        showNotification(accessRestriction, 'error');
+        return;
+    }
+
     if (!previewState.isVideoEnabled && previewState.videoPermission !== 'granted') {
         const granted = await requestDevicePermission('video');
         if (!granted) return;
@@ -1343,6 +1365,8 @@ function updateMediaAvailabilityUI() {
     const videoUnavailable = !previewState.hasVideoInput;
     const audioPermissionDenied = previewState.audioPermission === 'denied';
     const videoPermissionDenied = previewState.videoPermission === 'denied';
+    const audioAccessRestricted = Boolean(getMediaPermissionRestriction('audio'));
+    const videoAccessRestricted = Boolean(getMediaPermissionRestriction('video'));
 
     elements.previewToggleMic.disabled = false;
     elements.previewToggleVideo.disabled = false;
@@ -1355,34 +1379,42 @@ function updateMediaAvailabilityUI() {
         ? 'No microphone detected'
         : audioPermissionDenied
         ? 'Microphone permission denied'
+        : audioAccessRestricted
+        ? 'Microphone access is disabled by the host'
         : 'Toggle Microphone';
     elements.previewToggleVideo.title = videoUnavailable
         ? 'No camera detected'
         : videoPermissionDenied
         ? 'Camera permission denied'
+        : videoAccessRestricted
+        ? 'Camera access is disabled by the host'
         : 'Toggle Camera';
     elements.toggleAudioBtn.title = audioUnavailable
         ? 'No microphone detected'
         : audioPermissionDenied
         ? 'Microphone permission denied'
+        : audioAccessRestricted
+        ? 'Microphone access is disabled by the host'
         : 'Toggle Microphone';
     elements.toggleVideoBtn.title = videoUnavailable
         ? 'No camera detected'
         : videoPermissionDenied
         ? 'Camera permission denied'
+        : videoAccessRestricted
+        ? 'Camera access is disabled by the host'
         : 'Toggle Camera';
 
-    elements.previewToggleMic.classList.toggle('muted', audioUnavailable || audioPermissionDenied || !previewState.isAudioEnabled);
-    elements.previewToggleVideo.classList.toggle('muted', videoUnavailable || videoPermissionDenied || !previewState.isVideoEnabled);
-    elements.toggleAudioBtn.classList.toggle('muted', audioUnavailable || audioPermissionDenied || !appState.isAudioEnabled);
-    elements.toggleVideoBtn.classList.toggle('muted', videoUnavailable || videoPermissionDenied || !appState.isVideoEnabled);
+    elements.previewToggleMic.classList.toggle('muted', audioUnavailable || audioPermissionDenied || audioAccessRestricted || !previewState.isAudioEnabled);
+    elements.previewToggleVideo.classList.toggle('muted', videoUnavailable || videoPermissionDenied || videoAccessRestricted || !previewState.isVideoEnabled);
+    elements.toggleAudioBtn.classList.toggle('muted', audioUnavailable || audioPermissionDenied || audioAccessRestricted || !appState.isAudioEnabled);
+    elements.toggleVideoBtn.classList.toggle('muted', videoUnavailable || videoPermissionDenied || videoAccessRestricted || !appState.isVideoEnabled);
 
-    if (audioUnavailable || audioPermissionDenied) {
+    if (audioUnavailable || audioPermissionDenied || audioAccessRestricted) {
         elements.previewToggleMic.innerHTML = '<i data-lucide="mic-off"></i>';
         elements.toggleAudioBtn.innerHTML = '<i data-lucide="mic-off"></i>';
     }
 
-    if (videoUnavailable || videoPermissionDenied) {
+    if (videoUnavailable || videoPermissionDenied || videoAccessRestricted) {
         elements.previewToggleVideo.innerHTML = '<i data-lucide="video-off"></i>';
         elements.toggleVideoBtn.innerHTML = '<i data-lucide="video-off"></i>';
     }
@@ -3018,8 +3050,8 @@ function requestMuteParticipant(connectionId) {
 /**
  * Kick a participant from the call
  */
-function kickParticipant(connectionId) {
-    if (!openviduClient.session) return;
+async function kickParticipant(connectionId) {
+    if (!appState.sessionId) return;
     if (!canKickParticipants()) {
         showNotification('You do not have permission to remove participants.', 'error');
         return;
@@ -3032,20 +3064,24 @@ function kickParticipant(connectionId) {
     if (!confirm(`Remove ${participant.nickname} from the call?`)) {
         return;
     }
-    
-    // Send signal to kick
-    openviduClient.session.signal({
-        data: JSON.stringify({ 
-            fromNickname: appState.nickname,
-            reason: 'Removed by host'
-        }),
-        to: [openviduClient.session.remoteConnections.get(connectionId)],
-        type: 'kick'
-    }).then(() => {
-        logEvent('info', `Kicked ${participant.nickname} from the call`);
-    }).catch(err => {
-        console.error('Error kicking participant:', err);
-    });
+
+    apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_PARTICIPANT(appState.sessionId, connectionId)}`,
+        { method: 'DELETE' }
+    )
+        .then(async (response) => {
+            if (!response.ok) {
+                const error = await response.json().catch(() => ({}));
+                throw new Error(error.details || 'Failed to remove participant');
+            }
+
+            logEvent('info', `Removed ${participant.nickname} from the call`);
+            showNotification(`${participant.nickname} was removed from the call.`, 'info');
+        })
+        .catch((err) => {
+            console.error('Error kicking participant:', err);
+            showNotification(err.message || 'Failed to remove participant.', 'error');
+        });
 }
 
 /**
@@ -3070,19 +3106,6 @@ function handleMuteRequest(event) {
         logEvent('info', message);
     } catch (e) {
         console.error('Error handling mute request:', e);
-    }
-}
-
-/**
- * Handle incoming kick signal
- */
-function handleKickSignal(event) {
-    try {
-        const data = JSON.parse(event.data);
-        alert(`You have been removed from the call by ${data.fromNickname}`);
-        leaveSession();
-    } catch (e) {
-        console.error('Error handling kick signal:', e);
     }
 }
 
@@ -3812,9 +3835,8 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         await syncParticipantRolesFromSession();
         connectPermissionsWebSocket();
         
-        // Register signal handlers for participants panel (mute/kick)
+        // Register signal handlers for participants panel
         openviduClient.session.on('signal:requestMute', handleMuteRequest);
-        openviduClient.session.on('signal:kick', handleKickSignal);
         
     } catch (error) {
         console.error('Error joining session:', error);
@@ -4120,7 +4142,7 @@ elements.joinForm.addEventListener('submit', async (e) => {
 // Audio toggle
 elements.toggleAudioBtn.addEventListener('click', async () => {
     if (!canPublishAudio()) {
-        showNotification('You do not have permission to enable your microphone.', 'error');
+        showNotification(getMediaPermissionRestriction('audio') || 'You do not have permission to enable your microphone.', 'error');
         return;
     }
 
@@ -4153,7 +4175,7 @@ elements.toggleAudioBtn.addEventListener('click', async () => {
 // Video toggle
 elements.toggleVideoBtn.addEventListener('click', async () => {
     if (!canPublishVideo()) {
-        showNotification('You do not have permission to enable your camera.', 'error');
+        showNotification(getMediaPermissionRestriction('video') || 'You do not have permission to enable your camera.', 'error');
         return;
     }
 

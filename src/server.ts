@@ -1165,6 +1165,78 @@ app.patch('/api/sessions/:sessionId/participants/:participantId/permissions', re
     }
 });
 
+app.delete('/api/sessions/:sessionId/participants/:participantId', requirePermission(Permission.KICK_PARTICIPANT), async (req, res) => {
+    try {
+        const { sessionId, participantId } = req.params;
+
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await sessionRepository.findById(sessionId);
+        if (!storedSession) {
+            return res.status(404).json({
+                error: 'Session not found',
+                details: `Session ${sessionId} is not registered in the repository`,
+            });
+        }
+
+        if (!storedSession.getParticipantIds().includes(participantId)) {
+            return res.status(404).json({
+                error: 'Participant not found',
+                details: `Participant ${participantId} is not registered in session ${sessionId}`,
+            });
+        }
+
+        const session = await getCachedOrRemoteOpenViduSession(sessionId);
+        if (!session) {
+            await sessionRepository.delete(sessionId);
+            return res.status(404).json({
+                error: 'Session not found',
+                details: `Session ${sessionId} does not exist in OpenVidu`,
+            });
+        }
+
+        await withOpenViduRetry(
+            'openvidu.fetchSessionBeforeDisconnect',
+            () => session.fetch()
+        );
+
+        const targetConnection =
+            session.connections.find((connection) => connection.connectionId === participantId) ||
+            session.activeConnections.find((connection) => connection.connectionId === participantId);
+
+        if (!targetConnection) {
+            return res.status(404).json({
+                error: 'Participant not found',
+                details: `Connection ${participantId} does not exist in OpenVidu session ${sessionId}`,
+            });
+        }
+
+        await withOpenViduRetry(
+            'openvidu.forceDisconnect',
+            () => session.forceDisconnect(targetConnection)
+        );
+
+        storedSession.removeParticipant(new ParticipantId(participantId));
+        await sessionRepository.save(storedSession);
+
+        logger.info(
+            {
+                sessionId,
+                participantId,
+                requestedBy: req.auth?.role ?? null,
+            },
+            'Participant removed from session'
+        );
+
+        return res.status(204).send();
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to remove participant from session');
+        return sendOpenViduError(res, error, 'Failed to remove participant from the session');
+    }
+});
+
 /**
  * POST /api/translate
  * Translates text using Azure Translator API

@@ -20,6 +20,8 @@ const CONFIG = {
         SESSIONS: '/api/sessions',
         SESSION_INVITE_LINK: (sessionId) => `/api/sessions/${sessionId}/invite-link`,
         CONNECTIONS: (sessionId) => `/api/sessions/${sessionId}/connections`,
+        SESSION_PARTICIPANT: (sessionId, participantId) =>
+            `/api/sessions/${sessionId}/participants/${participantId}`,
         PARTICIPANT_PERMISSIONS: (sessionId, participantId) =>
             `/api/sessions/${sessionId}/participants/${participantId}/permissions`
     },
