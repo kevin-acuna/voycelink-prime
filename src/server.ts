@@ -8,6 +8,7 @@
 
 import cors from 'cors';
 import express from 'express';
+import fs from 'fs';
 import jwt from 'jsonwebtoken';
 import path from 'path';
 import { OpenVidu } from 'openvidu-node-client';
@@ -23,13 +24,19 @@ import { ParticipantId, Session as DomainSession } from './session/Session';
 
 const app = express();
 const projectRoot = process.cwd();
-const isProduction = process.env.NODE_ENV === 'production';
-const staticAssetDirectories = isProduction
-    ? [path.join(__dirname, 'public')]
-    : [path.join(projectRoot, 'public'), path.join(projectRoot, 'dist', 'public')];
-const frontendDocumentPath = isProduction
-    ? path.join(__dirname, 'public', 'index.html')
-    : path.join(projectRoot, 'public', 'index.html');
+const runtimeDistPublicDirectory = path.join(__dirname, 'public');
+const workspaceDistPublicDirectory = path.join(projectRoot, 'dist', 'public');
+const workspaceSourcePublicDirectory = path.join(projectRoot, 'public');
+const preferredFrontendDirectory = fs.existsSync(path.join(runtimeDistPublicDirectory, 'index.html'))
+    ? runtimeDistPublicDirectory
+    : fs.existsSync(path.join(workspaceDistPublicDirectory, 'index.html'))
+        ? workspaceDistPublicDirectory
+        : workspaceSourcePublicDirectory;
+const staticAssetDirectories = [
+    preferredFrontendDirectory,
+    ...(preferredFrontendDirectory === workspaceSourcePublicDirectory ? [] : [workspaceSourcePublicDirectory]),
+];
+const frontendDocumentPath = path.join(preferredFrontendDirectory, 'index.html');
 
 // Validate required environment variables
 validateServerConfig();
@@ -1903,6 +1910,9 @@ const server = app.listen(config.port, () => {
             port: config.port,
             openviduUrl: config.openvidu.url,
             openaiConfigured: Boolean(config.openai.apiKey),
+            nodeEnv: process.env.NODE_ENV ?? null,
+            frontendDirectory: preferredFrontendDirectory,
+            staticAssetDirectories,
         },
         `Server is running on http://localhost:${config.port}`
     );
