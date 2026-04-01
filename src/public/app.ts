@@ -5,6 +5,8 @@
  * Orchestrates the UI and OpenVidu client
  */
 
+import { OpenVidu } from 'openvidu-browser';
+
 // =============================================================================
 // Button Click Protection (Prevent Multiple Clicks)
 // =============================================================================
@@ -3881,12 +3883,28 @@ async function startScreenShare() {
         
         // Step 4: Initialize screen share publisher
         logEvent('info', 'Step 5: Initializing screen publisher...');
-        const screenPublisher = await screenOV.initPublisherAsync(undefined, {
-            videoSource: 'screen',
-            publishAudio: false,
-            publishVideo: true,
-            mirror: false
-        });
+        let screenPublisher;
+        let isScreenAudioEnabled = true;
+
+        try {
+            screenPublisher = await screenOV.initPublisherAsync(undefined, {
+                videoSource: 'screen',
+                audioSource: 'screen',
+                publishAudio: true,
+                publishVideo: true,
+                mirror: false
+            });
+        } catch (screenAudioError) {
+            isScreenAudioEnabled = false;
+            logEvent('warn', `Screen audio unavailable, falling back to video-only share: ${screenAudioError?.message || screenAudioError}`);
+
+            screenPublisher = await screenOV.initPublisherAsync(undefined, {
+                videoSource: 'screen',
+                publishAudio: false,
+                publishVideo: true,
+                mirror: false
+            });
+        }
         logEvent('info', 'Step 6: Screen publisher created');
         
         // Handle when user stops sharing via browser UI
@@ -3908,6 +3926,11 @@ async function startScreenShare() {
         logEvent('info', 'Step 8: Publishing screen share...');
         await screenSession.publish(screenPublisher);
         logEvent('info', 'Step 9: Screen share published successfully!');
+        if (isScreenAudioEnabled) {
+            logEvent('info', 'Screen share includes system audio when allowed by the browser and selected by the user');
+        } else {
+            showNotification('Screen sharing started without system audio. Your browser may not support it for this capture.', 'info');
+        }
         
         // Store references for cleanup
         appState.screenOV = screenOV;
