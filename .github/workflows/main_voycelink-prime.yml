@@ -35,6 +35,7 @@ jobs:
           rm -rf deploy
           mkdir -p deploy
           cp -R dist deploy/dist
+          cp -R dist/public/. deploy/
           cp package.json package-lock.json deploy/
           cp -R node_modules deploy/node_modules
           printf '{"gitSha":"%s","builtAt":"%s"}\n' "${GITHUB_SHA}" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > deploy/build-info.json
