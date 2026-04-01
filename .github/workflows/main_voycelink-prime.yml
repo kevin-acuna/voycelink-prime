@@ -37,12 +37,18 @@ jobs:
           cp -R dist deploy/dist
           cp package.json package-lock.json deploy/
           cp -R node_modules deploy/node_modules
+          printf '{"gitSha":"%s","builtAt":"%s"}\n' "${GITHUB_SHA}" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > deploy/build-info.json
+
+      - name: Archive deployment package
+        run: |
+          cd deploy
+          zip -r ../node-app.zip .
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: node-app
-          path: deploy
+          path: node-app.zip
 
   deploy:
     runs-on: ubuntu-latest
@@ -54,6 +60,9 @@ jobs:
         with:
           name: node-app
           path: .
+
+      - name: Inspect deployment package
+        run: unzip -l node-app.zip | sed -n '1,120p'
       
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
@@ -61,5 +70,5 @@ jobs:
         with:
           app-name: 'voycelink-prime'
           slot-name: 'Production'
-          package: .
+          package: node-app.zip
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_3BC5E6F6B596439E88B6057F96260323 }}
