@@ -89,41 +89,51 @@ body {
 
 .app-header {
     display: flex;
-    justify-content: space-between;
+    justify-content: flex-end;
     align-items: center;
-    padding: 0.75rem 1.5rem;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border-color);
+    padding: 0.75rem 1rem 0;
+    background: transparent;
+    border-bottom: 0;
+    pointer-events: none;
     flex-shrink: 0;
-}
-
-.app-header h1 {
-    font-size: 1.125rem;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-}
-
-.header-icon {
-    width: 20px;
-    height: 20px;
-    color: var(--primary-color);
+    min-height: 0;
 }
 
 .connection-status {
-    padding: 0.375rem 0.875rem;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    font-weight: 500;
-    background: var(--danger-color);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.25rem 0.625rem;
+    border-radius: 999px;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    background: rgba(231, 76, 60, 0.14);
+    border: 1px solid rgba(231, 76, 60, 0.22);
+    color: rgba(255, 255, 255, 0.86);
     text-transform: uppercase;
-    letter-spacing: 0.025em;
+    letter-spacing: 0.08em;
+    pointer-events: auto;
+    backdrop-filter: blur(10px);
 }
 
 .connection-status.connected {
+    background: rgba(27, 143, 90, 0.14);
+    border-color: rgba(27, 143, 90, 0.24);
+}
+
+.connection-status::before {
+    content: '';
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: var(--danger-color);
+    box-shadow: 0 0 0 0.15rem rgba(231, 76, 60, 0.16);
+    flex-shrink: 0;
+}
+
+.connection-status.connected::before {
     background: var(--success-color);
+    box-shadow: 0 0 0 0.15rem rgba(27, 143, 90, 0.16);
 }
 
 /* =============================================================================
@@ -1176,11 +1186,7 @@ body {
     }
 
     .app-header {
-        padding: 0.5rem 1rem;
-    }
-    
-    .app-header h1 {
-        font-size: 0.9375rem;
+        padding: 0.5rem 0.75rem 0;
     }
     
     .main-content {
