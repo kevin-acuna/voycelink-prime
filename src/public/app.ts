@@ -1003,31 +1003,6 @@ async function enforceCurrentPermissions() {
         });
     }
 
-    const wantsAnyLocalMedia =
-        (appState.isAudioEnabled && canPublishAudio()) ||
-        (appState.isVideoEnabled && canPublishVideo());
-
-    if (!openviduClient.publisher) {
-        if (wantsAnyLocalMedia) {
-            await publishLocalStreamWithCurrentPermissions().catch((error) => {
-                logEvent('warn', `Could not publish local media after permission refresh: ${error?.message || error}`);
-            });
-        }
-        syncLocalMediaControlUi();
-        return;
-    }
-
-    const missingAllowedAudioTrack =
-        appState.isAudioEnabled && canPublishAudio() && !isLocalAudioLive();
-    const missingAllowedVideoTrack =
-        appState.isVideoEnabled && canPublishVideo() && !isLocalVideoLive();
-
-    if (missingAllowedAudioTrack || missingAllowedVideoTrack) {
-        await publishLocalStreamWithCurrentPermissions().catch((error) => {
-            logEvent('warn', `Could not republish local media after permission refresh: ${error?.message || error}`);
-        });
-    }
-
     if (!canPublishAudio() && isLocalAudioLive()) {
         openviduClient.toggleAudio();
     }
