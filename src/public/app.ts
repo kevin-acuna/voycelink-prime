@@ -132,6 +132,48 @@ function playLeaveSound() {
     }
 }
 
+/**
+ * Play a short waiting room notification for hosts/co-hosts
+ * Slight two-tone chime so it feels distinct from join/leave
+ */
+function playWaitingRoomSound() {
+    try {
+        if (!audioContext) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        if (audioContext.state === 'suspended') {
+            audioContext.resume().catch(() => null);
+        }
+
+        const now = audioContext.currentTime;
+        const masterGain = audioContext.createGain();
+        masterGain.gain.setValueAtTime(0.05, now);
+        masterGain.connect(audioContext.destination);
+
+        [
+            { frequency: 880, start: now, duration: 0.12 },
+            { frequency: 1175, start: now + 0.14, duration: 0.16 },
+        ].forEach((tone) => {
+            const osc = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(tone.frequency, tone.start);
+            gainNode.gain.setValueAtTime(0, tone.start);
+            gainNode.gain.linearRampToValueAtTime(1, tone.start + 0.01);
+            gainNode.gain.exponentialRampToValueAtTime(0.001, tone.start + tone.duration);
+
+            osc.connect(gainNode);
+            gainNode.connect(masterGain);
+            osc.start(tone.start);
+            osc.stop(tone.start + tone.duration);
+        });
+    } catch (e) {
+        console.log('Could not play waiting room notification sound:', e);
+    }
+}
+
 // =============================================================================
 // Application State
 // =============================================================================
@@ -155,6 +197,9 @@ const appState = {
     participantPresence: {},
     participantPermissionState: {},
     participantMediaConnections: {},
+    waitingRoomRequests: [],
+    waitingRoomRequestId: null,
+    isWaitingForAdmission: false,
     whiteboardState: {
         main: { isOpen: false, canvasState: null, updatedAt: null },
         breakouts: {},
@@ -196,6 +241,10 @@ const elements = {
     nicknameInput: document.getElementById('nickname'),
     editNicknameBtn: document.getElementById('editNicknameBtn'),
     languageSelect: document.getElementById('preferredLanguage'),
+    waitingRoomCard: document.getElementById('waitingRoomCard'),
+    waitingRoomStatus: document.getElementById('waitingRoomStatus'),
+    waitingRoomMeta: document.getElementById('waitingRoomMeta'),
+    cancelWaitingRoomBtn: document.getElementById('cancelWaitingRoomBtn'),
     connectionStatus: document.getElementById('connectionStatus'),
     videoGrid: document.getElementById('videoGrid'),
     localVideo: document.getElementById('localVideo'),
@@ -287,11 +336,16 @@ let reconnectTimeoutId = null;
 let isLeavingSessionIntentional = false;
 let hasHandledConnectionLoss = false;
 let isSwitchingRooms = false;
+let waitingRoomPollIntervalId = null;
+let waitingRoomAutoJoinInProgress = false;
+let waitingRoomNotificationPrimed = false;
+let knownPendingWaitingRoomRequestIds = new Set();
 const ENABLE_LAYOUT_TESTER = CONFIG.DEBUG || window.location.hostname === 'localhost';
 const MOCK_PARTICIPANT_PREFIX = 'mock-participant-';
 const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
 const NICKNAME_STORAGE_KEY = 'voycelink_nickname';
 const ROOM_PARTICIPANT_STORAGE_PREFIX = 'voycelink_room_participant_';
+const WAITING_ROOM_REQUEST_STORAGE_PREFIX = 'voycelink_waiting_room_request_';
 const Permission = {
     CREATE_SESSION: 'create_session',
     JOIN_SESSION: 'join_session',
@@ -310,7 +364,8 @@ const Permission = {
     JOIN_BREAKOUT_ROOM: 'join_breakout_room',
     MOVE_PARTICIPANT_BETWEEN_ROOMS: 'move_participant_between_rooms',
     ASSIGN_COHOST: 'assign_cohost',
-    REMOVE_COHOST: 'remove_cohost'
+    REMOVE_COHOST: 'remove_cohost',
+    ADMIT_WAITING_ROOM: 'admit_waiting_room'
 };
 let permissionsSocket = null;
 let permissionsSocketReconnectTimeoutId = null;
@@ -515,6 +570,10 @@ function canRemoveCoHosts() {
     return hasPermission(Permission.REMOVE_COHOST);
 }
 
+function canAdmitWaitingRoom() {
+    return hasPermission(Permission.ADMIT_WAITING_ROOM);
+}
+
 function canManageTargetParticipantRole(targetRole) {
     if (appState.authRole !== 'co_host') {
         return true;
@@ -558,6 +617,10 @@ function getParticipantStorageKey(sessionId) {
     return `${ROOM_PARTICIPANT_STORAGE_PREFIX}${sessionId}`;
 }
 
+function getWaitingRoomRequestStorageKey(sessionId) {
+    return `${WAITING_ROOM_REQUEST_STORAGE_PREFIX}${sessionId}`;
+}
+
 function getStoredRoomParticipantId(sessionId) {
     if (!sessionId) {
         return null;
@@ -579,6 +642,42 @@ function storeRoomParticipantId(sessionId, participantId) {
         localStorage.setItem(getParticipantStorageKey(sessionId), participantId);
     } catch (error) {
         logEvent('warn', `Failed to persist room participant id: ${error?.message || error}`);
+    }
+}
+
+function getStoredWaitingRoomRequestId(sessionId) {
+    if (!sessionId) {
+        return null;
+    }
+
+    try {
+        return localStorage.getItem(getWaitingRoomRequestStorageKey(sessionId)) || null;
+    } catch (error) {
+        return null;
+    }
+}
+
+function storeWaitingRoomRequestId(sessionId, requestId) {
+    if (!sessionId || !requestId) {
+        return;
+    }
+
+    try {
+        localStorage.setItem(getWaitingRoomRequestStorageKey(sessionId), requestId);
+    } catch (error) {
+        logEvent('warn', `Failed to persist waiting room request id: ${error?.message || error}`);
+    }
+}
+
+function clearStoredWaitingRoomRequestId(sessionId) {
+    if (!sessionId) {
+        return;
+    }
+
+    try {
+        localStorage.removeItem(getWaitingRoomRequestStorageKey(sessionId));
+    } catch (error) {
+        logEvent('warn', `Failed to clear waiting room request id: ${error?.message || error}`);
     }
 }
 
@@ -812,10 +911,12 @@ function isOutdatedSnapshotPayload(payload = {}) {
 function summarizeSnapshotPayload(payload = {}) {
     const breakoutRooms = Array.isArray(payload.breakoutRooms) ? payload.breakoutRooms : [];
     const participantPresence = payload.participantPresence || {};
+    const waitingRoomRequests = Array.isArray(payload.waitingRoomRequests) ? payload.waitingRoomRequests : [];
 
     return {
         revision: normalizeSnapshotRevision(payload.revision),
         breakoutCount: breakoutRooms.length,
+        waitingRoomRequestCount: waitingRoomRequests.length,
         breakoutRooms: breakoutRooms.map((room) => ({
             id: room.id,
             status: room.status,
@@ -825,6 +926,42 @@ function summarizeSnapshotPayload(payload = {}) {
         participantLocations: payload.participantLocations || {},
         currentRootParticipantId: payload.currentRootParticipantId || null,
     };
+}
+
+function syncWaitingRoomNotificationState(payload = {}, options = {}) {
+    const { primeOnly = false } = options;
+    const pendingRequests = Array.isArray(payload.waitingRoomRequests)
+        ? payload.waitingRoomRequests.filter((request) => request?.status === 'pending')
+        : [];
+    const pendingIds = new Set(
+        pendingRequests
+            .map((request) => request?.id)
+            .filter((requestId) => typeof requestId === 'string' && requestId)
+    );
+
+    if (!waitingRoomNotificationPrimed || primeOnly) {
+        knownPendingWaitingRoomRequestIds = pendingIds;
+        waitingRoomNotificationPrimed = true;
+        return;
+    }
+
+    const newRequests = pendingRequests.filter(
+        (request) => request?.id && !knownPendingWaitingRoomRequestIds.has(request.id)
+    );
+
+    knownPendingWaitingRoomRequestIds = pendingIds;
+
+    if (!canAdmitWaitingRoom() || newRequests.length === 0) {
+        return;
+    }
+
+    playWaitingRoomSound();
+    showNotification(
+        newRequests.length === 1
+            ? `${newRequests[0].nickname || 'A guest'} is waiting to join.`
+            : `${newRequests.length} people are waiting to join.`,
+        'info'
+    );
 }
 
 function applyGlobalSessionSnapshot(payload = {}) {
@@ -853,6 +990,9 @@ function applyGlobalSessionSnapshot(payload = {}) {
 
     if (Array.isArray(payload.breakoutRooms)) {
         appState.breakoutRooms = payload.breakoutRooms;
+    }
+    if (Array.isArray(payload.waitingRoomRequests)) {
+        appState.waitingRoomRequests = payload.waitingRoomRequests;
     }
     if (payload.participantLocations) {
         appState.participantLocations = payload.participantLocations;
@@ -1149,12 +1289,30 @@ function initializePage() {
     if (roomId) {
         elements.homeCard.style.display = 'none';
         elements.joinCard.style.display = 'block';
+        setElementVisibility(elements.waitingRoomCard, false);
         elements.sessionIdInput.value = roomId;
         elements.roomIdDisplay.textContent = roomId;
+
+        const storedWaitingRoomRequestId = getStoredWaitingRoomRequestId(roomId);
+        const storedParticipantId = getStoredRoomParticipantId(roomId);
+        if (storedWaitingRoomRequestId && !storedParticipantId) {
+            showWaitingRoom(roomId, storedWaitingRoomRequestId, {
+                id: storedWaitingRoomRequestId,
+                nickname: elements.nicknameInput.value.trim() || getStoredNickname() || 'Guest',
+                preferredLanguage: elements.languageSelect.value || 'en',
+            });
+            startWaitingRoomPolling(
+                roomId,
+                storedWaitingRoomRequestId,
+                elements.nicknameInput.value.trim() || getStoredNickname() || 'Guest',
+                elements.languageSelect.value || 'en'
+            );
+        }
     } else {
         // No room - show create meeting button
         elements.homeCard.style.display = 'block';
         elements.joinCard.style.display = 'none';
+        setElementVisibility(elements.waitingRoomCard, false);
     }
 
     applyPermissionBasedUi();
@@ -1340,11 +1498,15 @@ async function refreshCurrentPermissions(options = {}) {
             : [];
         appState.currentRoomTarget = authorization.roomTarget || appState.currentRoomTarget;
         applyGlobalSessionSnapshot(authorization);
+        syncWaitingRoomNotificationState(authorization, { primeOnly: true });
         if (appState.sessionId && appState.currentRootParticipantId) {
             storeRoomParticipantId(appState.sessionId, appState.currentRootParticipantId);
         }
         loadBootstrapSession();
         applyPermissionBasedUi();
+        if (appState.isParticipantsOpen) {
+            renderParticipantsList();
+        }
         renderBreakoutsPanel();
         logEvent(
             'info',
@@ -1387,9 +1549,296 @@ async function fetchBreakoutSnapshot() {
         return payload;
     }
     applyGlobalSessionSnapshot(payload);
+    syncWaitingRoomNotificationState(payload, { primeOnly: true });
     logEvent('info', `Fetched breakout snapshot: ${JSON.stringify(summarizeSnapshotPayload(payload))}`);
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
     renderBreakoutsPanel();
     return payload;
+}
+
+function formatWaitingRoomMeta(sessionId, request = null) {
+    if (!request) {
+        return `Room ${sessionId}`;
+    }
+
+    const language = (request.preferredLanguage || 'en').toUpperCase();
+    return `${request.nickname} · ${language} · Request ${request.id}`;
+}
+
+function showWaitingRoom(sessionId, requestId, request = null) {
+    appState.waitingRoomRequestId = requestId || appState.waitingRoomRequestId;
+    appState.isWaitingForAdmission = true;
+
+    setElementVisibility(elements.homeCard, false);
+    setElementVisibility(elements.joinCard, false);
+    setElementVisibility(elements.waitingRoomCard, true, 'block');
+
+    if (elements.waitingRoomStatus) {
+        elements.waitingRoomStatus.innerHTML = `
+            <span class="waiting-room-pulse" aria-hidden="true"></span>
+            <span>Request sent. Waiting for approval...</span>
+        `;
+    }
+
+    if (elements.waitingRoomMeta) {
+        elements.waitingRoomMeta.textContent = formatWaitingRoomMeta(sessionId, request);
+    }
+}
+
+function hideWaitingRoom() {
+    appState.isWaitingForAdmission = false;
+    setElementVisibility(elements.waitingRoomCard, false);
+}
+
+function stopWaitingRoomPolling() {
+    if (waitingRoomPollIntervalId) {
+        clearInterval(waitingRoomPollIntervalId);
+        waitingRoomPollIntervalId = null;
+    }
+}
+
+async function createWaitingRoomRequest(sessionId, nickname, preferredLanguage, requestId = null) {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.WAITING_ROOM_REQUESTS(sessionId)}`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                requestId,
+                nickname,
+                preferredLanguage,
+            }),
+        }
+    );
+
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(payload.details || 'Failed to enter the waiting room');
+    }
+
+    if (payload.revision !== undefined || payload.breakoutRooms || payload.waitingRoomRequests) {
+        applyGlobalSessionSnapshot(payload);
+        syncWaitingRoomNotificationState(payload, { primeOnly: true });
+    }
+
+    logEvent(
+        'info',
+        `Created waiting room request: ${JSON.stringify({
+            sessionId,
+            requestId: payload?.request?.id || requestId || null,
+            nickname,
+            preferredLanguage,
+        })}`
+    );
+
+    return payload;
+}
+
+async function fetchWaitingRoomRequestStatus(sessionId, requestId) {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.WAITING_ROOM_REQUEST(sessionId, requestId)}`,
+        { suppressAuthExpiredNotice: true }
+    );
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+        const error = new Error(payload.details || 'Failed to check waiting room status');
+        if (response.status === 404) {
+            error.waitingRoomRequestMissing = true;
+        }
+        throw error;
+    }
+
+    return payload;
+}
+
+async function cancelWaitingRoomRequest(sessionId, requestId, options = {}) {
+    const { silent = false } = options;
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.WAITING_ROOM_REQUEST(sessionId, requestId)}`,
+        { method: 'DELETE', suppressAuthExpiredNotice: true }
+    );
+
+    if (!response.ok && response.status !== 404) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to cancel waiting room request');
+    }
+
+    stopWaitingRoomPolling();
+    appState.waitingRoomRequestId = null;
+    clearStoredWaitingRoomRequestId(sessionId);
+    hideWaitingRoom();
+    if (!silent) {
+        showJoinForm();
+        showNotification('Waiting room request cancelled.', 'info');
+    }
+}
+
+async function approveWaitingRoomRequest(requestId) {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.WAITING_ROOM_APPROVE(appState.sessionId, requestId)}`,
+        { method: 'POST' }
+    );
+
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(payload.details || 'Failed to admit participant');
+    }
+
+    applyGlobalSessionSnapshot(payload);
+    syncWaitingRoomNotificationState(payload);
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+    return payload;
+}
+
+async function rejectWaitingRoomRequest(requestId) {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.WAITING_ROOM_REJECT(appState.sessionId, requestId)}`,
+        { method: 'POST' }
+    );
+
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(payload.details || 'Failed to reject participant');
+    }
+
+    applyGlobalSessionSnapshot(payload);
+    syncWaitingRoomNotificationState(payload);
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+    return payload;
+}
+
+async function pollWaitingRoomAdmission(sessionId, requestId, nickname, preferredLanguage) {
+    try {
+        const payload = await fetchWaitingRoomRequestStatus(sessionId, requestId);
+        const request = payload.request || null;
+        const status = request?.status || 'pending';
+
+        if (status === 'approved') {
+            stopWaitingRoomPolling();
+            appState.waitingRoomRequestId = requestId;
+            logEvent('info', `Waiting room request approved: ${requestId}`);
+            showNotification('You were admitted to the meeting.', 'info');
+            if (!waitingRoomAutoJoinInProgress) {
+                waitingRoomAutoJoinInProgress = true;
+                try {
+                    await joinSession(sessionId, nickname, preferredLanguage, {
+                        skipWaitingRoomCheck: true,
+                        waitingRequestId: requestId,
+                    });
+                } finally {
+                    waitingRoomAutoJoinInProgress = false;
+                }
+            }
+            return;
+        }
+
+        if (status === 'rejected') {
+            stopWaitingRoomPolling();
+            appState.waitingRoomRequestId = null;
+            clearStoredWaitingRoomRequestId(sessionId);
+            hideWaitingRoom();
+            logEvent('warn', `Waiting room request rejected: ${requestId}`);
+            showJoinForm();
+            showNotification('Your request to join was declined.', 'error');
+            return;
+        }
+
+        logEvent('info', `Waiting room request still pending: ${requestId}`);
+        showWaitingRoom(sessionId, requestId, request);
+    } catch (error) {
+        if (error.waitingRoomRequestMissing) {
+            stopWaitingRoomPolling();
+            appState.waitingRoomRequestId = null;
+            clearStoredWaitingRoomRequestId(sessionId);
+            hideWaitingRoom();
+            showJoinForm();
+            showNotification('Your waiting room request expired. Please try again.', 'error');
+            return;
+        }
+
+        logEvent('warn', `Waiting room polling failed: ${error.message || error}`);
+    }
+}
+
+function startWaitingRoomPolling(sessionId, requestId, nickname, preferredLanguage) {
+    stopWaitingRoomPolling();
+    waitingRoomAutoJoinInProgress = false;
+    pollWaitingRoomAdmission(sessionId, requestId, nickname, preferredLanguage);
+    waitingRoomPollIntervalId = setInterval(() => {
+        pollWaitingRoomAdmission(sessionId, requestId, nickname, preferredLanguage);
+    }, 2500);
+}
+
+async function ensureWaitingRoomAdmission(sessionId, nickname, preferredLanguage) {
+    const existingParticipantId = getStoredRoomParticipantId(sessionId);
+    if (
+        existingParticipantId ||
+        appState.authRole === 'host' ||
+        appState.authRole === 'co_host'
+    ) {
+        return {
+            admitted: true,
+            waitingRequestId: null,
+        };
+    }
+
+    let requestId = getStoredWaitingRoomRequestId(sessionId);
+    let existingStatus = null;
+
+    if (requestId) {
+        existingStatus = await fetchWaitingRoomRequestStatus(sessionId, requestId).catch((error) => {
+            if (error.waitingRoomRequestMissing) {
+                clearStoredWaitingRoomRequestId(sessionId);
+                return null;
+            }
+            throw error;
+        });
+    }
+
+    if (!requestId || !existingStatus) {
+        const created = await createWaitingRoomRequest(sessionId, nickname, preferredLanguage);
+        requestId = created?.request?.id || null;
+        if (!requestId) {
+            return {
+                admitted: true,
+                waitingRequestId: null,
+            };
+        }
+        storeWaitingRoomRequestId(sessionId, requestId);
+        showWaitingRoom(sessionId, requestId, created.request || null);
+        startWaitingRoomPolling(sessionId, requestId, nickname, preferredLanguage);
+        return {
+            admitted: false,
+            waitingRequestId: requestId,
+        };
+    }
+
+    const request = existingStatus?.request || null;
+    if (request?.status === 'approved') {
+        return {
+            admitted: true,
+            waitingRequestId: requestId,
+        };
+    }
+
+    if (request?.status === 'rejected') {
+        clearStoredWaitingRoomRequestId(sessionId);
+        throw new Error('Your request to join was declined.');
+    }
+
+    showWaitingRoom(sessionId, requestId, request);
+    startWaitingRoomPolling(sessionId, requestId, nickname, preferredLanguage);
+    return {
+        admitted: false,
+        waitingRequestId: requestId,
+    };
 }
 
 async function fetchRoomTargetForCurrentParticipant() {
@@ -1836,8 +2285,26 @@ function connectPermissionsWebSocket() {
                 if (!snapshotApplied && payload.revision !== undefined) {
                     return;
                 }
+                syncWaitingRoomNotificationState(payload);
                 logEvent('info', `Received breakout_rooms_updated: ${JSON.stringify(summarizeSnapshotPayload(payload))}`);
                 renderBreakoutsPanel();
+                if (appState.isParticipantsOpen) {
+                    renderParticipantsList();
+                }
+                return;
+            }
+
+            if (payload.type === 'waiting_room_updated') {
+                if (payload.sessionId !== appState.authRoomId) {
+                    return;
+                }
+
+                const snapshotApplied = applyGlobalSessionSnapshot(payload);
+                if (!snapshotApplied && payload.revision !== undefined) {
+                    return;
+                }
+                syncWaitingRoomNotificationState(payload);
+                logEvent('info', `Received waiting_room_updated: ${JSON.stringify(summarizeSnapshotPayload(payload))}`);
                 if (appState.isParticipantsOpen) {
                     renderParticipantsList();
                 }
@@ -2013,6 +2480,7 @@ async function getToken(sessionId, nickname, preferredLanguage, options = {}) {
     const {
         previousParticipantId = null,
         rootParticipantId = null,
+        waitingRequestId = null,
         isAuxiliaryMedia = false,
         auxiliaryMediaKind = null,
     } = options;
@@ -2059,6 +2527,7 @@ async function getToken(sessionId, nickname, preferredLanguage, options = {}) {
                 preferredLanguage,
                 previousParticipantId,
                 rootParticipantId,
+                waitingRequestId,
                 isAuxiliaryMedia,
                 auxiliaryMediaKind,
             })
@@ -2869,9 +3338,14 @@ function showConferenceRoom() {
 function showJoinForm() {
     elements.conferenceContainer.style.display = 'none';
     elements.joinContainer.style.display = 'flex';
+    hideWaitingRoom();
     clearMockParticipants();
     updateParticipantCount();
     applyStoredNickname();
+
+    const roomId = getRoomIdFromUrl();
+    setElementVisibility(elements.homeCard, !roomId, 'block');
+    setElementVisibility(elements.joinCard, Boolean(roomId), 'block');
     
     // Restart preview when returning to join form
     initPreview();
@@ -4189,6 +4663,9 @@ function updateParticipantsCount() {
  * Render the participants list
  */
 function renderParticipantsList() {
+    const pendingWaitingRoomRequests = canAdmitWaitingRoom()
+        ? (appState.waitingRoomRequests || []).filter((request) => request.status === 'pending')
+        : [];
     const roster = shouldUseGlobalRosterView()
         ? getGlobalParticipantsForPanels().filter((participant) => participant.presence === 'connected')
         : Array.from(participantsData.values()).map((participant) => {
@@ -4216,7 +4693,7 @@ function renderParticipantsList() {
             };
         });
 
-    if (roster.length === 0) {
+    if (roster.length === 0 && pendingWaitingRoomRequests.length === 0) {
         elements.participantsList.innerHTML = `
             <div class="participants-empty">
                 <i data-lucide="user-x"></i>
@@ -4229,8 +4706,39 @@ function renderParticipantsList() {
     
     // Sort: local user first, then alphabetically
     const sortedParticipants = roster.sort(compareParticipantsByRoleAndName);
-    
-    elements.participantsList.innerHTML = sortedParticipants.map(p => {
+
+    const waitingRoomMarkup = pendingWaitingRoomRequests.length > 0
+        ? `
+            <div class="participants-section waiting-room-section">
+                <div class="participants-section-title">Waiting room</div>
+                ${pendingWaitingRoomRequests.map((request) => `
+                    <div class="participant-item waiting-room-request-item" data-waiting-request-id="${request.id}">
+                        <div class="participant-avatar">${escapeHtml((request.nickname || '?').charAt(0).toUpperCase())}</div>
+                        <div class="participant-info">
+                            <div class="participant-name">
+                                <span class="participant-name-text">${escapeHtml(request.nickname || 'Guest')}</span>
+                            </div>
+                            <div class="participant-status">
+                                <i data-lucide="clock-3"></i>
+                                Waiting for approval
+                            </div>
+                            <div class="participant-status">${escapeHtml((request.preferredLanguage || 'en').toUpperCase())}</div>
+                        </div>
+                        <div class="participant-actions" style="opacity: 1;">
+                            <button class="participant-action-btn approve-btn" data-waiting-request-id="${request.id}" title="Admit to meeting">
+                                <i data-lucide="check"></i>
+                            </button>
+                            <button class="participant-action-btn kick-btn reject-btn" data-waiting-request-id="${request.id}" title="Reject request">
+                                <i data-lucide="x"></i>
+                            </button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `
+        : '';
+
+    const participantMarkup = sortedParticipants.map(p => {
         const initials = p.nickname.charAt(0).toUpperCase();
         const isYou = p.isLocal;
         const isProtectedTarget = !canManageTargetParticipantRole(p.role);
@@ -4322,6 +4830,18 @@ function renderParticipantsList() {
             </div>
         `;
     }).join('');
+
+    elements.participantsList.innerHTML = `
+        ${waitingRoomMarkup}
+        ${participantMarkup
+            ? `
+                <div class="participants-section">
+                    ${waitingRoomMarkup ? '<div class="participants-section-title">In conference</div>' : ''}
+                    ${participantMarkup}
+                </div>
+            `
+            : ''}
+    `;
     
     lucide.createIcons();
     
@@ -4360,6 +4880,26 @@ function renderParticipantsList() {
         button.addEventListener('click', async (event) => {
             event.stopPropagation();
             await toggleParticipantCoHostRole(button.dataset.connectionId, button.dataset.nextRole);
+        });
+    });
+
+    elements.participantsList.querySelectorAll('.approve-btn').forEach((button) => {
+        button.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            await withButtonProtection(button, async () => {
+                await approveWaitingRoomRequest(button.dataset.waitingRequestId);
+                showNotification('Participant admitted to the meeting.', 'info');
+            });
+        });
+    });
+
+    elements.participantsList.querySelectorAll('.reject-btn').forEach((button) => {
+        button.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            await withButtonProtection(button, async () => {
+                await rejectWaitingRoomRequest(button.dataset.waitingRequestId);
+                showNotification('Waiting room request rejected.', 'info');
+            });
         });
     });
 }
@@ -5258,13 +5798,30 @@ async function reconnectToAssignedRoom() {
 /**
  * Join a conference session
  */
-async function joinSession(sessionId, nickname, preferredLanguage) {
+async function joinSession(sessionId, nickname, preferredLanguage, options = {}) {
     try {
+        const {
+            skipWaitingRoomCheck = false,
+            waitingRequestId: initialWaitingRequestId = null,
+        } = options;
         const resolvedSessionId = resolveBoundSessionId(sessionId);
         if (resolvedSessionId !== sessionId) {
             elements.sessionIdInput.value = resolvedSessionId;
             elements.roomIdDisplay.textContent = resolvedSessionId;
             logEvent('warn', `Room mismatch detected. Using bound room ${resolvedSessionId} instead of ${sessionId}`);
+        }
+
+        let waitingRequestId = initialWaitingRequestId;
+        if (!skipWaitingRoomCheck) {
+            const waitingRoomAdmission = await ensureWaitingRoomAdmission(
+                resolvedSessionId,
+                nickname,
+                preferredLanguage
+            );
+            if (!waitingRoomAdmission.admitted) {
+                return;
+            }
+            waitingRequestId = waitingRoomAdmission.waitingRequestId || waitingRequestId;
         }
 
         isLeavingSessionIntentional = false;
@@ -5295,7 +5852,7 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
             resolvedSessionId,
             nickname,
             preferredLanguage,
-            { previousParticipantId, rootParticipantId: previousParticipantId }
+            { previousParticipantId, rootParticipantId: previousParticipantId, waitingRequestId }
         );
         logEvent('info', 'Token received');
         
@@ -5313,6 +5870,10 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         appState.currentRootParticipantId = nextRootParticipantId || previousParticipantId || null;
         appState.currentRoomTarget = roomTarget || appState.currentRoomTarget;
         storeRoomParticipantId(resolvedSessionId, appState.currentRootParticipantId);
+        clearStoredWaitingRoomRequestId(resolvedSessionId);
+        appState.waitingRoomRequestId = null;
+        hideWaitingRoom();
+        stopWaitingRoomPolling();
         await fetchRoomTargetForCurrentParticipant().catch(() => null);
         await refreshCurrentPermissions({ silent: true });
         await fetchBreakoutSnapshot().catch(() => null);
@@ -5612,6 +6173,7 @@ function leaveSession() {
     notifyParticipantDisconnected();
     isLeavingSessionIntentional = true;
     clearReconnectTimeout();
+    stopWaitingRoomPolling();
     disconnectPermissionsWebSocket();
 
     // Stop screen sharing if active
@@ -5664,6 +6226,11 @@ function leaveSession() {
     appState.participantPresence = {};
     appState.participantPermissionState = {};
     appState.participantMediaConnections = {};
+    appState.waitingRoomRequests = [];
+    appState.waitingRoomRequestId = null;
+    appState.isWaitingForAdmission = false;
+    waitingRoomNotificationPrimed = false;
+    knownPendingWaitingRoomRequestIds = new Set();
     appState.whiteboardState = {
         main: { isOpen: false, canvasState: null, updatedAt: null },
         breakouts: {},
@@ -5739,6 +6306,22 @@ elements.joinForm.addEventListener('submit', async (e) => {
 
 elements.editNicknameBtn?.addEventListener('click', () => {
     enableNicknameEditing();
+});
+
+elements.cancelWaitingRoomBtn?.addEventListener('click', async () => {
+    const sessionId = elements.sessionIdInput.value.trim() || getRoomIdFromUrl() || appState.authRoomId;
+    const requestId = appState.waitingRoomRequestId || getStoredWaitingRoomRequestId(sessionId);
+    if (!sessionId || !requestId) {
+        hideWaitingRoom();
+        showJoinForm();
+        return;
+    }
+
+    try {
+        await cancelWaitingRoomRequest(sessionId, requestId);
+    } catch (error) {
+        showNotification(error.message || 'Failed to cancel waiting room request.', 'error');
+    }
 });
 
 // Audio toggle
@@ -5954,6 +6537,7 @@ window.addEventListener('scroll', () => {
 
 // Clean up on page unload
 window.addEventListener('beforeunload', () => {
+    stopWaitingRoomPolling();
     disconnectPermissionsWebSocket();
     stopPreview();
     if (appState.isConnected) {

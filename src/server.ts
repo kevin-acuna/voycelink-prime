@@ -24,6 +24,7 @@ import {
     BreakoutRoomStatus,
     ParticipantId,
     Session as DomainSession,
+    WaitingRoomRequestStatus,
 } from './session/Session';
 
 const app = express();
@@ -111,6 +112,10 @@ function generateRoomId() {
 
 function generateBreakoutRoomId() {
     return `breakout-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function generateWaitingRoomRequestId() {
+    return `wreq-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function isValidBreakoutRoomId(value) {
@@ -1033,6 +1038,7 @@ function buildBreakoutSnapshot(storedSession) {
         revision: storedSession.getRevision(),
         session: storedSession.getFeatureFlags(),
         breakoutRooms: storedSession.getBreakoutRooms(),
+        waitingRoomRequests: storedSession.getPendingWaitingRoomRequests(),
         participantLocations: storedSession.getParticipantLocations(),
         participantProfiles: storedSession.getParticipantProfiles(),
         participantRoles: storedSession.getParticipantRoles(),
@@ -1055,6 +1061,13 @@ function summarizeStoredSessionForLogs(storedSession) {
     return {
         revision: storedSession.getRevision(),
         connectedParticipantCount: Object.values(participantPresence).filter((presence) => presence === 'connected').length,
+        waitingRoomRequestCount: storedSession.getPendingWaitingRoomRequests().length,
+        waitingRoomRequests: storedSession.getPendingWaitingRoomRequests().map((request) => ({
+            id: request.id,
+            nickname: request.nickname,
+            role: request.role,
+            status: request.status,
+        })),
         participantLocations,
         breakoutRooms: breakoutRooms.map((room) => ({
             id: room.id,
@@ -1111,6 +1124,14 @@ function broadcastBreakoutSnapshot(rootSessionId, storedSession) {
     });
 }
 
+function broadcastWaitingRoomSnapshot(rootSessionId, storedSession) {
+    broadcastPermissionUpdate(rootSessionId, {
+        type: 'waiting_room_updated',
+        sessionId: rootSessionId,
+        ...buildBreakoutSnapshot(storedSession),
+    });
+}
+
 function broadcastRoomTransferRequested(rootSessionId, storedSession, participantId, targetRoom) {
     broadcastPermissionUpdate(rootSessionId, {
         type: 'room_transfer_requested',
@@ -1153,6 +1174,14 @@ function canManageRequestedPermissions(role, permissionPatch) {
         allowed: true,
         reason: 'Permission update is allowed',
     };
+}
+
+function requiresWaitingRoomApproval(role, participantId = null, isAuxiliaryMedia = false) {
+    if (isAuxiliaryMedia || participantId) {
+        return false;
+    }
+
+    return role !== Role.HOST && role !== Role.CO_HOST;
 }
 
 function canModerateTargetRole(actorRole, targetRole) {
@@ -1371,6 +1400,7 @@ app.get('/api/me/permissions', requirePermission(Permission.JOIN_SESSION), async
             roomTarget,
             revision: storedSession?.getRevision?.() ?? 0,
             breakoutRooms: storedSession?.getBreakoutRooms?.() || [],
+            waitingRoomRequests: storedSession?.getPendingWaitingRoomRequests?.() || [],
             participantLocations: storedSession?.getParticipantLocations?.() || {},
             participantProfiles: storedSession?.getParticipantProfiles?.() || {},
             participantRoles: storedSession?.getParticipantRoles?.() || {},
@@ -1484,6 +1514,247 @@ app.get('/api/sessions/:sessionId/breakouts', requirePermission(Permission.JOIN_
         return res.status(500).json({
             error: 'Failed to list breakout rooms',
             details: getErrorMessage(error),
+        });
+    }
+});
+
+app.post('/api/sessions/:sessionId/waiting-room/requests', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const nickname = typeof req.body?.nickname === 'string' ? req.body.nickname.trim() : '';
+        const preferredLanguage = typeof req.body?.preferredLanguage === 'string'
+            ? req.body.preferredLanguage.trim() || 'en'
+            : 'en';
+        const requestId = typeof req.body?.requestId === 'string' && req.body.requestId.trim()
+            ? req.body.requestId.trim()
+            : generateWaitingRoomRequestId();
+
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        if (!nickname) {
+            return res.status(400).json({
+                error: 'Nickname is required',
+                details: 'A nickname is required to create a waiting room request',
+            });
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const participantId = resolveRootParticipantId(storedSession, getParticipantIdFromRequest(req));
+
+        if (participantId || req.auth.role === Role.HOST || req.auth.role === Role.CO_HOST) {
+            return res.json({
+                waitingRoomRequired: false,
+                admitted: true,
+                currentRootParticipantId: participantId,
+                request: null,
+                ...buildBreakoutSnapshot(storedSession),
+            });
+        }
+
+        const existingRequest = storedSession.getWaitingRoomRequest(requestId);
+        const requestedAt = existingRequest?.requestedAt || new Date().toISOString();
+        storedSession.upsertWaitingRoomRequest({
+            id: requestId,
+            nickname,
+            preferredLanguage,
+            role: req.auth.role,
+            status: existingRequest?.status || WaitingRoomRequestStatus.PENDING,
+            requestedAt,
+            decidedAt: existingRequest?.decidedAt || null,
+            decidedByRole: existingRequest?.decidedByRole || null,
+        });
+        await sessionRepository.save(storedSession);
+
+        logger.info(
+            {
+                sessionId,
+                requestId,
+                nickname,
+                preferredLanguage,
+                role: req.auth.role,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            existingRequest ? 'Updated waiting room request' : 'Created waiting room request'
+        );
+
+        broadcastWaitingRoomSnapshot(sessionId, storedSession);
+
+        return res.status(existingRequest ? 200 : 201).json({
+            waitingRoomRequired: true,
+            admitted: false,
+            request: storedSession.getWaitingRoomRequest(requestId),
+            ...buildBreakoutSnapshot(storedSession),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to create waiting room request');
+        return res.status(error.status || 500).json({
+            error: 'Failed to create waiting room request',
+            details: error.details || getErrorMessage(error),
+        });
+    }
+});
+
+app.get('/api/sessions/:sessionId/waiting-room/requests/:requestId', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const { sessionId, requestId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const request = storedSession.getWaitingRoomRequest(requestId);
+        if (!request) {
+            return res.status(404).json({
+                error: 'Waiting room request not found',
+                details: `Waiting room request ${requestId} does not exist`,
+            });
+        }
+
+        return res.json({
+            request,
+            revision: storedSession.getRevision(),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to fetch waiting room request');
+        return res.status(error.status || 500).json({
+            error: 'Failed to fetch waiting room request',
+            details: error.details || getErrorMessage(error),
+        });
+    }
+});
+
+app.delete('/api/sessions/:sessionId/waiting-room/requests/:requestId', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const { sessionId, requestId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const request = storedSession.getWaitingRoomRequest(requestId);
+        if (!request) {
+            return res.status(404).json({
+                error: 'Waiting room request not found',
+                details: `Waiting room request ${requestId} does not exist`,
+            });
+        }
+
+        storedSession.removeWaitingRoomRequest(requestId);
+        await sessionRepository.save(storedSession);
+
+        logger.info(
+            {
+                sessionId,
+                requestId,
+                role: req.auth.role,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Removed waiting room request'
+        );
+
+        broadcastWaitingRoomSnapshot(sessionId, storedSession);
+        return res.json({
+            removed: true,
+            requestId,
+            ...buildBreakoutSnapshot(storedSession),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to remove waiting room request');
+        return res.status(error.status || 500).json({
+            error: 'Failed to remove waiting room request',
+            details: error.details || getErrorMessage(error),
+        });
+    }
+});
+
+app.post('/api/sessions/:sessionId/waiting-room/requests/:requestId/approve', requirePermission(Permission.ADMIT_WAITING_ROOM), async (req, res) => {
+    try {
+        const { sessionId, requestId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const request = storedSession.getWaitingRoomRequest(requestId);
+        if (!request) {
+            return res.status(404).json({
+                error: 'Waiting room request not found',
+                details: `Waiting room request ${requestId} does not exist`,
+            });
+        }
+
+        if (request.status !== WaitingRoomRequestStatus.APPROVED) {
+            storedSession.approveWaitingRoomRequest(requestId, new Date().toISOString(), req.auth.role);
+            await sessionRepository.save(storedSession);
+            broadcastWaitingRoomSnapshot(sessionId, storedSession);
+        }
+
+        logger.info(
+            {
+                sessionId,
+                requestId,
+                decidedByRole: req.auth.role,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Approved waiting room request'
+        );
+
+        return res.json({
+            request: storedSession.getWaitingRoomRequest(requestId),
+            ...buildBreakoutSnapshot(storedSession),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to approve waiting room request');
+        return res.status(error.status || 500).json({
+            error: 'Failed to approve waiting room request',
+            details: error.details || getErrorMessage(error),
+        });
+    }
+});
+
+app.post('/api/sessions/:sessionId/waiting-room/requests/:requestId/reject', requirePermission(Permission.ADMIT_WAITING_ROOM), async (req, res) => {
+    try {
+        const { sessionId, requestId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const request = storedSession.getWaitingRoomRequest(requestId);
+        if (!request) {
+            return res.status(404).json({
+                error: 'Waiting room request not found',
+                details: `Waiting room request ${requestId} does not exist`,
+            });
+        }
+
+        if (request.status !== WaitingRoomRequestStatus.REJECTED) {
+            storedSession.rejectWaitingRoomRequest(requestId, new Date().toISOString(), req.auth.role);
+            await sessionRepository.save(storedSession);
+            broadcastWaitingRoomSnapshot(sessionId, storedSession);
+        }
+
+        logger.info(
+            {
+                sessionId,
+                requestId,
+                decidedByRole: req.auth.role,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Rejected waiting room request'
+        );
+
+        return res.json({
+            request: storedSession.getWaitingRoomRequest(requestId),
+            ...buildBreakoutSnapshot(storedSession),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to reject waiting room request');
+        return res.status(error.status || 500).json({
+            error: 'Failed to reject waiting room request',
+            details: error.details || getErrorMessage(error),
         });
     }
 });
@@ -2428,6 +2699,7 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
             connectionProperties = {},
             previousParticipantId,
             rootParticipantId,
+            waitingRequestId,
             isAuxiliaryMedia,
             auxiliaryMediaKind,
         } = req.body;
@@ -2446,6 +2718,64 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
         const stableParticipantId =
             currentParticipantId
             || (isAuxiliaryMedia ? null : generateRootParticipantId());
+        const shouldRequireWaitingApproval = requiresWaitingRoomApproval(
+            req.auth.role,
+            currentParticipantId,
+            Boolean(isAuxiliaryMedia)
+        );
+        const resolvedWaitingRequestId =
+            typeof waitingRequestId === 'string' && waitingRequestId.trim()
+                ? waitingRequestId.trim()
+                : null;
+        const waitingRoomRequest = resolvedWaitingRequestId
+            ? storedSession.getWaitingRoomRequest(resolvedWaitingRequestId)
+            : null;
+
+        if (shouldRequireWaitingApproval) {
+            if (!waitingRoomRequest) {
+                logger.info(
+                    {
+                        sessionId,
+                        requestedByRole: req.auth.role,
+                        waitingRequestId: resolvedWaitingRequestId,
+                    },
+                    'Blocked connection creation pending waiting room approval'
+                );
+                return res.status(403).json({
+                    error: 'Waiting room approval required',
+                    details: 'A host or co-host must admit you before you can join this session',
+                    waitingRoomRequired: true,
+                    waitingRequestId: resolvedWaitingRequestId,
+                });
+            }
+
+            if (waitingRoomRequest.role !== req.auth.role) {
+                return res.status(403).json({
+                    error: 'Waiting room request mismatch',
+                    details: 'The waiting room request role does not match the authenticated role',
+                    waitingRoomRequired: true,
+                    waitingRequestId: resolvedWaitingRequestId,
+                });
+            }
+
+            if (waitingRoomRequest.status === WaitingRoomRequestStatus.REJECTED) {
+                return res.status(403).json({
+                    error: 'Waiting room request rejected',
+                    details: 'Your waiting room request was declined',
+                    waitingRoomRequired: true,
+                    waitingRequestId: resolvedWaitingRequestId,
+                });
+            }
+
+            if (waitingRoomRequest.status !== WaitingRoomRequestStatus.APPROVED) {
+                return res.status(403).json({
+                    error: 'Waiting room approval required',
+                    details: 'A host or co-host must admit you before you can join this session',
+                    waitingRoomRequired: true,
+                    waitingRequestId: resolvedWaitingRequestId,
+                });
+            }
+        }
 
         const roomTarget = getRoomTargetForParticipant(storedSession, currentParticipantId);
         const targetOpenViduSessionId = roomTarget.openviduSessionId || sessionId;
@@ -2821,6 +3151,7 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
                 revision: storedSession.getRevision(),
                 roomConfiguration: storedSession.getFeatureFlags(),
                 persistedParticipants: storedSession.getParticipantIds(),
+                waitingRoomRequests: storedSession.getPendingWaitingRoomRequests(),
                 participantProfiles: storedSession.getParticipantProfiles(),
                 participantLocations: storedSession.getParticipantLocations(),
                 participantRoles: storedSession.getParticipantRoles(),
@@ -2842,6 +3173,7 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
             revision: storedSession.getRevision(),
             roomConfiguration: storedSession.getFeatureFlags(),
             persistedParticipants: storedSession.getParticipantIds(),
+            waitingRoomRequests: storedSession.getPendingWaitingRoomRequests(),
             participantProfiles: storedSession.getParticipantProfiles(),
             participantLocations: storedSession.getParticipantLocations(),
             participantRoles: storedSession.getParticipantRoles(),

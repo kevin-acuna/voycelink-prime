@@ -114,6 +114,21 @@
                     </button>
                 </form>
             </div>
+
+            <div class="join-card waiting-room-card" id="waitingRoomCard" style="display: none;">
+                <h2>Waiting for approval</h2>
+                <p class="waiting-room-description">
+                    A host or co-host must admit you before you can enter this meeting.
+                </p>
+                <div class="waiting-room-status" id="waitingRoomStatus">
+                    <span class="waiting-room-pulse" aria-hidden="true"></span>
+                    <span>Request sent. Waiting for approval...</span>
+                </div>
+                <p class="waiting-room-meta" id="waitingRoomMeta"></p>
+                <button type="button" class="btn btn-secondary" id="cancelWaitingRoomBtn">
+                    Cancel request
+                </button>
+            </div>
         </div>
 
         <!-- Video Conference Room -->

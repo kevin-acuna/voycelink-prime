@@ -26,6 +26,10 @@ const CONFIG = {
         SESSION_BREAKOUT: (sessionId, breakoutRoomId) => `/api/sessions/${sessionId}/breakouts/${breakoutRoomId}`,
         SESSION_BREAKOUT_OPEN: (sessionId, breakoutRoomId) => `/api/sessions/${sessionId}/breakouts/${breakoutRoomId}/open`,
         SESSION_BREAKOUT_CLOSE: (sessionId, breakoutRoomId) => `/api/sessions/${sessionId}/breakouts/${breakoutRoomId}/close`,
+        WAITING_ROOM_REQUESTS: (sessionId) => `/api/sessions/${sessionId}/waiting-room/requests`,
+        WAITING_ROOM_REQUEST: (sessionId, requestId) => `/api/sessions/${sessionId}/waiting-room/requests/${requestId}`,
+        WAITING_ROOM_APPROVE: (sessionId, requestId) => `/api/sessions/${sessionId}/waiting-room/requests/${requestId}/approve`,
+        WAITING_ROOM_REJECT: (sessionId, requestId) => `/api/sessions/${sessionId}/waiting-room/requests/${requestId}/reject`,
         WHITEBOARD_STATE: (sessionId) => `/api/sessions/${sessionId}/whiteboard-state`,
         PARTICIPANT_LOCATION: (sessionId, participantId) =>
             `/api/sessions/${sessionId}/participants/${participantId}/location`,

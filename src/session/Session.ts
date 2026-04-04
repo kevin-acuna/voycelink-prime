@@ -56,6 +56,27 @@ export type WhiteboardStatePrimitives = {
   breakouts: Record<string, WhiteboardRoomState>;
 };
 
+export const WaitingRoomRequestStatus = {
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
+} as const;
+
+export type WaitingRoomRequestStatus =
+  typeof WaitingRoomRequestStatus[keyof typeof WaitingRoomRequestStatus];
+
+export type WaitingRoomRequestPrimitives = {
+  id: string;
+  nickname: string;
+  preferredLanguage: string;
+  role: Role;
+  status: WaitingRoomRequestStatus;
+  requestedAt: string;
+  updatedAt: string;
+  decidedAt: string | null;
+  decidedByRole: Role | null;
+};
+
 export type SessionPrimitives = {
   id: string;
   roomId: string;
@@ -70,6 +91,7 @@ export type SessionPrimitives = {
   participantPresence: Record<string, 'connected' | 'disconnected'>;
   breakoutRooms: BreakoutRoomPrimitives[];
   whiteboardState: WhiteboardStatePrimitives;
+  waitingRoomRequests: WaitingRoomRequestPrimitives[];
 };
 
 type BreakoutRoomState = {
@@ -81,6 +103,8 @@ type BreakoutRoomState = {
   openedAt: string | null;
   closedAt: string | null;
 };
+
+type WaitingRoomRequestState = WaitingRoomRequestPrimitives;
 
 function normalizeLocation(location?: ParticipantLocation | null): ParticipantLocation {
   if (!location || location.type !== 'breakout' || !location.breakoutRoomId) {
@@ -139,7 +163,8 @@ export class Session {
     private participantLocations: Map<string, ParticipantLocation> = new Map(),
     private participantPresence: Map<string, 'connected' | 'disconnected'> = new Map(),
     private breakoutRooms: Map<string, BreakoutRoomState> = new Map(),
-    private whiteboardState: WhiteboardStatePrimitives = normalizeWhiteboardState()
+    private whiteboardState: WhiteboardStatePrimitives = normalizeWhiteboardState(),
+    private waitingRoomRequests: Map<string, WaitingRoomRequestState> = new Map()
   ) {
     if (!sessionId) {
       throw new Error('Session id cannot be empty');
@@ -178,7 +203,15 @@ export class Session {
       ),
       new Map(Object.entries(primitives.participantPresence || {})),
       breakoutRooms,
-      normalizeWhiteboardState(primitives.whiteboardState)
+      normalizeWhiteboardState(primitives.whiteboardState),
+      new Map(
+        (primitives.waitingRoomRequests || []).map((request) => [
+          request.id,
+          {
+            ...request,
+          },
+        ])
+      )
     );
   }
 
@@ -553,6 +586,57 @@ export class Session {
     this.whiteboardState.breakouts[normalizedLocation.breakoutRoomId] = nextRoomState;
   }
 
+  upsertWaitingRoomRequest(request: Omit<WaitingRoomRequestPrimitives, 'updatedAt'> & { updatedAt?: string }) {
+    if (!request.id) {
+      throw new Error('Waiting room request id cannot be empty');
+    }
+
+    const existingRequest = this.waitingRoomRequests.get(request.id);
+    const updatedAt = request.updatedAt || request.decidedAt || request.requestedAt;
+
+    this.waitingRoomRequests.set(request.id, {
+      ...existingRequest,
+      ...request,
+      updatedAt,
+    });
+  }
+
+  getWaitingRoomRequest(requestId: string): WaitingRoomRequestPrimitives | null {
+    return this.waitingRoomRequests.get(requestId) || null;
+  }
+
+  getWaitingRoomRequests(): WaitingRoomRequestPrimitives[] {
+    return Array.from(this.waitingRoomRequests.values()).sort((a, b) =>
+      (a.requestedAt || '').localeCompare(b.requestedAt || '')
+    );
+  }
+
+  getPendingWaitingRoomRequests(): WaitingRoomRequestPrimitives[] {
+    return this.getWaitingRoomRequests().filter(
+      (request) => request.status === WaitingRoomRequestStatus.PENDING
+    );
+  }
+
+  approveWaitingRoomRequest(requestId: string, decidedAt: string, decidedByRole: Role) {
+    const request = this.getWaitingRoomRequestStateOrFail(requestId);
+    request.status = WaitingRoomRequestStatus.APPROVED;
+    request.updatedAt = decidedAt;
+    request.decidedAt = decidedAt;
+    request.decidedByRole = decidedByRole;
+  }
+
+  rejectWaitingRoomRequest(requestId: string, decidedAt: string, decidedByRole: Role) {
+    const request = this.getWaitingRoomRequestStateOrFail(requestId);
+    request.status = WaitingRoomRequestStatus.REJECTED;
+    request.updatedAt = decidedAt;
+    request.decidedAt = decidedAt;
+    request.decidedByRole = decidedByRole;
+  }
+
+  removeWaitingRoomRequest(requestId: string) {
+    this.waitingRoomRequests.delete(requestId);
+  }
+
   toPrimitives(): SessionPrimitives {
     return {
       id: this.sessionId,
@@ -568,6 +652,7 @@ export class Session {
       participantPresence: this.getParticipantPresenceMap(),
       breakoutRooms: this.getBreakoutRooms(),
       whiteboardState: this.getWhiteboardStateSnapshot(),
+      waitingRoomRequests: this.getWaitingRoomRequests(),
     };
   }
 
@@ -602,5 +687,14 @@ export class Session {
       openedAt: room.openedAt,
       closedAt: room.closedAt,
     };
+  }
+
+  private getWaitingRoomRequestStateOrFail(requestId: string): WaitingRoomRequestState {
+    const request = this.waitingRoomRequests.get(requestId);
+    if (!request) {
+      throw new Error(`Waiting room request ${requestId} does not exist`);
+    }
+
+    return request;
   }
 }

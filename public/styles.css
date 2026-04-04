@@ -465,6 +465,51 @@ body {
     line-height: 1.5;
 }
 
+.waiting-room-card {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.waiting-room-description {
+    margin-bottom: 0;
+}
+
+.waiting-room-status {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.875rem 1rem;
+    border-radius: 10px;
+    background: rgba(59, 130, 246, 0.12);
+    border: 1px solid rgba(59, 130, 246, 0.22);
+    color: var(--text-primary);
+    font-size: 0.875rem;
+}
+
+.waiting-room-pulse {
+    width: 0.65rem;
+    height: 0.65rem;
+    border-radius: 50%;
+    background: #60a5fa;
+    box-shadow: 0 0 0 0 rgba(96, 165, 250, 0.3);
+    animation: waitingPulse 1.8s ease-in-out infinite;
+    flex-shrink: 0;
+}
+
+@keyframes waitingPulse {
+    0% { box-shadow: 0 0 0 0 rgba(96, 165, 250, 0.3); }
+    70% { box-shadow: 0 0 0 10px rgba(96, 165, 250, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(96, 165, 250, 0); }
+}
+
+.waiting-room-meta {
+    color: var(--text-secondary);
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    min-height: 1.25rem;
+}
+
 /* =============================================================================
    Buttons
    ============================================================================= */
@@ -550,6 +595,18 @@ body {
     background: var(--bg-card);
     color: var(--text-secondary);
     border: 1px solid var(--border-color);
+}
+
+.btn-secondary {
+    width: 100%;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    padding: 0.75rem 1.25rem;
+}
+
+.btn-secondary:hover {
+    background: var(--bg-primary);
 }
 
 /* =============================================================================
@@ -2804,6 +2861,25 @@ body {
     margin: 0;
 }
 
+.participants-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.participants-section + .participants-section {
+    margin-top: 10px;
+}
+
+.participants-section-title {
+    padding: 4px 4px 0;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
 /* Participant item */
 .participant-item {
     display: flex;
@@ -3030,6 +3106,15 @@ body {
 .participant-action-btn svg {
     width: 14px;
     height: 14px;
+}
+
+.participant-action-btn.approve-btn:hover {
+    background: rgba(27, 143, 90, 0.2);
+    color: var(--success-color);
+}
+
+.waiting-room-request-item {
+    border: 1px solid rgba(96, 165, 250, 0.2);
 }
 
 /* Responsive participants panel */

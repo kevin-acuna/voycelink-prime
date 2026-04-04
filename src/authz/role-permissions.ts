@@ -28,6 +28,7 @@ export const ROLE_PERMISSIONS: RolePermissionMap = {
     Permission.MOVE_PARTICIPANT_BETWEEN_ROOMS,
     Permission.ASSIGN_COHOST,
     Permission.REMOVE_COHOST,
+    Permission.ADMIT_WAITING_ROOM,
   ],
   [Role.CO_HOST]: [
     Permission.JOIN_SESSION,
@@ -47,6 +48,7 @@ export const ROLE_PERMISSIONS: RolePermissionMap = {
     Permission.MANAGE_BREAKOUT_ROOMS,
     Permission.JOIN_BREAKOUT_ROOM,
     Permission.MOVE_PARTICIPANT_BETWEEN_ROOMS,
+    Permission.ADMIT_WAITING_ROOM,
   ],
   [Role.PARTICIPANT]: [
     Permission.JOIN_SESSION,

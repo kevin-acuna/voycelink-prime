@@ -20,6 +20,7 @@ export const Permission = {
   MOVE_PARTICIPANT_BETWEEN_ROOMS: 'move_participant_between_rooms',
   ASSIGN_COHOST: 'assign_cohost',
   REMOVE_COHOST: 'remove_cohost',
+  ADMIT_WAITING_ROOM: 'admit_waiting_room',
 } as const;
 
 export type Permission = typeof Permission[keyof typeof Permission];
