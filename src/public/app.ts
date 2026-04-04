@@ -305,7 +305,9 @@ const Permission = {
     UPDATE_ROOM_CONFIGURATION: 'update_room_configuration',
     MANAGE_BREAKOUT_ROOMS: 'manage_breakout_rooms',
     JOIN_BREAKOUT_ROOM: 'join_breakout_room',
-    MOVE_PARTICIPANT_BETWEEN_ROOMS: 'move_participant_between_rooms'
+    MOVE_PARTICIPANT_BETWEEN_ROOMS: 'move_participant_between_rooms',
+    ASSIGN_COHOST: 'assign_cohost',
+    REMOVE_COHOST: 'remove_cohost'
 };
 let permissionsSocket = null;
 let permissionsSocketReconnectTimeoutId = null;
@@ -500,6 +502,34 @@ function canManageWhiteboard() {
 
 function canManageBreakouts() {
     return hasPermission(Permission.MANAGE_BREAKOUT_ROOMS);
+}
+
+function canAssignCoHosts() {
+    return hasPermission(Permission.ASSIGN_COHOST);
+}
+
+function canRemoveCoHosts() {
+    return hasPermission(Permission.REMOVE_COHOST);
+}
+
+function canManageTargetParticipantRole(targetRole) {
+    if (appState.authRole !== 'co_host') {
+        return true;
+    }
+
+    return targetRole !== 'host' && targetRole !== 'co_host';
+}
+
+function getParticipantRoleListLabel(role) {
+    if (role === 'host') {
+        return 'Host';
+    }
+
+    if (role === 'co_host') {
+        return 'Co-host';
+    }
+
+    return '';
 }
 
 function canUseWhiteboard() {
@@ -921,6 +951,21 @@ function getGlobalParticipantsForPanels() {
         .sort(compareParticipantsByRoleAndName);
 }
 
+function getParticipantForModeration(identifier) {
+    if (!identifier) {
+        return null;
+    }
+
+    return (
+        getGlobalParticipantsForPanels().find(
+            (participant) =>
+                participant.connectionId === identifier || participant.mediaConnectionId === identifier
+        ) ||
+        participantsData.get(identifier) ||
+        null
+    );
+}
+
 async function updateParticipantPermissions(connectionId, permissionsPatch) {
     if (!appState.sessionId) {
         showNotification('No active session available.', 'error');
@@ -946,6 +991,29 @@ async function updateParticipantPermissions(connectionId, permissionsPatch) {
     return payload;
 }
 
+async function updateParticipantRole(connectionId, role) {
+    if (!appState.sessionId) {
+        showNotification('No active session available.', 'error');
+        return;
+    }
+
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.PARTICIPANT_ROLE(appState.sessionId, connectionId)}`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ role }),
+        }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to update participant role');
+    }
+
+    return response.json().catch(() => ({}));
+}
+
 function toggleParticipantAccessMenu(connectionId) {
     activeParticipantAccessMenuId =
         activeParticipantAccessMenuId === connectionId ? null : connectionId;
@@ -959,6 +1027,22 @@ function closeParticipantAccessMenu() {
 
     activeParticipantAccessMenuId = null;
     if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+}
+
+async function toggleParticipantCoHostRole(connectionId, nextRole) {
+    try {
+        await updateParticipantRole(connectionId, nextRole);
+        closeParticipantAccessMenu();
+        showNotification(
+            nextRole === 'co_host'
+                ? 'Participant promoted to co-host.'
+                : 'Co-host role removed.',
+            'info'
+        );
+    } catch (error) {
+        showNotification(error.message || 'Failed to update participant role.', 'error');
         renderParticipantsList();
     }
 }
@@ -1142,8 +1226,15 @@ function loadBootstrapSession() {
 }
 
 async function apiFetch(url, options = {}) {
+    const headers = new Headers(options.headers || {});
+    const rootParticipantId = getCurrentRootParticipantId();
+    if (rootParticipantId && !headers.has('X-Participant-Id')) {
+        headers.set('X-Participant-Id', rootParticipantId);
+    }
+
     const response = await fetch(url, {
         ...options,
+        headers,
         credentials: 'same-origin',
     });
 
@@ -1777,6 +1868,28 @@ function connectPermissionsWebSocket() {
             }
 
             if (payload.type !== 'participant_access_updated') {
+                if (payload.type === 'participant_role_updated') {
+                    const snapshotApplied = applyGlobalSessionSnapshot(payload);
+                    if (!snapshotApplied && payload.revision !== undefined) {
+                        return;
+                    }
+                    if (appState.isParticipantsOpen) {
+                        renderParticipantsList();
+                    }
+                    renderBreakoutsPanel();
+                    await syncParticipantRolesFromSession();
+
+                    if (payload.participantId === appState.currentRootParticipantId) {
+                        await refreshCurrentPermissions({ silent: true });
+                        showNotification(
+                            payload.role === 'co_host'
+                                ? 'You have been promoted to co-host.'
+                                : 'Your co-host role was removed.',
+                            'info'
+                        );
+                    }
+                    return;
+                }
                 if (payload.type === 'participant_left_conference') {
                     const snapshotApplied = applyGlobalSessionSnapshot(payload);
                     if (!snapshotApplied && payload.revision !== undefined) {
@@ -4009,6 +4122,8 @@ function renderParticipantsList() {
     elements.participantsList.innerHTML = sortedParticipants.map(p => {
         const initials = p.nickname.charAt(0).toUpperCase();
         const isYou = p.isLocal;
+        const isProtectedTarget = !canManageTargetParticipantRole(p.role);
+        const roleLabel = getParticipantRoleListLabel(p.role);
         const isParticipantInCurrentRoom = !shouldUseGlobalRosterView() || (
             p.location?.type === (appState.currentRoomTarget?.type || 'main') &&
             (p.location?.breakoutRoomId || null) === (appState.currentRoomTarget?.breakoutRoomId || null)
@@ -4016,11 +4131,18 @@ function renderParticipantsList() {
         const canMuteParticipant =
             canManageParticipantMedia() &&
             !isYou &&
+            !isProtectedTarget &&
             p.presence === 'connected' &&
             isParticipantInCurrentRoom;
-        const canRemoveParticipant = canKickParticipants() && !isYou;
+        const canRemoveParticipant = canKickParticipants() && !isYou && !isProtectedTarget;
         const canModerateParticipant = canMuteParticipant || canRemoveParticipant;
-        const canManagePermissionGrants = (canManageParticipantMedia() || canManageWhiteboard()) && !isYou;
+        const canManagePermissionGrants =
+            (canManageParticipantMedia() || canManageWhiteboard()) &&
+            !isYou &&
+            !isProtectedTarget;
+        const canToggleCoHostRole =
+            !isYou &&
+            ((p.role !== 'co_host' && canAssignCoHosts()) || (p.role === 'co_host' && canRemoveCoHosts()));
         const participantPermissions = p.permissions || getDefaultParticipantPermissionState();
         const isAccessMenuOpen = activeParticipantAccessMenuId === p.connectionId;
         
@@ -4029,7 +4151,8 @@ function renderParticipantsList() {
                 <div class="participant-avatar">${initials}</div>
                 <div class="participant-info">
                     <div class="participant-name">
-                        ${escapeHtml(p.nickname)}
+                        <span class="participant-name-text">${escapeHtml(p.nickname)}</span>
+                        ${roleLabel ? `<span class="participant-role-label">(${escapeHtml(roleLabel)})</span>` : ''}
                         ${isYou ? '<span class="participant-you-badge">You</span>' : ''}
                     </div>
                     <div class="participant-status ${p.isMuted ? 'muted' : ''}">
@@ -4059,6 +4182,11 @@ function renderParticipantsList() {
                                     ${canManageWhiteboard() ? `
                                         <button class="participant-access-menu-item" data-connection-id="${p.connectionId}" data-action="${participantPermissions.whiteboardEnabled ? 'disableWhiteboard' : 'enableWhiteboard'}">
                                             ${participantPermissions.whiteboardEnabled ? 'Disable whiteboard access' : 'Enable whiteboard access'}
+                                        </button>
+                                    ` : ''}
+                                    ${canToggleCoHostRole ? `
+                                        <button class="participant-access-menu-item participant-role-menu-item" data-connection-id="${p.connectionId}" data-next-role="${p.role === 'co_host' ? 'participant' : 'co_host'}">
+                                            ${p.role === 'co_host' ? 'Remove co-host role' : 'Make co-host'}
                                         </button>
                                     ` : ''}
                                 </div>
@@ -4116,6 +4244,13 @@ function renderParticipantsList() {
             await handleParticipantAccessAction(button.dataset.connectionId, button.dataset.action);
         });
     });
+
+    elements.participantsList.querySelectorAll('.participant-role-menu-item').forEach((button) => {
+        button.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            await toggleParticipantCoHostRole(button.dataset.connectionId, button.dataset.nextRole);
+        });
+    });
 }
 
 /**
@@ -4129,8 +4264,12 @@ function requestMuteParticipant(connectionId) {
         return;
     }
     
-    const participant = participantsData.get(connectionId);
+    const participant = getParticipantForModeration(connectionId);
     if (!participant) return;
+    if (!canManageTargetParticipantRole(participant.role)) {
+        showNotification('Co-hosts cannot mute the host or other co-hosts.', 'error');
+        return;
+    }
     
     // Send signal to request mute
     openviduClient.session.signal({
@@ -4160,6 +4299,10 @@ async function kickParticipant(connectionId) {
         getGlobalParticipantsForPanels().find((candidate) => candidate.connectionId === connectionId)
         || participantsData.get(connectionId);
     if (!participant) return;
+    if (!canManageTargetParticipantRole(participant.role)) {
+        showNotification('Co-hosts cannot remove the host or other co-hosts.', 'error');
+        return;
+    }
     
     // Confirm before kicking
     if (!confirm(`Remove ${participant.nickname} from the call?`)) {
@@ -4191,6 +4334,18 @@ async function kickParticipant(connectionId) {
 function handleMuteRequest(event) {
     try {
         const data = JSON.parse(event.data);
+        const senderParticipant = getParticipantForModeration(event?.from?.connectionId);
+        const senderRole = senderParticipant?.role || 'participant';
+        const localRole = appState.authRole || 'participant';
+        const senderCanRequestMute =
+            senderRole === 'host' ||
+            (senderRole === 'co_host' && localRole !== 'host' && localRole !== 'co_host');
+
+        if (!senderCanRequestMute) {
+            logEvent('warn', `Ignored mute request from ${senderParticipant?.nickname || 'unknown participant'} due to insufficient moderation privileges`);
+            return;
+        }
+
         // Show notification and auto-mute
         const message = `${data.fromNickname} has requested you to mute your microphone`;
         

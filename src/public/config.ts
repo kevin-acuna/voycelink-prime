@@ -34,7 +34,9 @@ const CONFIG = {
         PARTICIPANT_DISCONNECT: (sessionId, participantId) =>
             `/api/sessions/${sessionId}/participants/${participantId}/disconnect`,
         PARTICIPANT_PERMISSIONS: (sessionId, participantId) =>
-            `/api/sessions/${sessionId}/participants/${participantId}/permissions`
+            `/api/sessions/${sessionId}/participants/${participantId}/permissions`,
+        PARTICIPANT_ROLE: (sessionId, participantId) =>
+            `/api/sessions/${sessionId}/participants/${participantId}/role`
     },
     
     // OpenVidu Publisher Settings

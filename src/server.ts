@@ -57,7 +57,7 @@ const sessionRepository = new CosmosSessionRepository();
 app.use(cors({
     origin: '*', // In production, restrict this to your frontend domain
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Participant-Id'],
     credentials: true,
 }));
 app.use(express.json());
@@ -707,18 +707,44 @@ function authenticateRequest(req, res, next) {
 }
 
 function requirePermission(permission) {
-    return (req, res, next) => {
-        const role = req.auth?.role;
-        const authorization = canPerform({ role }, permission);
+    return async (req, res, next) => {
+        try {
+            let effectiveRole = req.auth?.role;
 
-        if (!authorization.allowed) {
-            return res.status(403).json({
-                error: 'Forbidden',
-                details: authorization.reason,
+            if (req.auth?.roomId && req.auth?.role !== Role.HOST) {
+                const storedSession = await sessionRepository.findById(req.auth.roomId);
+                const participantId = resolveRootParticipantId(
+                    storedSession,
+                    getParticipantIdFromRequest(req)
+                );
+
+                if (participantId) {
+                    const storedRole = storedSession?.getParticipantRole?.(new ParticipantId(participantId));
+                    if (storedRole) {
+                        effectiveRole = storedRole;
+                    }
+                    req.auth.participantId = participantId;
+                }
+            }
+
+            req.auth.role = effectiveRole;
+            const authorization = canPerform({ role: effectiveRole }, permission);
+
+            if (!authorization.allowed) {
+                return res.status(403).json({
+                    error: 'Forbidden',
+                    details: authorization.reason,
+                });
+            }
+
+            next();
+        } catch (error) {
+            logger.error({ err: error, path: req.path, permission }, 'Failed to resolve effective role for permission check');
+            return res.status(500).json({
+                error: 'Failed to authorize request',
+                details: getErrorMessage(error),
             });
         }
-
-        next();
     };
 }
 
@@ -1124,6 +1150,27 @@ function canManageRequestedPermissions(role, permissionPatch) {
     return {
         allowed: true,
         reason: 'Permission update is allowed',
+    };
+}
+
+function canModerateTargetRole(actorRole, targetRole) {
+    if (actorRole !== Role.CO_HOST) {
+        return {
+            allowed: true,
+            reason: 'Target role can be moderated',
+        };
+    }
+
+    if (targetRole === Role.HOST || targetRole === Role.CO_HOST) {
+        return {
+            allowed: false,
+            reason: 'Co-hosts cannot moderate the host or other co-hosts',
+        };
+    }
+
+    return {
+        allowed: true,
+        reason: 'Target role can be moderated',
     };
 }
 
@@ -1845,6 +1892,15 @@ app.patch('/api/sessions/:sessionId/participants/:participantId/permissions', re
         }
 
         const participantRef = new ParticipantId(resolvedParticipantId);
+        const targetRole = storedSession.getParticipantRole(participantRef) || Role.PARTICIPANT;
+        const targetRoleAuthorization = canModerateTargetRole(req.auth.role, targetRole);
+        if (!targetRoleAuthorization.allowed) {
+            return res.status(403).json({
+                error: 'Forbidden',
+                details: targetRoleAuthorization.reason,
+            });
+        }
+
         storedSession.updateParticipantPermissions(participantRef, permissionPatch);
         await sessionRepository.save(storedSession);
 
@@ -1875,6 +1931,93 @@ app.patch('/api/sessions/:sessionId/participants/:participantId/permissions', re
         logger.error({ err: error }, 'Failed to update participant permissions');
         return res.status(error?.status || 400).json({
             error: 'Failed to update participant permissions',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.patch('/api/sessions/:sessionId/participants/:participantId/role', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const { sessionId, participantId } = req.params;
+
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const nextRole = req.body?.role;
+        if (nextRole !== Role.CO_HOST && nextRole !== Role.PARTICIPANT) {
+            return res.status(400).json({
+                error: 'Invalid role',
+                details: 'Role must be either co_host or participant',
+            });
+        }
+
+        const requiredPermission =
+            nextRole === Role.CO_HOST ? Permission.ASSIGN_COHOST : Permission.REMOVE_COHOST;
+        const authorization = canPerform({ role: req.auth.role }, requiredPermission);
+        if (!authorization.allowed) {
+            return res.status(403).json({
+                error: 'Forbidden',
+                details: authorization.reason,
+            });
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const resolvedParticipantId = resolveRootParticipantId(storedSession, participantId);
+        if (!resolvedParticipantId) {
+            return res.status(404).json({
+                error: 'Participant not found',
+                details: `Participant ${participantId} is not registered in session ${sessionId}`,
+            });
+        }
+
+        const participantRef = new ParticipantId(resolvedParticipantId);
+        const currentRole = storedSession.getParticipantRole(participantRef) || Role.PARTICIPANT;
+
+        if (currentRole === Role.HOST) {
+            return res.status(409).json({
+                error: 'Invalid role transition',
+                details: 'The host role cannot be changed from this endpoint',
+            });
+        }
+
+        if (currentRole === nextRole) {
+            return res.json({
+                participantId: resolvedParticipantId,
+                role: currentRole,
+            });
+        }
+
+        storedSession.setParticipantRole(participantRef, nextRole);
+        await sessionRepository.save(storedSession);
+
+        logger.info(
+            {
+                sessionId,
+                resolvedParticipantId,
+                previousRole: currentRole,
+                nextRole,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Updated participant role'
+        );
+
+        broadcastPermissionUpdate(sessionId, {
+            type: 'participant_role_updated',
+            sessionId,
+            participantId: resolvedParticipantId,
+            role: nextRole,
+            ...buildBreakoutSnapshot(storedSession),
+        });
+
+        return res.json({
+            participantId: resolvedParticipantId,
+            role: nextRole,
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to update participant role');
+        return res.status(error?.status || 400).json({
+            error: 'Failed to update participant role',
             details: getErrorMessage(error),
         });
     }
@@ -1980,6 +2123,15 @@ app.delete('/api/sessions/:sessionId/participants/:participantId', requirePermis
         }
 
         const participantRef = new ParticipantId(resolvedParticipantId);
+        const targetRole = storedSession.getParticipantRole(participantRef) || Role.PARTICIPANT;
+        const targetRoleAuthorization = canModerateTargetRole(req.auth.role, targetRole);
+        if (!targetRoleAuthorization.allowed) {
+            return res.status(403).json({
+                error: 'Forbidden',
+                details: targetRoleAuthorization.reason,
+            });
+        }
+
         const participantLocation = storedSession.getParticipantLocation(participantRef);
         const breakoutRoom =
             participantLocation.type === 'breakout' && participantLocation.breakoutRoomId

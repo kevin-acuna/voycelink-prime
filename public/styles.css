@@ -2837,12 +2837,27 @@ body {
 }
 
 .participant-name {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     font-size: 0.875rem;
     font-weight: 500;
     color: var(--text-primary);
+    min-width: 0;
+}
+
+.participant-name-text {
+    min-width: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.participant-role-label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-weight: 500;
+    flex-shrink: 0;
 }
 
 .participant-status {
