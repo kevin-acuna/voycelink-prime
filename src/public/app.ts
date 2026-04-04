@@ -162,6 +162,7 @@ const appState = {
     currentSessionSnapshotRevision: null,
     sessionFeatures: {
         chatEnabled: true,
+        groupChatEnabled: false,
         whiteboardEnabled: true,
         subtitlesEnabled: true,
         aiInterpretationEnabled: false,
@@ -238,6 +239,8 @@ const elements = {
     chatMessages: document.getElementById('chatMessages'),
     chatRecipientSelect: document.getElementById('chatRecipientSelect'),
     chatInput: document.getElementById('chatInput'),
+    groupChatToggleWrapper: document.getElementById('groupChatToggleWrapper'),
+    groupChatToggle: document.getElementById('groupChatToggle'),
     sendChatBtn: document.getElementById('sendChatBtn'),
     closeChatBtn: document.getElementById('closeChatBtn'),
     chatBadge: document.getElementById('chatBadge'),
@@ -583,6 +586,18 @@ function getCurrentRootParticipantId() {
     return appState.currentRootParticipantId || getStoredRoomParticipantId(appState.sessionId);
 }
 
+function isOwnScreenShareConnection(connectionId, connectionData = {}) {
+    if (appState.screenConnectionId && connectionId === appState.screenConnectionId) {
+        return true;
+    }
+
+    return (
+        Boolean(connectionData.isScreenShare) &&
+        Boolean(connectionData.rootParticipantId) &&
+        connectionData.rootParticipantId === getCurrentRootParticipantId()
+    );
+}
+
 function getMediaConnectionIdForParticipant(participantId) {
     return appState.participantMediaConnections?.[participantId] || null;
 }
@@ -704,15 +719,27 @@ function applyPermissionBasedUi() {
         setElementVisibility(elements.whiteboardActions, canManageWhiteboard(), 'inline-flex');
         setElementVisibility(elements.toggleWhiteboardMenuBtn, appState.authRole === 'host', 'inline-flex');
         setElementVisibility(elements.advancedWhiteboardLink, appState.authRole === 'host', 'flex');
+        setElementVisibility(
+            elements.groupChatToggleWrapper,
+            hasPermission(Permission.UPDATE_ROOM_CONFIGURATION),
+            'flex'
+        );
+        if (elements.groupChatToggle) {
+            elements.groupChatToggle.checked = appState.sessionFeatures.groupChatEnabled === true;
+        }
         setElementVisibility(elements.toggleReactionsBtn, canSendGroupMessages(), '');
         elements.sendChatBtn.disabled = !canSendAnyChatMessages();
         elements.chatInput.disabled = !canSendAnyChatMessages();
         if (elements.chatRecipientSelect) {
             elements.chatRecipientSelect.disabled = !canSendAnyChatMessages();
         }
-        elements.chatInput.placeholder = canSendAnyChatMessages()
-            ? 'Type a message...'
-            : 'Messaging is disabled for your access level';
+        if (canSendAnyChatMessages()) {
+            elements.chatInput.placeholder = canSendGroupMessages()
+                ? 'Type a message...'
+                : 'Message the host or co-host...';
+        } else {
+            elements.chatInput.placeholder = 'Messaging is disabled for your access level';
+        }
 
         if (!canSendGroupMessages()) {
             hideReactionsPopup();
@@ -847,6 +874,12 @@ function applyGlobalSessionSnapshot(payload = {}) {
     }
     if (payload.whiteboardState) {
         appState.whiteboardState = payload.whiteboardState;
+    }
+    if (payload.session || payload.roomConfiguration) {
+        appState.sessionFeatures = {
+            ...appState.sessionFeatures,
+            ...(payload.session || payload.roomConfiguration),
+        };
     }
     if (payload.currentRootParticipantId) {
         appState.currentRootParticipantId = payload.currentRootParticipantId;
@@ -1888,6 +1921,22 @@ function connectPermissionsWebSocket() {
                             'info'
                         );
                     }
+                    return;
+                }
+                if (payload.type === 'room_configuration_updated') {
+                    const snapshotApplied = applyGlobalSessionSnapshot(payload);
+                    if (!snapshotApplied && payload.revision !== undefined) {
+                        return;
+                    }
+                    applyPermissionBasedUi();
+                    updateChatRecipientOptions();
+                    logEvent(
+                        'info',
+                        `Received room_configuration_updated: ${JSON.stringify({
+                            revision: payload.revision ?? null,
+                            session: payload.session || null,
+                        })}`
+                    );
                     return;
                 }
                 if (payload.type === 'participant_left_conference') {
@@ -3106,9 +3155,10 @@ function setActiveScreenShare(connectionId) {
 /**
  * Create video element for a remote screen share
  */
-function createRemoteScreenShareElement(subscriber) {
+function createRemoteScreenShareElement(subscriber, options = {}) {
     const stream = subscriber.stream;
     const connectionId = stream.connection.connectionId;
+    const shouldMutePlayback = Boolean(options.muteAudio);
     
     // Parse connection data for nickname
     // OpenVidu concatenates client and server data with '%/%' separator
@@ -3136,6 +3186,9 @@ function createRemoteScreenShareElement(subscriber) {
     if (existingWrapper) {
         const video = existingWrapper.querySelector('video');
         if (video) {
+            video.muted = shouldMutePlayback;
+            video.defaultMuted = shouldMutePlayback;
+            video.volume = shouldMutePlayback ? 0 : 1;
             subscriber.addVideoElement(video);
         }
         setActiveScreenShare(connectionId);
@@ -3152,6 +3205,9 @@ function createRemoteScreenShareElement(subscriber) {
     video.autoplay = true;
     video.playsInline = true;
     video.id = `screen-video-${connectionId}`;
+    video.muted = shouldMutePlayback;
+    video.defaultMuted = shouldMutePlayback;
+    video.volume = shouldMutePlayback ? 0 : 1;
     
     // Create label
     const label = document.createElement('div');
@@ -3894,15 +3950,65 @@ function resetChatUI() {
 }
 
 function getEligibleDirectMessageRecipients() {
-    const participants = shouldUseGlobalRosterView()
-        ? getGlobalParticipantsForPanels().filter((participant) => !participant.isLocal && participant.presence === 'connected')
-        : Array.from(participantsData.values()).filter((participant) => !participant.isLocal);
+    const globalParticipants = getGlobalParticipantsForPanels()
+        .filter((participant) => !participant.isLocal && participant.presence === 'connected')
+        .map((participant) => ({
+            ...participant,
+            messageTargetConnectionId: participant.mediaConnectionId || null,
+        }))
+        .filter((participant) => Boolean(participant.messageTargetConnectionId));
+
+    const participants =
+        globalParticipants.length > 0
+            ? globalParticipants
+            : Array.from(participantsData.values())
+                .filter((participant) => !participant.isLocal)
+                .map((participant) => ({
+                    ...participant,
+                    messageTargetConnectionId: participant.connectionId,
+                }));
+
+    const sortedParticipants = [...participants].sort(compareParticipantsByRoleAndName);
 
     if (canModerateChatRecipients()) {
-        return participants;
+        return sortedParticipants;
     }
 
-    return participants.filter((participant) => participant.role === 'host' || participant.role === 'co_host');
+    return sortedParticipants.filter((participant) => participant.role === 'host' || participant.role === 'co_host');
+}
+
+async function updateSessionConfiguration(roomConfiguration) {
+    if (!appState.sessionId) {
+        return null;
+    }
+
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_CONFIGURATION(appState.sessionId)}`,
+        {
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ roomConfiguration }),
+        }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to update room configuration');
+    }
+
+    const payload = await response.json();
+    appState.sessionFeatures = {
+        ...appState.sessionFeatures,
+        ...(payload.roomConfiguration || {}),
+    };
+    if (payload.revision !== undefined) {
+        appState.currentSessionSnapshotRevision = normalizeSnapshotRevision(payload.revision);
+    }
+    applyPermissionBasedUi();
+    updateChatRecipientOptions();
+    return payload;
 }
 
 function updateChatRecipientOptions() {
@@ -3920,7 +4026,7 @@ function updateChatRecipientOptions() {
     if (canSendDirectMessages()) {
         getEligibleDirectMessageRecipients().forEach((participant) => {
             options.push(
-                `<option value="${participant.connectionId}" data-nickname="${escapeHtml(participant.nickname)}">Direct to ${escapeHtml(participant.nickname)}</option>`
+                `<option value="${participant.messageTargetConnectionId}" data-nickname="${escapeHtml(participant.nickname)}">Direct to ${escapeHtml(participant.nickname)}</option>`
             );
         });
     }
@@ -3928,6 +4034,11 @@ function updateChatRecipientOptions() {
     if (options.length === 0) {
         elements.chatRecipientSelect.innerHTML = '<option value="">No available destinations</option>';
         elements.chatRecipientSelect.disabled = true;
+        elements.chatInput.disabled = true;
+        elements.sendChatBtn.disabled = true;
+        elements.chatInput.placeholder = canSendDirectMessages()
+            ? 'No connected host or co-host available'
+            : 'Messaging is disabled for your access level';
         return;
     }
 
@@ -4773,9 +4884,14 @@ function setupOpenViduCallbacks() {
                 logEvent('info', `Ignoring screen share from ${connectionId} outside current room`);
                 return;
             }
+            const isOwnScreenShare = isOwnScreenShareConnection(connectionId, connectionData);
+            if (isOwnScreenShare && typeof subscriber.subscribeToAudio === 'function') {
+                subscriber.subscribeToAudio(false);
+                logEvent('info', `Muted local playback for own screen share ${connectionId}`);
+            }
             // Create screen share video element (for both local sharer and remote viewers)
             logEvent('info', `Creating screen share element...`);
-            createRemoteScreenShareElement(subscriber);
+            createRemoteScreenShareElement(subscriber, { muteAudio: isOwnScreenShare });
             logEvent('info', `Screen share displayed from ${connectionId}`);
         } else {
             // Skip creating camera element for screen share connections (they only publish SCREEN)
@@ -5561,6 +5677,7 @@ function leaveSession() {
     appState.isTranscriptionActive = false;
     appState.sessionFeatures = {
         chatEnabled: true,
+        groupChatEnabled: false,
         whiteboardEnabled: true,
         subtitlesEnabled: true,
         aiInterpretationEnabled: false,
@@ -5757,6 +5874,22 @@ elements.chatInput.addEventListener('keydown', (e) => {
     }
 });
 elements.chatTranslateToggle.addEventListener('change', toggleChatTranslation);
+elements.groupChatToggle?.addEventListener('change', async () => {
+    const nextValue = elements.groupChatToggle.checked;
+
+    try {
+        await updateSessionConfiguration({ groupChatEnabled: nextValue });
+        showNotification(
+            nextValue
+                ? 'Global chat enabled for participants.'
+                : 'Global chat disabled for participants.',
+            'info'
+        );
+    } catch (error) {
+        elements.groupChatToggle.checked = appState.sessionFeatures.groupChatEnabled === true;
+        showNotification(error.message || 'Failed to update global chat.', 'error');
+    }
+});
 
 // Participants panel controls
 elements.toggleParticipantsBtn.addEventListener('click', toggleParticipants);

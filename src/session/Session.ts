@@ -198,6 +198,7 @@ export class Session {
   getFeatureFlags() {
     return {
       chatEnabled: true,
+      groupChatEnabled: false,
       whiteboardEnabled: true,
       subtitlesEnabled: true,
       aiInterpretationEnabled: false,

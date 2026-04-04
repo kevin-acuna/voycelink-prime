@@ -130,6 +130,17 @@ export function canPerform(
     if (
       permission === Permission.SEND_GROUP_CHAT_MESSAGE &&
       role === Role.PARTICIPANT &&
+      session?.groupChatEnabled !== true
+    ) {
+      return {
+        allowed: false,
+        reason: 'group chat is currently disabled for participants',
+      };
+    }
+
+    if (
+      permission === Permission.SEND_GROUP_CHAT_MESSAGE &&
+      role === Role.PARTICIPANT &&
       grants?.groupChatEnabled === false
     ) {
       return {

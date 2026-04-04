@@ -1726,6 +1726,16 @@ body {
     color: #3b82f6;
 }
 
+.chat-global-toggle {
+    gap: 8px;
+}
+
+.chat-global-toggle-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
 .btn-close-chat {
     background: transparent;
     border: none;

@@ -19,6 +19,7 @@ const CONFIG = {
         HOST_SESSION_BOOTSTRAP: '/api/bootstrap/host-session',
         SESSIONS: '/api/sessions',
         SESSION: (sessionId) => `/api/sessions/${sessionId}`,
+        SESSION_CONFIGURATION: (sessionId) => `/api/sessions/${sessionId}/configuration`,
         SESSION_INVITE_LINK: (sessionId) => `/api/sessions/${sessionId}/invite-link`,
         SESSION_ROOM_TARGET: (sessionId) => `/api/sessions/${sessionId}/room-target`,
         SESSION_BREAKOUTS: (sessionId) => `/api/sessions/${sessionId}/breakouts`,

@@ -771,6 +771,7 @@ async function getAuthorizationContextForRequest(req) {
     let grants = {};
     let sessionFlags = {
         chatEnabled: true,
+        groupChatEnabled: false,
         whiteboardEnabled: true,
         subtitlesEnabled: true,
         aiInterpretationEnabled: false,
@@ -1030,6 +1031,7 @@ function getRoomTargetForParticipant(storedSession, participantId = null) {
 function buildBreakoutSnapshot(storedSession) {
     return {
         revision: storedSession.getRevision(),
+        session: storedSession.getFeatureFlags(),
         breakoutRooms: storedSession.getBreakoutRooms(),
         participantLocations: storedSession.getParticipantLocations(),
         participantProfiles: storedSession.getParticipantProfiles(),
@@ -2254,6 +2256,10 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
     const ownedRooms = getOwnedRoomsFromRequest(req);
     const roomConfiguration = req.body?.roomConfiguration || {};
     const normalizedRoomConfiguration = {
+        groupChatEnabled:
+            typeof roomConfiguration.groupChatEnabled === 'boolean'
+                ? roomConfiguration.groupChatEnabled
+                : false,
         subtitlesEnabled:
             typeof roomConfiguration.subtitlesEnabled === 'boolean'
                 ? roomConfiguration.subtitlesEnabled
@@ -2724,6 +2730,70 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
     } catch (error) {
         logger.error({ err: error }, 'Failed to generate connection token');
         return sendOpenViduError(res, error, 'Failed to generate connection token');
+    }
+});
+
+app.patch('/api/sessions/:sessionId/configuration', requirePermission(Permission.UPDATE_ROOM_CONFIGURATION), async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const roomConfiguration = req.body?.roomConfiguration || {};
+        const configurationPatch = {};
+
+        if (typeof roomConfiguration.groupChatEnabled === 'boolean') {
+            configurationPatch.groupChatEnabled = roomConfiguration.groupChatEnabled;
+        }
+
+        if (typeof roomConfiguration.subtitlesEnabled === 'boolean') {
+            configurationPatch.subtitlesEnabled = roomConfiguration.subtitlesEnabled;
+        }
+
+        if (typeof roomConfiguration.aiInterpretationEnabled === 'boolean') {
+            configurationPatch.aiInterpretationEnabled = roomConfiguration.aiInterpretationEnabled;
+        }
+
+        if (Object.keys(configurationPatch).length === 0) {
+            return res.status(400).json({
+                error: 'Invalid room configuration',
+                details: 'At least one supported room configuration flag must be provided',
+            });
+        }
+
+        const storedSession = await loadStoredSessionOrFail(sessionId);
+        storedSession.updateFeatureFlags(configurationPatch);
+        await sessionRepository.save(storedSession);
+
+        logger.info(
+            {
+                sessionId,
+                configurationPatch,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Updated room configuration'
+        );
+
+        broadcastPermissionUpdate(sessionId, {
+            type: 'room_configuration_updated',
+            sessionId,
+            session: storedSession.getFeatureFlags(),
+            ...buildBreakoutSnapshot(storedSession),
+        });
+
+        return res.json({
+            sessionId,
+            roomConfiguration: storedSession.getFeatureFlags(),
+            revision: storedSession.getRevision(),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to update room configuration');
+        return res.status(error?.status || 400).json({
+            error: 'Failed to update room configuration',
+            details: getErrorMessage(error),
+        });
     }
 });
 

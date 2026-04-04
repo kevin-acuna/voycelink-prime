@@ -12,6 +12,7 @@ export type PermissionGrantSet = {
 
 export type SessionFeatureFlags = {
   chatEnabled?: boolean;
+  groupChatEnabled?: boolean;
   whiteboardEnabled?: boolean;
   subtitlesEnabled?: boolean;
   aiInterpretationEnabled?: boolean;
