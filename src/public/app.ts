@@ -142,6 +142,24 @@ const appState = {
     authRole: null,
     authRoomId: null,
     authTokenExpiresAt: null,
+    currentRoomTarget: {
+        type: 'main',
+        breakoutRoomId: null,
+        openviduSessionId: null,
+        displayName: 'Main room',
+    },
+    breakoutRooms: [],
+    participantLocations: {},
+    participantProfiles: {},
+    participantRoles: {},
+    participantPresence: {},
+    participantPermissionState: {},
+    participantMediaConnections: {},
+    whiteboardState: {
+        main: { isOpen: false, canvasState: null, updatedAt: null },
+        breakouts: {},
+    },
+    currentSessionSnapshotRevision: null,
     sessionFeatures: {
         chatEnabled: true,
         whiteboardEnabled: true,
@@ -150,13 +168,17 @@ const appState = {
     },
     currentPermissions: [],
     currentParticipantId: null,
+    currentRootParticipantId: null,
     isConnected: false,
     isAudioEnabled: true,
     isVideoEnabled: true,
+    publishedAudioLive: false,
+    publishedVideoLive: false,
     isInterpreterActive: false,
     isTranscriptionActive: false,
     isChatOpen: false,
     isParticipantsOpen: false,
+    isBreakoutsOpen: false,
     isScreenSharing: false,
     screenPublisher: null,
     activeScreenShareConnectionId: null
@@ -236,7 +258,12 @@ const elements = {
     participantsPanel: document.getElementById('participantsPanel'),
     participantsList: document.getElementById('participantsList'),
     participantsPanelCount: document.getElementById('participantsPanelCount'),
-    closeParticipantsBtn: document.getElementById('closeParticipantsBtn')
+    closeParticipantsBtn: document.getElementById('closeParticipantsBtn'),
+    toggleBreakoutsBtn: document.getElementById('toggleBreakouts'),
+    breakoutsPanel: document.getElementById('breakoutsPanel'),
+    breakoutsContent: document.getElementById('breakoutsContent'),
+    createBreakoutBtn: document.getElementById('createBreakoutBtn'),
+    closeBreakoutsBtn: document.getElementById('closeBreakoutsBtn')
 };
 
 // Preview state
@@ -256,10 +283,12 @@ const previewState = {
 let reconnectTimeoutId = null;
 let isLeavingSessionIntentional = false;
 let hasHandledConnectionLoss = false;
+let isSwitchingRooms = false;
 const ENABLE_LAYOUT_TESTER = CONFIG.DEBUG || window.location.hostname === 'localhost';
 const MOCK_PARTICIPANT_PREFIX = 'mock-participant-';
 const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
 const NICKNAME_STORAGE_KEY = 'voycelink_nickname';
+const ROOM_PARTICIPANT_STORAGE_PREFIX = 'voycelink_room_participant_';
 const Permission = {
     CREATE_SESSION: 'create_session',
     JOIN_SESSION: 'join_session',
@@ -273,7 +302,10 @@ const Permission = {
     SEND_HOST_DIRECT_MESSAGE: 'send_host_direct_message',
     MANAGE_WHITEBOARD: 'manage_whiteboard',
     USE_WHITEBOARD: 'use_whiteboard',
-    UPDATE_ROOM_CONFIGURATION: 'update_room_configuration'
+    UPDATE_ROOM_CONFIGURATION: 'update_room_configuration',
+    MANAGE_BREAKOUT_ROOMS: 'manage_breakout_rooms',
+    JOIN_BREAKOUT_ROOM: 'join_breakout_room',
+    MOVE_PARTICIPANT_BETWEEN_ROOMS: 'move_participant_between_rooms'
 };
 let permissionsSocket = null;
 let permissionsSocketReconnectTimeoutId = null;
@@ -466,6 +498,10 @@ function canManageWhiteboard() {
     return hasPermission(Permission.MANAGE_WHITEBOARD);
 }
 
+function canManageBreakouts() {
+    return hasPermission(Permission.MANAGE_BREAKOUT_ROOMS);
+}
+
 function canUseWhiteboard() {
     return canManageWhiteboard() || hasPermission(Permission.USE_WHITEBOARD);
 }
@@ -483,6 +519,80 @@ function canManageConferenceUi() {
         hasPermission(Permission.UPDATE_ROOM_CONFIGURATION) ||
         canManageWhiteboard()
     );
+}
+
+function getParticipantStorageKey(sessionId) {
+    return `${ROOM_PARTICIPANT_STORAGE_PREFIX}${sessionId}`;
+}
+
+function getStoredRoomParticipantId(sessionId) {
+    if (!sessionId) {
+        return null;
+    }
+
+    try {
+        return localStorage.getItem(getParticipantStorageKey(sessionId)) || null;
+    } catch (error) {
+        return null;
+    }
+}
+
+function storeRoomParticipantId(sessionId, participantId) {
+    if (!sessionId || !participantId) {
+        return;
+    }
+
+    try {
+        localStorage.setItem(getParticipantStorageKey(sessionId), participantId);
+    } catch (error) {
+        logEvent('warn', `Failed to persist room participant id: ${error?.message || error}`);
+    }
+}
+
+function getCurrentRootParticipantId() {
+    return appState.currentRootParticipantId || getStoredRoomParticipantId(appState.sessionId);
+}
+
+function getMediaConnectionIdForParticipant(participantId) {
+    return appState.participantMediaConnections?.[participantId] || null;
+}
+
+function getRootParticipantIdForMediaConnection(mediaConnectionId) {
+    if (!mediaConnectionId) {
+        return null;
+    }
+
+    const mappedParticipantId = Object.entries(appState.participantMediaConnections || {}).find(
+        ([, candidateMediaConnectionId]) => candidateMediaConnectionId === mediaConnectionId
+    )?.[0];
+
+    if (mappedParticipantId) {
+        return mappedParticipantId;
+    }
+
+    if (mediaConnectionId === appState.currentParticipantId) {
+        return getCurrentRootParticipantId();
+    }
+
+    return null;
+}
+
+function getCurrentRoomWhiteboardState() {
+    if (appState.currentRoomTarget?.type === 'breakout' && appState.currentRoomTarget.breakoutRoomId) {
+        return (
+            appState.whiteboardState?.breakouts?.[appState.currentRoomTarget.breakoutRoomId] || {
+                isOpen: false,
+                canvasState: null,
+                updatedAt: null,
+            }
+        );
+    }
+
+    return appState.whiteboardState?.main || {
+        isOpen: false,
+        canvasState: null,
+        updatedAt: null,
+    };
 }
 
 function isInterpreterFeatureEnabled() {
@@ -560,6 +670,7 @@ function applyPermissionBasedUi() {
         setElementVisibility(elements.toggleTranscriptionBtn, isSubtitlesFeatureEnabled(), '');
         setElementVisibility(elements.toggleScreenShareBtn, canShareScreen(), '');
         setElementVisibility(elements.toggleWhiteboardBtn, canManageWhiteboard(), '');
+        setElementVisibility(elements.toggleBreakoutsBtn, canManageBreakouts(), '');
         setElementVisibility(elements.whiteboardActions, canManageWhiteboard(), 'inline-flex');
         setElementVisibility(elements.toggleWhiteboardMenuBtn, appState.authRole === 'host', 'inline-flex');
         setElementVisibility(elements.advancedWhiteboardLink, appState.authRole === 'host', 'flex');
@@ -580,10 +691,18 @@ function applyPermissionBasedUi() {
         if (appState.authRole !== 'host') {
             closeWhiteboardMenu();
         }
+
+        if (!canManageBreakouts()) {
+            closeBreakoutsPanel();
+        }
     }
 
     if (appState.isParticipantsOpen) {
         renderParticipantsList();
+    }
+
+    if (appState.isBreakoutsOpen) {
+        renderBreakoutsPanel();
     }
 }
 
@@ -597,21 +716,209 @@ function getDefaultParticipantPermissionState() {
 }
 
 function updateParticipantPermissionState(connectionId, permissions = {}) {
-    const participant = participantsData.get(connectionId);
-    if (!participant) {
-        return;
-    }
-
-    participant.permissions = {
-        ...(participant.permissions || getDefaultParticipantPermissionState()),
+    appState.participantPermissionState[connectionId] = {
+        ...(appState.participantPermissionState[connectionId] || getDefaultParticipantPermissionState()),
         ...permissions,
     };
 
-    participantsData.set(connectionId, participant);
+    const mediaConnectionId = getMediaConnectionIdForParticipant(connectionId) || connectionId;
+    const participant = participantsData.get(mediaConnectionId);
+    if (participant) {
+        participant.permissions = {
+            ...(participant.permissions || getDefaultParticipantPermissionState()),
+            ...permissions,
+        };
+
+        participantsData.set(mediaConnectionId, participant);
+    }
 
     if (appState.isParticipantsOpen) {
         renderParticipantsList();
     }
+}
+
+function normalizeSnapshotRevision(revision) {
+    return Number.isFinite(revision) ? Number(revision) : null;
+}
+
+function isOutdatedSnapshotPayload(payload = {}) {
+    const incomingRevision = normalizeSnapshotRevision(payload.revision);
+    const currentRevision = normalizeSnapshotRevision(appState.currentSessionSnapshotRevision);
+
+    if (incomingRevision === null) {
+        return currentRevision !== null;
+    }
+
+    return currentRevision !== null && incomingRevision < currentRevision;
+}
+
+function summarizeSnapshotPayload(payload = {}) {
+    const breakoutRooms = Array.isArray(payload.breakoutRooms) ? payload.breakoutRooms : [];
+    const participantPresence = payload.participantPresence || {};
+
+    return {
+        revision: normalizeSnapshotRevision(payload.revision),
+        breakoutCount: breakoutRooms.length,
+        breakoutRooms: breakoutRooms.map((room) => ({
+            id: room.id,
+            status: room.status,
+            participantIds: room.participantIds || [],
+        })),
+        connectedParticipantCount: Object.values(participantPresence).filter((presence) => presence === 'connected').length,
+        participantLocations: payload.participantLocations || {},
+        currentRootParticipantId: payload.currentRootParticipantId || null,
+    };
+}
+
+function applyGlobalSessionSnapshot(payload = {}) {
+    const incomingRevision = normalizeSnapshotRevision(payload.revision);
+    const currentRevision = normalizeSnapshotRevision(appState.currentSessionSnapshotRevision);
+
+    if (incomingRevision === null) {
+        if (currentRevision !== null) {
+            logEvent(
+                'warn',
+                `Ignored revision-less snapshot after revision ${currentRevision}: ${JSON.stringify(summarizeSnapshotPayload(payload))}`
+            );
+            return false;
+        }
+    } else if (currentRevision !== null && incomingRevision < currentRevision) {
+        logEvent(
+            'warn',
+            `Ignored stale snapshot revision ${incomingRevision} < ${currentRevision}: ${JSON.stringify(summarizeSnapshotPayload(payload))}`
+        );
+        return false;
+    }
+
+    if (incomingRevision !== null) {
+        appState.currentSessionSnapshotRevision = incomingRevision;
+    }
+
+    if (Array.isArray(payload.breakoutRooms)) {
+        appState.breakoutRooms = payload.breakoutRooms;
+    }
+    if (payload.participantLocations) {
+        appState.participantLocations = payload.participantLocations;
+    }
+    if (payload.participantProfiles) {
+        appState.participantProfiles = payload.participantProfiles;
+    }
+    if (payload.participantRoles) {
+        appState.participantRoles = payload.participantRoles;
+    }
+    if (payload.participantPresence) {
+        appState.participantPresence = payload.participantPresence;
+    }
+    if (payload.participantPermissions) {
+        appState.participantPermissionState = payload.participantPermissions;
+    }
+    if (payload.participantMediaConnections) {
+        appState.participantMediaConnections = payload.participantMediaConnections;
+    }
+    if (payload.whiteboardState) {
+        appState.whiteboardState = payload.whiteboardState;
+    }
+    if (payload.currentRootParticipantId) {
+        appState.currentRootParticipantId = payload.currentRootParticipantId;
+    }
+
+    const mediaConnectionToParticipantId = new Map(
+        Object.entries(appState.participantMediaConnections || {})
+            .filter(([, mediaConnectionId]) => typeof mediaConnectionId === 'string' && mediaConnectionId)
+            .map(([participantId, mediaConnectionId]) => [mediaConnectionId, participantId])
+    );
+
+    participantsData.forEach((participant, connectionId) => {
+        const rootParticipantId =
+            mediaConnectionToParticipantId.get(connectionId)
+            || (connectionId === appState.currentParticipantId ? appState.currentRootParticipantId : null);
+        const profile = rootParticipantId ? appState.participantProfiles?.[rootParticipantId] : null;
+        if (profile?.nickname) {
+            participant.nickname = profile.nickname;
+        }
+        if (rootParticipantId && appState.participantRoles?.[rootParticipantId]) {
+            participant.role = appState.participantRoles[rootParticipantId];
+        }
+        if (rootParticipantId && appState.participantPermissionState?.[rootParticipantId]) {
+            participant.permissions = {
+                ...(participant.permissions || getDefaultParticipantPermissionState()),
+                ...appState.participantPermissionState[rootParticipantId],
+            };
+        }
+        participantsData.set(connectionId, participant);
+    });
+
+    logEvent(
+        'info',
+        `Applied global snapshot: ${JSON.stringify({
+            ...summarizeSnapshotPayload(payload),
+            currentRoomTarget: appState.currentRoomTarget,
+        })}`
+    );
+
+    return true;
+}
+
+function shouldUseGlobalRosterView() {
+    return appState.authRole === 'host' || appState.authRole === 'co_host';
+}
+
+function getParticipantPresence(participantId) {
+    return appState.participantPresence?.[participantId] || 'connected';
+}
+
+function getParticipantLocationLabel(participantId) {
+    const location = appState.participantLocations?.[participantId];
+    if (!location || location.type !== 'breakout' || !location.breakoutRoomId) {
+        return 'Main room';
+    }
+
+    const breakoutRoom = (appState.breakoutRooms || []).find((room) => room.id === location.breakoutRoomId);
+    return breakoutRoom?.name || 'Breakout room';
+}
+
+function getGlobalParticipantsForPanels() {
+    const participantIds = new Set([
+        ...Object.keys(appState.participantProfiles || {}),
+        ...Object.keys(appState.participantRoles || {}),
+        ...Object.keys(appState.participantLocations || {}),
+        ...Object.keys(appState.participantPresence || {}),
+        ...Object.keys(appState.participantPermissionState || {}),
+        ...Object.keys(appState.participantMediaConnections || {}),
+    ]);
+
+    if (appState.currentRootParticipantId && appState.nickname) {
+        participantIds.add(appState.currentRootParticipantId);
+    }
+
+    return Array.from(participantIds)
+        .map((participantId) => {
+            const mediaConnectionId = getMediaConnectionIdForParticipant(participantId);
+            const localParticipant = mediaConnectionId ? participantsData.get(mediaConnectionId) : null;
+            const profile = appState.participantProfiles?.[participantId];
+            const isLocal = participantId === appState.currentRootParticipantId;
+            return {
+                connectionId: participantId,
+                participantId,
+                mediaConnectionId,
+                nickname: profile?.nickname || localParticipant?.nickname || (isLocal ? appState.nickname : participantId),
+                role: appState.participantRoles?.[participantId] || localParticipant?.role || (isLocal ? (appState.authRole || 'participant') : 'participant'),
+                isLocal,
+                isMuted: localParticipant?.isMuted ?? false,
+                isVideoOff: localParticipant?.isVideoOff ?? false,
+                presence: getParticipantPresence(participantId),
+                location: appState.participantLocations?.[participantId] || {
+                    type: 'main',
+                    breakoutRoomId: null,
+                },
+                locationLabel: getParticipantLocationLabel(participantId),
+                permissions: {
+                    ...getDefaultParticipantPermissionState(),
+                    ...(appState.participantPermissionState?.[participantId] || localParticipant?.permissions || {}),
+                },
+            };
+        })
+        .sort(compareParticipantsByRoleAndName);
 }
 
 async function updateParticipantPermissions(connectionId, permissionsPatch) {
@@ -696,33 +1003,44 @@ async function enforceCurrentPermissions() {
         });
     }
 
+    const wantsAnyLocalMedia =
+        (appState.isAudioEnabled && canPublishAudio()) ||
+        (appState.isVideoEnabled && canPublishVideo());
+
     if (!openviduClient.publisher) {
+        if (wantsAnyLocalMedia) {
+            await publishLocalStreamWithCurrentPermissions().catch((error) => {
+                logEvent('warn', `Could not publish local media after permission refresh: ${error?.message || error}`);
+            });
+        }
+        syncLocalMediaControlUi();
         return;
     }
 
-    if (!canPublishAudio() && appState.isAudioEnabled && localPublisherHasTrack('audio')) {
-        appState.isAudioEnabled = openviduClient.toggleAudio();
-        elements.toggleAudioBtn.classList.add('muted');
-        elements.toggleAudioBtn.innerHTML = '<i data-lucide="mic-off"></i>';
+    const missingAllowedAudioTrack =
+        appState.isAudioEnabled && canPublishAudio() && !isLocalAudioLive();
+    const missingAllowedVideoTrack =
+        appState.isVideoEnabled && canPublishVideo() && !isLocalVideoLive();
+
+    if (missingAllowedAudioTrack || missingAllowedVideoTrack) {
+        await publishLocalStreamWithCurrentPermissions().catch((error) => {
+            logEvent('warn', `Could not republish local media after permission refresh: ${error?.message || error}`);
+        });
     }
 
-    if (!canPublishVideo() && appState.isVideoEnabled && localPublisherHasTrack('video')) {
-        appState.isVideoEnabled = openviduClient.toggleVideo();
-        elements.toggleVideoBtn.classList.add('muted');
-        elements.toggleVideoBtn.innerHTML = '<i data-lucide="video-off"></i>';
-        const localWrapper = document.getElementById('localVideoWrapper');
-        const localAvatar = document.getElementById('localAvatar');
-        if (localWrapper && localAvatar) {
-            localWrapper.classList.add('camera-off');
-            localAvatar.classList.add('visible');
-        }
+    if (!canPublishAudio() && isLocalAudioLive()) {
+        openviduClient.toggleAudio();
+    }
+
+    if (!canPublishVideo() && isLocalVideoLive()) {
+        openviduClient.toggleVideo();
     }
 
     if (!canShareScreen() && appState.isScreenSharing) {
         await stopScreenShare();
     }
 
-    lucide.createIcons();
+    syncLocalMediaControlUi();
 }
 
 /**
@@ -884,8 +1202,9 @@ async function refreshCurrentPermissions(options = {}) {
             window.location.origin
         );
 
-        if (appState.currentParticipantId) {
-            permissionsUrl.searchParams.set('participantId', appState.currentParticipantId);
+        const rootParticipantId = getCurrentRootParticipantId();
+        if (rootParticipantId) {
+            permissionsUrl.searchParams.set('participantId', rootParticipantId);
         }
         if (requestedRoomId) {
             permissionsUrl.searchParams.set('roomId', requestedRoomId);
@@ -901,6 +1220,10 @@ async function refreshCurrentPermissions(options = {}) {
         }
 
         const authorization = await response.json();
+        if (isOutdatedSnapshotPayload(authorization)) {
+            logEvent('warn', `Ignored stale permissions payload: ${JSON.stringify(summarizeSnapshotPayload(authorization))}`);
+            return authorization;
+        }
         if (
             requestedRoomId &&
             authorization.roomId &&
@@ -916,8 +1239,25 @@ async function refreshCurrentPermissions(options = {}) {
         appState.currentPermissions = Array.isArray(authorization.permissions)
             ? authorization.permissions
             : [];
+        appState.currentRoomTarget = authorization.roomTarget || appState.currentRoomTarget;
+        applyGlobalSessionSnapshot(authorization);
+        if (appState.sessionId && appState.currentRootParticipantId) {
+            storeRoomParticipantId(appState.sessionId, appState.currentRootParticipantId);
+        }
         loadBootstrapSession();
         applyPermissionBasedUi();
+        renderBreakoutsPanel();
+        logEvent(
+            'info',
+            `Permissions refreshed: ${JSON.stringify({
+                role: appState.authRole,
+                roomId: appState.authRoomId,
+                roomTarget: appState.currentRoomTarget,
+                currentRootParticipantId: appState.currentRootParticipantId,
+                revision: appState.currentSessionSnapshotRevision,
+                permissions: appState.currentPermissions,
+            })}`
+        );
         await enforceCurrentPermissions();
         return authorization;
     } catch (error) {
@@ -928,14 +1268,433 @@ async function refreshCurrentPermissions(options = {}) {
     }
 }
 
+async function fetchBreakoutSnapshot() {
+    if (!appState.sessionId) {
+        return null;
+    }
+
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_BREAKOUTS(appState.sessionId)}`
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to load breakout rooms');
+    }
+
+    const payload = await response.json();
+    if (isOutdatedSnapshotPayload(payload)) {
+        logEvent('warn', `Ignored stale breakout snapshot response: ${JSON.stringify(summarizeSnapshotPayload(payload))}`);
+        return payload;
+    }
+    applyGlobalSessionSnapshot(payload);
+    logEvent('info', `Fetched breakout snapshot: ${JSON.stringify(summarizeSnapshotPayload(payload))}`);
+    renderBreakoutsPanel();
+    return payload;
+}
+
+async function fetchRoomTargetForCurrentParticipant() {
+    if (!appState.sessionId) {
+        return null;
+    }
+
+    const participantId = getCurrentRootParticipantId();
+    const url = new URL(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_ROOM_TARGET(appState.sessionId)}`,
+        window.location.origin
+    );
+
+    if (participantId) {
+        url.searchParams.set('participantId', participantId);
+    }
+
+    const response = await apiFetch(url.toString(), { suppressAuthExpiredNotice: true });
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to resolve room target');
+    }
+
+    const payload = await response.json();
+    if (isOutdatedSnapshotPayload(payload)) {
+        logEvent('warn', `Ignored stale room target payload: ${JSON.stringify(summarizeSnapshotPayload(payload))}`);
+        return payload;
+    }
+    appState.currentRoomTarget = payload.roomTarget || appState.currentRoomTarget;
+    applyGlobalSessionSnapshot(payload);
+    logEvent(
+        'info',
+        `Fetched room target: ${JSON.stringify({
+            roomTarget: payload.roomTarget || null,
+            participantId,
+            summary: summarizeSnapshotPayload(payload),
+        })}`
+    );
+    renderBreakoutsPanel();
+    return payload;
+}
+
+function closeBreakoutsPanel() {
+    appState.isBreakoutsOpen = false;
+    elements.breakoutsPanel.style.display = 'none';
+    elements.toggleBreakoutsBtn?.classList.remove('active');
+}
+
+async function toggleBreakoutsPanel() {
+    if (!canManageBreakouts()) {
+        return;
+    }
+
+    appState.isBreakoutsOpen = !appState.isBreakoutsOpen;
+
+    if (appState.isBreakoutsOpen) {
+        elements.breakoutsPanel.style.display = 'flex';
+        elements.toggleBreakoutsBtn?.classList.add('active');
+        await fetchBreakoutSnapshot();
+    } else {
+        closeBreakoutsPanel();
+    }
+}
+
+function getParticipantDisplayNameForBreakout(participantId) {
+    const mediaConnectionId = getMediaConnectionIdForParticipant(participantId);
+    return appState.participantProfiles?.[participantId]?.nickname
+        || (mediaConnectionId ? participantsData.get(mediaConnectionId)?.nickname : null)
+        || participantId;
+}
+
+function doesConnectionBelongToCurrentRoom(connectionData) {
+    const connectionRoomType = connectionData.roomType || 'main';
+    const currentRoomType = appState.currentRoomTarget?.type || 'main';
+    const connectionBreakoutRoomId = connectionData.breakoutRoomId || null;
+    const currentBreakoutRoomId = appState.currentRoomTarget?.breakoutRoomId || null;
+
+    return connectionRoomType === currentRoomType && connectionBreakoutRoomId === currentBreakoutRoomId;
+}
+
+function renderBreakoutsPanel() {
+    if (!elements.breakoutsContent) {
+        return;
+    }
+
+    if (!canManageBreakouts() || !appState.sessionId) {
+        elements.breakoutsContent.innerHTML = `
+            <div class="participants-empty">
+                <i data-lucide="layout-panel-top"></i>
+                <p>No breakout controls available</p>
+            </div>
+        `;
+        lucide.createIcons();
+        return;
+    }
+
+    const breakoutRooms = Array.isArray(appState.breakoutRooms) ? appState.breakoutRooms : [];
+    const globalParticipants = getGlobalParticipantsForPanels()
+        .filter((participant) => !participant.isLocal && participant.presence === 'connected')
+        .sort(compareParticipantsByRoleAndName);
+
+    const assignmentItems = globalParticipants.map((participant) => {
+        const location = appState.participantLocations?.[participant.participantId];
+        const currentValue =
+            location?.type === 'breakout' && location.breakoutRoomId
+                ? location.breakoutRoomId
+                : 'main';
+        return `
+            <div class="breakout-room-participant">
+                <span class="breakout-room-participant-name">${escapeHtml(participant.nickname)}</span>
+                <select class="breakout-room-assignment-select" data-participant-id="${participant.participantId}">
+                    <option value="main" ${currentValue === 'main' ? 'selected' : ''}>Main room</option>
+                    ${breakoutRooms.map((room) => `
+                        <option value="${room.id}" ${currentValue === room.id ? 'selected' : ''}>
+                            ${escapeHtml(room.name)}
+                        </option>
+                    `).join('')}
+                </select>
+            </div>
+        `;
+    }).join('');
+
+    const isInBreakoutRoom = appState.currentRoomTarget?.type === 'breakout';
+    const currentRoomLabel = isInBreakoutRoom
+        ? escapeHtml(appState.currentRoomTarget?.displayName || 'Breakout room')
+        : 'Main room';
+
+    elements.breakoutsContent.innerHTML = `
+        <div class="breakout-room-card breakout-room-card-current">
+            <div class="breakout-room-header">
+                <div class="breakout-room-name">Current room</div>
+                <span class="breakout-room-status ${isInBreakoutRoom ? 'is-open' : ''}">
+                    ${isInBreakoutRoom ? 'Breakout' : 'Main'}
+                </span>
+            </div>
+            <div class="breakout-room-meta">You are currently in ${currentRoomLabel}</div>
+            ${isInBreakoutRoom ? `
+                <div class="breakout-room-actions">
+                    <button class="btn btn-small breakout-return-main-btn">
+                        Return to main room
+                    </button>
+                </div>
+            ` : ''}
+        </div>
+        <div class="breakout-room-card breakout-room-card-lobby">
+            <div class="breakout-room-header">
+                <div class="breakout-room-name">Main room</div>
+                <span class="breakout-room-status">Lobby</span>
+            </div>
+            <div class="breakout-room-meta">Move participants between the main room and breakout rooms.</div>
+            <div class="breakout-room-participants">
+                ${assignmentItems || '<div class="breakout-room-meta">No remote participants connected</div>'}
+            </div>
+        </div>
+        ${breakoutRooms.map((room) => {
+            const isOpen = room.status === 'open';
+            const isCurrentRoom = appState.currentRoomTarget?.breakoutRoomId === room.id;
+            const participantItems = (room.participantIds || []).map((participantId) => `
+                <div class="breakout-room-participant">
+                    <span class="breakout-room-participant-name">${escapeHtml(getParticipantDisplayNameForBreakout(participantId))}</span>
+                </div>
+            `).join('');
+
+            return `
+                <div class="breakout-room-card">
+                    <div class="breakout-room-header">
+                        <div class="breakout-room-title-group">
+                            <input class="breakout-room-name breakout-room-name-input" data-breakout-room-id="${room.id}" value="${escapeHtml(room.name)}" />
+                            <div class="breakout-room-meta">${(room.participantIds || []).filter((participantId) => getParticipantPresence(participantId) === 'connected').length} participant(s)</div>
+                        </div>
+                        <span class="breakout-room-status ${isOpen ? 'is-open' : ''}">${escapeHtml(room.status)}</span>
+                    </div>
+                    <div class="breakout-room-actions">
+                        <button class="btn btn-small breakout-open-btn" data-breakout-room-id="${room.id}">
+                            ${isOpen ? 'Re-open' : 'Open'}
+                        </button>
+                        <button class="btn btn-small breakout-close-btn" data-breakout-room-id="${room.id}" ${isOpen ? '' : 'disabled'}>
+                            Close
+                        </button>
+                        <button class="btn btn-small breakout-join-btn" data-breakout-room-id="${room.id}" ${isOpen ? '' : 'disabled'}>
+                            ${isCurrentRoom ? 'Return to main' : 'Join'}
+                        </button>
+                        <button class="btn btn-small breakout-delete-btn" data-breakout-room-id="${room.id}">
+                            Delete
+                        </button>
+                    </div>
+                    <div class="breakout-room-participants">
+                        ${participantItems || '<div class="breakout-room-meta">No assigned participants</div>'}
+                    </div>
+                </div>
+            `;
+        }).join('')}
+    `;
+
+    lucide.createIcons();
+
+    elements.breakoutsContent.querySelectorAll('.breakout-room-assignment-select').forEach((select) => {
+        select.addEventListener('change', async () => {
+            try {
+                const participantId = select.dataset.participantId;
+                const targetBreakoutRoomId = select.value === 'main' ? null : select.value;
+                await moveParticipantToRoom(participantId, targetBreakoutRoomId);
+            } catch (error) {
+                showNotification(error.message || 'Failed to move participant.', 'error');
+            }
+        });
+    });
+
+    elements.breakoutsContent.querySelectorAll('.breakout-open-btn').forEach((button) => {
+        button.addEventListener('click', async () => {
+            try {
+                await openBreakoutRoom(button.dataset.breakoutRoomId);
+            } catch (error) {
+                showNotification(error.message || 'Failed to open breakout room.', 'error');
+            }
+        });
+    });
+
+    elements.breakoutsContent.querySelectorAll('.breakout-close-btn').forEach((button) => {
+        button.addEventListener('click', async () => {
+            try {
+                await closeBreakoutRoom(button.dataset.breakoutRoomId);
+            } catch (error) {
+                showNotification(error.message || 'Failed to close breakout room.', 'error');
+            }
+        });
+    });
+
+    elements.breakoutsContent.querySelectorAll('.breakout-join-btn').forEach((button) => {
+        button.addEventListener('click', async () => {
+            try {
+                const breakoutRoomId = button.dataset.breakoutRoomId;
+                const isCurrentRoom = appState.currentRoomTarget?.breakoutRoomId === breakoutRoomId;
+                await moveCurrentUserToRoom(isCurrentRoom ? null : breakoutRoomId);
+            } catch (error) {
+                showNotification(error.message || 'Failed to switch room.', 'error');
+            }
+        });
+    });
+
+    elements.breakoutsContent.querySelectorAll('.breakout-room-name-input').forEach((input) => {
+        input.addEventListener('change', async () => {
+            try {
+                await renameBreakoutRoom(input.dataset.breakoutRoomId, input.value);
+            } catch (error) {
+                showNotification(error.message || 'Failed to rename breakout room.', 'error');
+            }
+        });
+    });
+
+    elements.breakoutsContent.querySelectorAll('.breakout-delete-btn').forEach((button) => {
+        button.addEventListener('click', async () => {
+            try {
+                if (!confirm('Delete this breakout room?')) {
+                    return;
+                }
+                await deleteBreakoutRoom(button.dataset.breakoutRoomId);
+            } catch (error) {
+                showNotification(error.message || 'Failed to delete breakout room.', 'error');
+            }
+        });
+    });
+
+    elements.breakoutsContent.querySelectorAll('.breakout-return-main-btn').forEach((button) => {
+        button.addEventListener('click', async () => {
+            try {
+                await moveCurrentUserToRoom(null);
+            } catch (error) {
+                showNotification(error.message || 'Failed to return to the main room.', 'error');
+            }
+        });
+    });
+}
+
+async function createBreakoutRoom() {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_BREAKOUTS(appState.sessionId)}`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+        }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to create breakout room');
+    }
+
+    await fetchBreakoutSnapshot();
+}
+
+async function renameBreakoutRoom(breakoutRoomId, name) {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_BREAKOUT(appState.sessionId, breakoutRoomId)}`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name }),
+        }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to rename breakout room');
+    }
+
+    await fetchBreakoutSnapshot();
+}
+
+async function openBreakoutRoom(breakoutRoomId) {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_BREAKOUT_OPEN(appState.sessionId, breakoutRoomId)}`,
+        { method: 'POST' }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to open breakout room');
+    }
+
+    await fetchBreakoutSnapshot();
+}
+
+async function closeBreakoutRoom(breakoutRoomId) {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_BREAKOUT_CLOSE(appState.sessionId, breakoutRoomId)}`,
+        { method: 'POST' }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to close breakout room');
+    }
+
+    await fetchBreakoutSnapshot();
+
+    if (appState.currentRoomTarget?.breakoutRoomId === breakoutRoomId) {
+        await fetchRoomTargetForCurrentParticipant().catch(() => null);
+        if (appState.currentRoomTarget?.type !== 'breakout') {
+            await reconnectToAssignedRoom();
+        }
+    }
+}
+
+async function deleteBreakoutRoom(breakoutRoomId) {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.SESSION_BREAKOUT(appState.sessionId, breakoutRoomId)}`,
+        { method: 'DELETE' }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to delete breakout room');
+    }
+
+    await fetchBreakoutSnapshot();
+}
+
+async function moveParticipantToRoom(participantId, breakoutRoomId) {
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.PARTICIPANT_LOCATION(appState.sessionId, participantId)}`,
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(
+                breakoutRoomId
+                    ? { target: 'breakout', breakoutRoomId }
+                    : { target: 'main' }
+            ),
+        }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to move participant');
+    }
+
+    await fetchBreakoutSnapshot();
+    return response.json().catch(() => ({}));
+}
+
+async function moveCurrentUserToRoom(breakoutRoomId) {
+    const rootParticipantId = getCurrentRootParticipantId();
+    if (!rootParticipantId) {
+        return;
+    }
+
+    const payload = await moveParticipantToRoom(rootParticipantId, breakoutRoomId);
+    if (payload?.roomTarget) {
+        appState.currentRoomTarget = payload.roomTarget;
+    }
+    await reconnectToAssignedRoom();
+}
+
 function getPermissionsWebSocketUrl() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = new URL(`${protocol}//${window.location.host}/ws/permissions`);
     if (appState.authRoomId) {
         url.searchParams.set('roomId', appState.authRoomId);
     }
-    if (appState.currentParticipantId) {
-        url.searchParams.set('participantId', appState.currentParticipantId);
+    const rootParticipantId = getCurrentRootParticipantId();
+    if (rootParticipantId) {
+        url.searchParams.set('participantId', rootParticipantId);
     }
     return url.toString();
 }
@@ -969,7 +1728,91 @@ function connectPermissionsWebSocket() {
                 return;
             }
 
+            if (payload.type === 'breakout_rooms_updated') {
+                if (payload.sessionId !== appState.authRoomId) {
+                    return;
+                }
+
+                const snapshotApplied = applyGlobalSessionSnapshot(payload);
+                if (!snapshotApplied && payload.revision !== undefined) {
+                    return;
+                }
+                logEvent('info', `Received breakout_rooms_updated: ${JSON.stringify(summarizeSnapshotPayload(payload))}`);
+                renderBreakoutsPanel();
+                if (appState.isParticipantsOpen) {
+                    renderParticipantsList();
+                }
+                return;
+            }
+
+            if (payload.type === 'room_transfer_requested') {
+                if (payload.sessionId !== appState.authRoomId || payload.participantId !== appState.currentRootParticipantId) {
+                    return;
+                }
+
+                const snapshotApplied = applyGlobalSessionSnapshot(payload);
+                if (!snapshotApplied && payload.revision !== undefined) {
+                    return;
+                }
+                appState.currentRoomTarget = payload.targetRoom || appState.currentRoomTarget;
+                logEvent(
+                    'info',
+                    `Received room_transfer_requested: ${JSON.stringify({
+                        participantId: payload.participantId,
+                        targetRoom: payload.targetRoom || null,
+                        summary: summarizeSnapshotPayload(payload),
+                    })}`
+                );
+                showNotification(
+                    payload.targetRoom?.type === 'breakout'
+                        ? `You have been moved to ${payload.targetRoom.displayName || 'a breakout room'}.`
+                        : 'You have been returned to the main room.',
+                    'info'
+                );
+                if (!isSwitchingRooms) {
+                    await reconnectToAssignedRoom();
+                }
+                return;
+            }
+
+            if (payload.type === 'whiteboard_state_updated') {
+                if (payload.sessionId !== appState.authRoomId) {
+                    return;
+                }
+
+                const snapshotApplied = applyGlobalSessionSnapshot(payload);
+                if (!snapshotApplied && payload.revision !== undefined) {
+                    return;
+                }
+                logEvent(
+                    'info',
+                    `Received whiteboard_state_updated: ${JSON.stringify({
+                        roomType: payload.roomType,
+                        breakoutRoomId: payload.breakoutRoomId || null,
+                        revision: payload.revision ?? null,
+                    })}`
+                );
+                if (
+                    payload.roomType === (appState.currentRoomTarget?.type || 'main') &&
+                    (payload.breakoutRoomId || null) === (appState.currentRoomTarget?.breakoutRoomId || null)
+                ) {
+                    whiteboardManager.applyRoomState?.(payload.roomState || getCurrentRoomWhiteboardState());
+                }
+                return;
+            }
+
             if (payload.type !== 'participant_access_updated') {
+                if (payload.type === 'participant_left_conference') {
+                    const snapshotApplied = applyGlobalSessionSnapshot(payload);
+                    if (!snapshotApplied && payload.revision !== undefined) {
+                        return;
+                    }
+                    logEvent('info', `Received participant_left_conference: ${JSON.stringify(summarizeSnapshotPayload(payload))}`);
+                    if (appState.isParticipantsOpen) {
+                        renderParticipantsList();
+                    }
+                    renderBreakoutsPanel();
+                }
                 return;
             }
 
@@ -977,9 +1820,21 @@ function connectPermissionsWebSocket() {
                 return;
             }
 
+            const snapshotApplied = applyGlobalSessionSnapshot(payload);
+            if (!snapshotApplied && payload.revision !== undefined) {
+                return;
+            }
+            logEvent(
+                'info',
+                `Received participant_access_updated: ${JSON.stringify({
+                    participantId: payload.participantId || null,
+                    revision: payload.revision ?? null,
+                    summary: summarizeSnapshotPayload(payload),
+                })}`
+            );
             updateParticipantPermissionState(payload.participantId, payload.permissions || {});
 
-            if (!appState.currentParticipantId || payload.participantId !== appState.currentParticipantId) {
+            if (!appState.currentRootParticipantId || payload.participantId !== appState.currentRootParticipantId) {
                 return;
             }
 
@@ -1017,7 +1872,13 @@ function connectPermissionsWebSocket() {
 /**
  * Request a session and connection token from the backend
  */
-async function getToken(sessionId, nickname, preferredLanguage) {
+async function getToken(sessionId, nickname, preferredLanguage, options = {}) {
+    const {
+        previousParticipantId = null,
+        rootParticipantId = null,
+        isAuxiliaryMedia = false,
+        auxiliaryMediaKind = null,
+    } = options;
     let resolvedSessionId = resolveBoundSessionId(sessionId);
     logEvent(
         'info',
@@ -1056,7 +1917,14 @@ async function getToken(sessionId, nickname, preferredLanguage) {
         {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ nickname, preferredLanguage })
+            body: JSON.stringify({
+                nickname,
+                preferredLanguage,
+                previousParticipantId,
+                rootParticipantId,
+                isAuxiliaryMedia,
+                auxiliaryMediaKind,
+            })
         }
     );
     
@@ -1071,7 +1939,10 @@ async function getToken(sessionId, nickname, preferredLanguage) {
     
     return {
         sessionId: resolvedSessionId,
-        token: tokenData.token
+        token: tokenData.token,
+        connectionId: tokenData.connectionId,
+        roomTarget: tokenData.roomTarget || appState.currentRoomTarget,
+        rootParticipantId: tokenData.rootParticipantId || rootParticipantId || previousParticipantId || null,
     };
 }
 
@@ -1507,19 +2378,16 @@ function updateMediaAvailabilityUI() {
 
     elements.previewToggleMic.classList.toggle('muted', audioUnavailable || audioPermissionDenied || audioAccessRestricted || !previewState.isAudioEnabled);
     elements.previewToggleVideo.classList.toggle('muted', videoUnavailable || videoPermissionDenied || videoAccessRestricted || !previewState.isVideoEnabled);
-    elements.toggleAudioBtn.classList.toggle('muted', audioUnavailable || audioPermissionDenied || audioAccessRestricted || !appState.isAudioEnabled);
-    elements.toggleVideoBtn.classList.toggle('muted', videoUnavailable || videoPermissionDenied || videoAccessRestricted || !appState.isVideoEnabled);
 
     if (audioUnavailable || audioPermissionDenied || audioAccessRestricted) {
         elements.previewToggleMic.innerHTML = '<i data-lucide="mic-off"></i>';
-        elements.toggleAudioBtn.innerHTML = '<i data-lucide="mic-off"></i>';
     }
 
     if (videoUnavailable || videoPermissionDenied || videoAccessRestricted) {
         elements.previewToggleVideo.innerHTML = '<i data-lucide="video-off"></i>';
-        elements.toggleVideoBtn.innerHTML = '<i data-lucide="video-off"></i>';
     }
 
+    syncLocalMediaControlUi();
     lucide.createIcons();
 }
 
@@ -1538,13 +2406,68 @@ function localPublisherHasTrack(kind) {
         : mediaStream.getVideoTracks().length > 0;
 }
 
-async function publishLocalStreamWithCurrentPermissions() {
-    const canPublishAudio =
-        previewState.hasAudioInput && previewState.audioPermission === 'granted';
-    const canPublishVideo =
-        previewState.hasVideoInput && previewState.videoPermission === 'granted';
+function syncPublishedLocalMediaState() {
+    if (!openviduClient.publisher || !openviduClient.publisher.stream) {
+        appState.publishedAudioLive = false;
+        appState.publishedVideoLive = false;
+        return;
+    }
 
-    if (!canPublishAudio && !canPublishVideo) {
+    appState.publishedAudioLive =
+        localPublisherHasTrack('audio') && Boolean(openviduClient.publisher.stream.audioActive);
+    appState.publishedVideoLive =
+        localPublisherHasTrack('video') && Boolean(openviduClient.publisher.stream.videoActive);
+}
+
+function isLocalAudioLive() {
+    syncPublishedLocalMediaState();
+    return appState.publishedAudioLive;
+}
+
+function isLocalVideoLive() {
+    syncPublishedLocalMediaState();
+    return appState.publishedVideoLive;
+}
+
+function syncLocalMediaControlUi() {
+    const localWrapper = document.getElementById('localVideoWrapper');
+    const localAvatar = document.getElementById('localAvatar');
+    syncPublishedLocalMediaState();
+    const audioLive = appState.publishedAudioLive;
+    const videoLive = appState.publishedVideoLive;
+
+    elements.toggleAudioBtn.classList.toggle('muted', !audioLive);
+    elements.toggleAudioBtn.innerHTML = audioLive
+        ? '<i data-lucide="mic"></i>'
+        : '<i data-lucide="mic-off"></i>';
+
+    elements.toggleVideoBtn.classList.toggle('muted', !videoLive);
+    elements.toggleVideoBtn.innerHTML = videoLive
+        ? '<i data-lucide="video"></i>'
+        : '<i data-lucide="video-off"></i>';
+
+    if (localWrapper && localAvatar) {
+        localWrapper.classList.toggle('camera-off', !videoLive);
+        localAvatar.classList.toggle('visible', !videoLive);
+    }
+
+    lucide.createIcons();
+}
+
+async function publishLocalStreamWithCurrentPermissions() {
+    const canPublishLocalAudio =
+        previewState.hasAudioInput &&
+        previewState.audioPermission === 'granted' &&
+        canPublishAudio() &&
+        appState.isAudioEnabled;
+    const canPublishLocalVideo =
+        previewState.hasVideoInput &&
+        previewState.videoPermission === 'granted' &&
+        canPublishVideo() &&
+        appState.isVideoEnabled;
+
+    if (!canPublishLocalAudio && !canPublishLocalVideo) {
+        syncLocalMediaControlUi();
         return false;
     }
 
@@ -1558,10 +2481,10 @@ async function publishLocalStreamWithCurrentPermissions() {
     }
 
     const publishOptions = {
-        audioSource: canPublishAudio ? previewState.selectedMicId || undefined : false,
-        videoSource: canPublishVideo ? previewState.selectedCameraId || undefined : false,
-        publishAudio: appState.isAudioEnabled,
-        publishVideo: appState.isVideoEnabled
+        audioSource: canPublishLocalAudio ? previewState.selectedMicId || undefined : false,
+        videoSource: canPublishLocalVideo ? previewState.selectedCameraId || undefined : false,
+        publishAudio: canPublishLocalAudio,
+        publishVideo: canPublishLocalVideo
     };
 
     await openviduClient.publish(elements.localVideo, publishOptions);
@@ -1573,6 +2496,8 @@ async function publishLocalStreamWithCurrentPermissions() {
         }
     }
 
+    syncLocalMediaControlUi();
+    updateParticipantCount();
     return true;
 }
 
@@ -1669,6 +2594,11 @@ function parseOpenViduConnectionData(connection) {
         preferredLanguage: connectionData.preferredLanguage || 'en',
         role: connectionData.role || 'participant',
         isScreenShare: Boolean(connectionData.isScreenShare),
+        roomType: connectionData.roomType || 'main',
+        breakoutRoomId: connectionData.breakoutRoomId || null,
+        rootSessionId: connectionData.rootSessionId || null,
+        rootParticipantId: connectionData.rootParticipantId || null,
+        auxiliaryMediaKind: connectionData.auxiliaryMediaKind || null,
     };
 }
 
@@ -1735,19 +2665,28 @@ async function syncParticipantRolesFromSession() {
 
         const sessionData = await response.json();
         const participantRoles = sessionData.participantRoles || {};
+        const snapshotApplied = applyGlobalSessionSnapshot(sessionData);
+        if (!snapshotApplied && sessionData.revision !== undefined) {
+            return;
+        }
 
-        Object.entries(participantRoles).forEach(([connectionId, role]) => {
-            const participant = participantsData.get(connectionId);
+        Object.entries(participantRoles).forEach(([participantId, role]) => {
+            const mediaConnectionId =
+                getMediaConnectionIdForParticipant(participantId)
+                || (participantId === appState.currentRootParticipantId ? appState.currentParticipantId : null);
+            const participant = mediaConnectionId ? participantsData.get(mediaConnectionId) : null;
             if (participant) {
                 participant.role = role;
-                participantsData.set(connectionId, participant);
+                participantsData.set(mediaConnectionId, participant);
             }
 
             const wrapperId =
-                connectionId === appState.currentParticipantId
+                participantId === appState.currentRootParticipantId
                     ? 'localVideoWrapper'
-                    : `video-${connectionId}`;
-            const wrapper = document.getElementById(wrapperId);
+                    : mediaConnectionId
+                    ? `video-${mediaConnectionId}`
+                    : null;
+            const wrapper = wrapperId ? document.getElementById(wrapperId) : null;
             if (wrapper) {
                 wrapper.dataset.role = role;
             }
@@ -1759,6 +2698,7 @@ async function syncParticipantRolesFromSession() {
         if (appState.isParticipantsOpen) {
             renderParticipantsList();
         }
+        renderBreakoutsPanel();
     } catch (error) {
         logEvent('warn', 'Could not sync participant roles');
     }
@@ -1767,7 +2707,10 @@ async function syncParticipantRolesFromSession() {
 function showConferenceRoom() {
     elements.joinContainer.style.display = 'none';
     elements.conferenceContainer.style.display = 'flex';
-    elements.currentSessionId.textContent = appState.sessionId;
+    elements.currentSessionId.textContent =
+        appState.currentRoomTarget?.type === 'breakout'
+            ? `${appState.sessionId} / ${appState.currentRoomTarget.displayName || 'Breakout'}`
+            : appState.sessionId;
     elements.localNickname.textContent = appState.nickname;
     elements.localLanguage.textContent = appState.preferredLanguage.toUpperCase();
     
@@ -1779,22 +2722,7 @@ function showConferenceRoom() {
     localWrapper.dataset.nickname = appState.nickname || 'You';
     setupAvatar(localWrapper, appState.nickname, localAvatar, localAvatarInitial);
     
-    // Sync button states with preview settings
-    elements.toggleAudioBtn.classList.toggle('muted', !appState.isAudioEnabled);
-    elements.toggleAudioBtn.innerHTML = appState.isAudioEnabled 
-        ? '<i data-lucide="mic"></i>' 
-        : '<i data-lucide="mic-off"></i>';
-    elements.toggleVideoBtn.classList.toggle('muted', !appState.isVideoEnabled);
-    elements.toggleVideoBtn.innerHTML = appState.isVideoEnabled 
-        ? '<i data-lucide="video"></i>' 
-        : '<i data-lucide="video-off"></i>';
-    lucide.createIcons();
-    
-    // Show avatar if video is disabled
-    if (!appState.isVideoEnabled) {
-        localWrapper.classList.add('camera-off');
-        localAvatar.classList.add('visible');
-    }
+    syncLocalMediaControlUi();
 
     reorderGalleryByParticipantRole();
     updateVideoGridLayoutState();
@@ -1814,11 +2742,10 @@ function showJoinForm() {
 }
 
 function updateParticipantCount() {
-    const count = participantsData.size > 0
-        ? participantsData.size
-        : appState.isConnected || appState.sessionId
-        ? 1
-        : 0;
+    const remoteParticipantCount = Array.from(participantsData.values()).filter(
+        (participant) => !participant.isLocal
+    ).length;
+    const count = remoteParticipantCount + (appState.isConnected || appState.sessionId ? 1 : 0);
     elements.participantCount.textContent = count;
     updateVideoGridLayoutState();
 }
@@ -2220,6 +3147,12 @@ function logEvent(type, message) {
     entry.className = type;
     entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
     elements.eventLog.insertBefore(entry, elements.eventLog.firstChild);
+
+    const consoleMethod =
+        type === 'error' ? 'error'
+            : type === 'warn' ? 'warn'
+                : 'log';
+    console[consoleMethod](`[Voycelink] ${message}`);
     
     // Keep only last 50 entries
     while (elements.eventLog.children.length > 50) {
@@ -2873,7 +3806,9 @@ function resetChatUI() {
 }
 
 function getEligibleDirectMessageRecipients() {
-    const participants = Array.from(participantsData.values()).filter((participant) => !participant.isLocal);
+    const participants = shouldUseGlobalRosterView()
+        ? getGlobalParticipantsForPanels().filter((participant) => !participant.isLocal && participant.presence === 'connected')
+        : Array.from(participantsData.values()).filter((participant) => !participant.isLocal);
 
     if (canModerateChatRecipients()) {
         return participants;
@@ -2953,6 +3888,49 @@ function toggleWhiteboardForCurrentRole() {
     whiteboardManager.toggle();
 }
 
+async function persistWhiteboardState(updates = {}) {
+    if (!appState.sessionId) {
+        return null;
+    }
+
+    const location =
+        appState.currentRoomTarget?.type === 'breakout' && appState.currentRoomTarget.breakoutRoomId
+            ? {
+                roomType: 'breakout',
+                breakoutRoomId: appState.currentRoomTarget.breakoutRoomId,
+            }
+            : {
+                roomType: 'main',
+                breakoutRoomId: null,
+            };
+
+    const participantId = getCurrentRootParticipantId();
+    const response = await apiFetch(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.WHITEBOARD_STATE(appState.sessionId)}`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...location,
+                ...(participantId ? { participantId } : {}),
+                ...updates,
+            }),
+        }
+    );
+
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.details || 'Failed to update whiteboard state');
+    }
+
+    const payload = await response.json().catch(() => ({}));
+    if (isOutdatedSnapshotPayload(payload)) {
+        return payload;
+    }
+    applyGlobalSessionSnapshot(payload);
+    return payload;
+}
+
 /**
  * Close participants panel
  */
@@ -2980,6 +3958,7 @@ function addParticipantToPanel(connectionId, nickname, isLocal = false, role = n
     if (appState.isParticipantsOpen) {
         renderParticipantsList();
     }
+    renderBreakoutsPanel();
 }
 
 /**
@@ -2992,22 +3971,53 @@ function removeParticipantFromPanel(connectionId) {
     if (appState.isParticipantsOpen) {
         renderParticipantsList();
     }
+    renderBreakoutsPanel();
 }
 
 /**
  * Update participants count display
  */
 function updateParticipantsCount() {
-    const count = participantsData.size;
-    elements.participantsPanelCount.textContent = count;
-    elements.participantCount.textContent = count;
+    const panelCount = shouldUseGlobalRosterView()
+        ? getGlobalParticipantsForPanels().filter((participant) => participant.presence === 'connected').length
+        : Array.from(participantsData.values()).filter((participant) => !participant.isLocal).length +
+            (appState.isConnected ? 1 : 0);
+    elements.participantsPanelCount.textContent = panelCount;
+    updateParticipantCount();
 }
 
 /**
  * Render the participants list
  */
 function renderParticipantsList() {
-    if (participantsData.size === 0) {
+    const roster = shouldUseGlobalRosterView()
+        ? getGlobalParticipantsForPanels().filter((participant) => participant.presence === 'connected')
+        : Array.from(participantsData.values()).map((participant) => {
+            const rootParticipantId = participant.isLocal
+                ? getCurrentRootParticipantId()
+                : getRootParticipantIdForMediaConnection(participant.connectionId);
+            const location = rootParticipantId
+                ? appState.participantLocations?.[rootParticipantId]
+                : null;
+
+            return {
+                ...participant,
+                presence: rootParticipantId ? getParticipantPresence(rootParticipantId) : 'connected',
+                location: location || {
+                    type: 'main',
+                    breakoutRoomId: null,
+                },
+                locationLabel: rootParticipantId ? getParticipantLocationLabel(rootParticipantId) : 'Main room',
+                permissions: rootParticipantId
+                    ? {
+                        ...getDefaultParticipantPermissionState(),
+                        ...(appState.participantPermissionState?.[rootParticipantId] || participant.permissions || {}),
+                    }
+                    : (participant.permissions || getDefaultParticipantPermissionState()),
+            };
+        });
+
+    if (roster.length === 0) {
         elements.participantsList.innerHTML = `
             <div class="participants-empty">
                 <i data-lucide="user-x"></i>
@@ -3019,12 +4029,20 @@ function renderParticipantsList() {
     }
     
     // Sort: local user first, then alphabetically
-    const sortedParticipants = Array.from(participantsData.values()).sort(compareParticipantsByRoleAndName);
+    const sortedParticipants = roster.sort(compareParticipantsByRoleAndName);
     
     elements.participantsList.innerHTML = sortedParticipants.map(p => {
         const initials = p.nickname.charAt(0).toUpperCase();
         const isYou = p.isLocal;
-        const canMuteParticipant = canManageParticipantMedia() && !isYou;
+        const isParticipantInCurrentRoom = !shouldUseGlobalRosterView() || (
+            p.location?.type === (appState.currentRoomTarget?.type || 'main') &&
+            (p.location?.breakoutRoomId || null) === (appState.currentRoomTarget?.breakoutRoomId || null)
+        );
+        const canMuteParticipant =
+            canManageParticipantMedia() &&
+            !isYou &&
+            p.presence === 'connected' &&
+            isParticipantInCurrentRoom;
         const canRemoveParticipant = canKickParticipants() && !isYou;
         const canModerateParticipant = canMuteParticipant || canRemoveParticipant;
         const canManagePermissionGrants = (canManageParticipantMedia() || canManageWhiteboard()) && !isYou;
@@ -3040,10 +4058,13 @@ function renderParticipantsList() {
                         ${isYou ? '<span class="participant-you-badge">You</span>' : ''}
                     </div>
                     <div class="participant-status ${p.isMuted ? 'muted' : ''}">
-                        ${p.isMuted 
+                        ${p.presence !== 'connected'
+                            ? '<i data-lucide="user-round-x"></i> Outside conference'
+                            : p.isMuted 
                             ? '<i data-lucide="mic-off"></i> Muted' 
                             : '<i data-lucide="mic"></i> Active'}
                     </div>
+                    <div class="participant-status">${escapeHtml(p.locationLabel || 'Main room')}</div>
                     ${canManagePermissionGrants ? `
                         <div class="participant-access">
                             <button class="participant-access-btn ${isAccessMenuOpen ? 'is-open' : ''}" data-connection-id="${p.connectionId}" title="Manage participant access" aria-expanded="${isAccessMenuOpen ? 'true' : 'false'}">
@@ -3073,7 +4094,7 @@ function renderParticipantsList() {
                 ${canModerateParticipant ? `
                     <div class="participant-actions">
                         ${canMuteParticipant ? `<button class="participant-action-btn mute-btn" 
-                                data-connection-id="${p.connectionId}" 
+                                data-connection-id="${p.mediaConnectionId || ''}" 
                                 title="Request mute">
                             <i data-lucide="mic-off"></i>
                         </button>` : ''}
@@ -3127,6 +4148,7 @@ function renderParticipantsList() {
  */
 function requestMuteParticipant(connectionId) {
     if (!openviduClient.session) return;
+    if (!connectionId) return;
     if (!canManageParticipantMedia()) {
         showNotification('You do not have permission to manage participant media.', 'error');
         return;
@@ -3159,7 +4181,9 @@ async function kickParticipant(connectionId) {
         return;
     }
     
-    const participant = participantsData.get(connectionId);
+    const participant =
+        getGlobalParticipantsForPanels().find((candidate) => candidate.connectionId === connectionId)
+        || participantsData.get(connectionId);
     if (!participant) return;
     
     // Confirm before kicking
@@ -3615,6 +4639,10 @@ function setupOpenViduCallbacks() {
         logEvent('info', `Is Screen Share: ${isScreenShare}`);
         
         if (isScreenShare) {
+            if (!doesConnectionBelongToCurrentRoom(connectionData)) {
+                logEvent('info', `Ignoring screen share from ${connectionId} outside current room`);
+                return;
+            }
             // Create screen share video element (for both local sharer and remote viewers)
             logEvent('info', `Creating screen share element...`);
             createRemoteScreenShareElement(subscriber);
@@ -3739,11 +4767,19 @@ function setupOpenViduCallbacks() {
         }
 
         const connectionData = parseOpenViduConnectionData(connection);
+        if (connectionData.rootParticipantId && connectionData.rootParticipantId === getCurrentRootParticipantId()) {
+            updateParticipantCount();
+            return;
+        }
+        if (!doesConnectionBelongToCurrentRoom(connectionData)) {
+            updateParticipantCount();
+            return;
+        }
+
         if (!connectionData.isScreenShare) {
             createRemoteVideoElement(connection);
             addParticipantToPanel(connection.connectionId, connectionData.nickname, false, connectionData.role);
             syncParticipantRolesFromSession();
-            playJoinSound();
         }
 
         updateParticipantCount();
@@ -3754,6 +4790,11 @@ function setupOpenViduCallbacks() {
     openviduClient.onConnectionDestroyed = (event) => {
         const connectionId = event.connection.connectionId;
         const connectionData = parseOpenViduConnectionData(event.connection);
+        if (!doesConnectionBelongToCurrentRoom(connectionData)) {
+            updateParticipantCount();
+            updateAudioTracksDebug();
+            return;
+        }
         removeRemoteVideoElement(connectionId);
         if (!connectionData.isScreenShare) {
             const hadParticipant = participantsData.has(connectionId);
@@ -3804,7 +4845,7 @@ function setupOpenViduCallbacks() {
     };
 
     openviduClient.onSessionDisconnected = (event) => {
-        if (isLeavingSessionIntentional) {
+        if (isLeavingSessionIntentional || isSwitchingRooms) {
             return;
         }
 
@@ -3823,7 +4864,7 @@ function clearReconnectTimeout() {
 }
 
 function handleConnectionLost(reason = 'Connection lost') {
-    if (isLeavingSessionIntentional || hasHandledConnectionLoss) {
+    if (isLeavingSessionIntentional || isSwitchingRooms || hasHandledConnectionLoss) {
         return;
     }
 
@@ -3838,6 +4879,130 @@ function handleConnectionLost(reason = 'Connection lost') {
     showNotification(`${reason}. You have been returned to the waiting room.`, 'error');
     logEvent('error', `${reason}. Returned to waiting room.`);
     leaveSession();
+}
+
+function clearCurrentRoomUiForReconnect() {
+    if (appState.isInterpreterActive) {
+        stopInterpreter();
+    }
+
+    if (appState.isTranscriptionActive) {
+        stopTranscription();
+    }
+
+    if (appState.isScreenSharing) {
+        stopScreenShare();
+    }
+
+    chatManager.destroy();
+    resetChatUI();
+    participantsData.clear();
+    setActiveScreenShare(null);
+    updateParticipantCount();
+    updateParticipantsCount();
+    updateChatRecipientOptions();
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+    stopSpeakingDetection();
+    whiteboardManager.destroy?.();
+
+    const remoteVideos = document.querySelectorAll('.remote-video, .screen-share-video');
+    remoteVideos.forEach((element) => element.remove());
+
+    openviduClient.disconnect();
+    disconnectPermissionsWebSocket();
+}
+
+async function reconnectToAssignedRoom() {
+    if (!appState.sessionId || !appState.nickname || isSwitchingRooms) {
+        return;
+    }
+
+    isSwitchingRooms = true;
+
+    try {
+        const previousParticipantId = appState.currentParticipantId || getStoredRoomParticipantId(appState.sessionId);
+        const rootParticipantId = getCurrentRootParticipantId();
+        logEvent(
+            'info',
+            `Reconnecting to assigned room: ${JSON.stringify({
+                sessionId: appState.sessionId,
+                previousParticipantId,
+                rootParticipantId,
+                currentRoomTarget: appState.currentRoomTarget,
+                currentRevision: appState.currentSessionSnapshotRevision,
+            })}`
+        );
+        clearCurrentRoomUiForReconnect();
+        appState.currentParticipantId = null;
+
+        const { token, connectionId, roomTarget, rootParticipantId: nextRootParticipantId } = await getToken(
+            appState.sessionId,
+            appState.nickname,
+            appState.preferredLanguage,
+            { previousParticipantId: rootParticipantId || previousParticipantId, rootParticipantId: rootParticipantId || previousParticipantId }
+        );
+
+        setupOpenViduCallbacks();
+        openviduClient.init();
+        await openviduClient.connect(token);
+        appState.currentParticipantId = connectionId || openviduClient.session.connection.connectionId;
+        appState.currentRootParticipantId = nextRootParticipantId || rootParticipantId || previousParticipantId || null;
+        appState.currentRoomTarget = roomTarget || appState.currentRoomTarget;
+        storeRoomParticipantId(appState.sessionId, appState.currentRootParticipantId);
+        updateConnectionStatus(true);
+        await fetchRoomTargetForCurrentParticipant().catch(() => null);
+        await refreshCurrentPermissions({ silent: true });
+        await fetchBreakoutSnapshot().catch(() => null);
+
+        showConferenceRoom();
+
+        const canPublishLocalAudio =
+            previewState.hasAudioInput &&
+            previewState.audioPermission === 'granted' &&
+            canPublishAudio();
+        const canPublishLocalVideo =
+            previewState.hasVideoInput &&
+            previewState.videoPermission === 'granted' &&
+            canPublishVideo();
+
+        if (canPublishLocalAudio || canPublishLocalVideo) {
+            await publishLocalStreamWithCurrentPermissions();
+        }
+
+        initializeChat(openviduClient.session);
+        whiteboardManager.initialize(openviduClient.session, {
+            roomTarget: appState.currentRoomTarget,
+            initialState: getCurrentRoomWhiteboardState(),
+            onPersistState: persistWhiteboardState,
+        });
+        initializeReactionSignals(openviduClient.session);
+        initializeInterpreterSignals(openviduClient.session);
+        addParticipantToPanel(appState.currentParticipantId, appState.nickname, true, appState.authRole || 'participant');
+        await syncParticipantRolesFromSession();
+        if (appState.isParticipantsOpen) {
+            renderParticipantsList();
+        }
+        if (appState.isBreakoutsOpen) {
+            renderBreakoutsPanel();
+        }
+        logEvent(
+            'info',
+            `Reconnect completed: ${JSON.stringify({
+                sessionId: appState.sessionId,
+                currentParticipantId: appState.currentParticipantId,
+                currentRootParticipantId: appState.currentRootParticipantId,
+                currentRoomTarget: appState.currentRoomTarget,
+                currentRevision: appState.currentSessionSnapshotRevision,
+                localParticipantCount: participantsData.size,
+            })}`
+        );
+        connectPermissionsWebSocket();
+        openviduClient.session.on('signal:requestMute', handleMuteRequest);
+    } finally {
+        isSwitchingRooms = false;
+    }
 }
 
 // =============================================================================
@@ -3879,7 +5044,13 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         
         // Get token from backend
         logEvent('info', 'Requesting token from backend...');
-        const { token } = await getToken(resolvedSessionId, nickname, preferredLanguage);
+        const previousParticipantId = getStoredRoomParticipantId(resolvedSessionId);
+        const { token, connectionId, roomTarget, rootParticipantId: nextRootParticipantId } = await getToken(
+            resolvedSessionId,
+            nickname,
+            preferredLanguage,
+            { previousParticipantId, rootParticipantId: previousParticipantId }
+        );
         logEvent('info', 'Token received');
         
         // Initialize OpenVidu
@@ -3890,16 +5061,25 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         logEvent('info', 'Connecting to OpenVidu...');
         await openviduClient.connect(token);
         updateConnectionStatus(true);
+
+        const localConnectionId = connectionId || openviduClient.session.connection.connectionId;
+        appState.currentParticipantId = localConnectionId;
+        appState.currentRootParticipantId = nextRootParticipantId || previousParticipantId || null;
+        appState.currentRoomTarget = roomTarget || appState.currentRoomTarget;
+        storeRoomParticipantId(resolvedSessionId, appState.currentRootParticipantId);
+        await fetchRoomTargetForCurrentParticipant().catch(() => null);
+        await refreshCurrentPermissions({ silent: true });
+        await fetchBreakoutSnapshot().catch(() => null);
         
         // Show conference UI
         showConferenceRoom();
         
-        const canPublishAudio =
-            previewState.hasAudioInput && previewState.audioPermission === 'granted';
-        const canPublishVideo =
-            previewState.hasVideoInput && previewState.videoPermission === 'granted';
+        const canPublishLocalAudio =
+            previewState.hasAudioInput && previewState.audioPermission === 'granted' && canPublishAudio();
+        const canPublishLocalVideo =
+            previewState.hasVideoInput && previewState.videoPermission === 'granted' && canPublishVideo();
 
-        if (canPublishAudio || canPublishVideo) {
+        if (canPublishLocalAudio || canPublishLocalVideo) {
             logEvent('info', 'Publishing local stream...');
             await publishLocalStreamWithCurrentPermissions();
         } else {
@@ -3921,7 +5101,11 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         initializeChat(openviduClient.session);
         
         // Initialize whiteboard
-        whiteboardManager.initialize(openviduClient.session);
+        whiteboardManager.initialize(openviduClient.session, {
+            roomTarget: appState.currentRoomTarget,
+            initialState: getCurrentRoomWhiteboardState(),
+            onPersistState: persistWhiteboardState,
+        });
         
         // Initialize reactions
         initializeReactionSignals(openviduClient.session);
@@ -3930,10 +5114,7 @@ async function joinSession(sessionId, nickname, preferredLanguage) {
         initializeInterpreterSignals(openviduClient.session);
         
         // Initialize participants panel with local user
-        const localConnectionId = openviduClient.session.connection.connectionId;
-        appState.currentParticipantId = localConnectionId;
         addParticipantToPanel(localConnectionId, nickname, true, appState.authRole || 'participant');
-        await refreshCurrentPermissions({ silent: true });
         await syncParticipantRolesFromSession();
         connectPermissionsWebSocket();
         
@@ -3982,7 +5163,16 @@ async function startScreenShare() {
         
         // Step 1: Get a new token for screen share connection
         logEvent('info', 'Step 1: Getting new token for screen share...');
-        const tokenData = await getToken(appState.sessionId, `${appState.nickname} (Screen)`, appState.preferredLanguage);
+        const tokenData = await getToken(
+            appState.sessionId,
+            `${appState.nickname} (Screen)`,
+            appState.preferredLanguage,
+            {
+                rootParticipantId: getCurrentRootParticipantId(),
+                isAuxiliaryMedia: true,
+                auxiliaryMediaKind: 'screen-share',
+            }
+        );
         const screenToken = tokenData.token;
         logEvent('info', 'Step 2: Token received for screen share');
         
@@ -3995,7 +5185,12 @@ async function startScreenShare() {
         await screenSession.connect(screenToken, JSON.stringify({ 
             nickname: `${appState.nickname} (Screen)`,
             preferredLanguage: appState.preferredLanguage,
-            isScreenShare: true
+            isScreenShare: true,
+            rootParticipantId: getCurrentRootParticipantId(),
+            rootSessionId: appState.sessionId,
+            roomType: appState.currentRoomTarget?.type || 'main',
+            breakoutRoomId: appState.currentRoomTarget?.breakoutRoomId || null,
+            auxiliaryMediaKind: 'screen-share',
         }));
         
         // Store the screen share connection ID to filter it out from remote streams
@@ -4141,7 +5336,34 @@ async function stopScreenShare() {
 /**
  * Leave the current session
  */
+function notifyParticipantDisconnected(options = {}) {
+    const { useBeacon = false } = options;
+
+    const rootParticipantId = getCurrentRootParticipantId();
+    if (!appState.sessionId || !rootParticipantId) {
+        return;
+    }
+
+    const disconnectUrl = new URL(
+        `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.PARTICIPANT_DISCONNECT(appState.sessionId, rootParticipantId)}`,
+        window.location.origin
+    );
+    disconnectUrl.searchParams.set('participantId', rootParticipantId);
+
+    if (useBeacon && navigator.sendBeacon) {
+        navigator.sendBeacon(disconnectUrl.toString(), new Blob([], { type: 'application/json' }));
+        return;
+    }
+
+    fetch(disconnectUrl.toString(), {
+        method: 'POST',
+        credentials: 'same-origin',
+        keepalive: true,
+    }).catch(() => null);
+}
+
 function leaveSession() {
+    notifyParticipantDisconnected();
     isLeavingSessionIntentional = true;
     clearReconnectTimeout();
     disconnectPermissionsWebSocket();
@@ -4167,6 +5389,7 @@ function leaveSession() {
     
     // Clean up participants panel
     resetParticipantsPanel();
+    closeBreakoutsPanel();
     
     // Stop speaking detection
     stopSpeakingDetection();
@@ -4181,8 +5404,29 @@ function leaveSession() {
     // Reset state
     appState.sessionId = null;
     appState.currentParticipantId = null;
+    appState.currentRootParticipantId = null;
+    appState.currentRoomTarget = {
+        type: 'main',
+        breakoutRoomId: null,
+        openviduSessionId: null,
+        displayName: 'Main room',
+    };
+    appState.breakoutRooms = [];
+    appState.participantLocations = {};
+    appState.participantProfiles = {};
+    appState.participantRoles = {};
+    appState.participantPresence = {};
+    appState.participantPermissionState = {};
+    appState.participantMediaConnections = {};
+    appState.whiteboardState = {
+        main: { isOpen: false, canvasState: null, updatedAt: null },
+        breakouts: {},
+    };
+    appState.currentSessionSnapshotRevision = null;
     appState.isAudioEnabled = true;
     appState.isVideoEnabled = true;
+    appState.publishedAudioLive = false;
+    appState.publishedVideoLive = false;
     appState.isInterpreterActive = false;
     appState.isTranscriptionActive = false;
     appState.sessionFeatures = {
@@ -4257,14 +5501,11 @@ elements.toggleAudioBtn.addEventListener('click', async () => {
         return;
     }
 
-    if (!appState.isAudioEnabled && previewState.audioPermission !== 'granted') {
+    const wantsToEnableAudio = !appState.isAudioEnabled || !isLocalAudioLive();
+
+    if (wantsToEnableAudio && previewState.audioPermission !== 'granted') {
         const granted = await requestDevicePermission('audio');
         if (!granted) return;
-
-        appState.isAudioEnabled = true;
-        if (!openviduClient.publisher || !localPublisherHasTrack('audio')) {
-            await publishLocalStreamWithCurrentPermissions();
-        }
     }
 
     const audioError = getDeviceAccessError('audio');
@@ -4273,14 +5514,20 @@ elements.toggleAudioBtn.addEventListener('click', async () => {
         return;
     }
 
-    if (openviduClient.publisher && localPublisherHasTrack('audio')) {
-        appState.isAudioEnabled = openviduClient.toggleAudio();
+    if (wantsToEnableAudio) {
+        appState.isAudioEnabled = true;
+        if (!openviduClient.publisher || !localPublisherHasTrack('audio')) {
+            await publishLocalStreamWithCurrentPermissions();
+        } else if (!isLocalAudioLive()) {
+            openviduClient.toggleAudio();
+        }
+    } else {
+        appState.isAudioEnabled = false;
+        if (openviduClient.publisher && isLocalAudioLive()) {
+            openviduClient.toggleAudio();
+        }
     }
-    elements.toggleAudioBtn.classList.toggle('muted', !appState.isAudioEnabled);
-    elements.toggleAudioBtn.innerHTML = appState.isAudioEnabled 
-        ? '<i data-lucide="mic"></i>' 
-        : '<i data-lucide="mic-off"></i>';
-    lucide.createIcons();
+    syncLocalMediaControlUi();
 });
 
 // Video toggle
@@ -4290,14 +5537,11 @@ elements.toggleVideoBtn.addEventListener('click', async () => {
         return;
     }
 
-    if (!appState.isVideoEnabled && previewState.videoPermission !== 'granted') {
+    const wantsToEnableVideo = !appState.isVideoEnabled || !isLocalVideoLive();
+
+    if (wantsToEnableVideo && previewState.videoPermission !== 'granted') {
         const granted = await requestDevicePermission('video');
         if (!granted) return;
-
-        appState.isVideoEnabled = true;
-        if (!openviduClient.publisher || !localPublisherHasTrack('video')) {
-            await publishLocalStreamWithCurrentPermissions();
-        }
     }
 
     const videoError = getDeviceAccessError('video');
@@ -4306,26 +5550,21 @@ elements.toggleVideoBtn.addEventListener('click', async () => {
         return;
     }
 
-    if (openviduClient.publisher && localPublisherHasTrack('video')) {
-        appState.isVideoEnabled = openviduClient.toggleVideo();
-    }
-    elements.toggleVideoBtn.classList.toggle('muted', !appState.isVideoEnabled);
-    elements.toggleVideoBtn.innerHTML = appState.isVideoEnabled 
-        ? '<i data-lucide="video"></i>' 
-        : '<i data-lucide="video-off"></i>';
-    lucide.createIcons();
-    
-    // Show/hide local avatar
-    const localWrapper = document.getElementById('localVideoWrapper');
-    const localAvatar = document.getElementById('localAvatar');
-    if (appState.isVideoEnabled) {
-        localWrapper.classList.remove('camera-off');
-        localAvatar.classList.remove('visible');
+    if (wantsToEnableVideo) {
+        appState.isVideoEnabled = true;
+        if (!openviduClient.publisher || !localPublisherHasTrack('video')) {
+            await publishLocalStreamWithCurrentPermissions();
+        } else if (!isLocalVideoLive()) {
+            openviduClient.toggleVideo();
+        }
     } else {
-        localWrapper.classList.add('camera-off');
-        localAvatar.classList.add('visible');
+        appState.isVideoEnabled = false;
+        if (openviduClient.publisher && isLocalVideoLive()) {
+            openviduClient.toggleVideo();
+        }
     }
-    logEvent('info', appState.isVideoEnabled ? 'Video enabled' : 'Video disabled');
+    syncLocalMediaControlUi();
+    logEvent('info', appState.isVideoEnabled ? 'Video desired on' : 'Video desired off');
 });
 
 // Leave session
@@ -4392,6 +5631,17 @@ elements.chatTranslateToggle.addEventListener('change', toggleChatTranslation);
 // Participants panel controls
 elements.toggleParticipantsBtn.addEventListener('click', toggleParticipants);
 elements.closeParticipantsBtn.addEventListener('click', closeParticipants);
+elements.toggleBreakoutsBtn?.addEventListener('click', async () => {
+    await toggleBreakoutsPanel();
+});
+elements.closeBreakoutsBtn?.addEventListener('click', closeBreakoutsPanel);
+elements.createBreakoutBtn?.addEventListener('click', async () => {
+    try {
+        await createBreakoutRoom();
+    } catch (error) {
+        showNotification(error.message || 'Failed to create breakout room.', 'error');
+    }
+});
 
 // Whiteboard controls
 elements.toggleWhiteboardBtn.addEventListener('click', toggleWhiteboardForCurrentRole);
@@ -4444,6 +5694,7 @@ window.addEventListener('beforeunload', () => {
     disconnectPermissionsWebSocket();
     stopPreview();
     if (appState.isConnected) {
+        notifyParticipantDisconnected({ useBeacon: true });
         openviduClient.disconnect();
     }
 });

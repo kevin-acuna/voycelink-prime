@@ -15,6 +15,9 @@ export const Permission = {
   MANAGE_WHITEBOARD: 'manage_whiteboard',
   USE_WHITEBOARD: 'use_whiteboard',
   UPDATE_ROOM_CONFIGURATION: 'update_room_configuration',
+  MANAGE_BREAKOUT_ROOMS: 'manage_breakout_rooms',
+  JOIN_BREAKOUT_ROOM: 'join_breakout_room',
+  MOVE_PARTICIPANT_BETWEEN_ROOMS: 'move_participant_between_rooms',
   ASSIGN_COHOST: 'assign_cohost',
   REMOVE_COHOST: 'remove_cohost',
 } as const;

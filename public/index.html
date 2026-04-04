@@ -240,6 +240,10 @@
                     <i data-lucide="users"></i>
                     <span>Participants</span>
                 </button>
+                <button class="btn btn-breakouts" id="toggleBreakouts" title="Breakout Rooms" style="display: none;">
+                    <i data-lucide="panel-right-dashed"></i>
+                    <span>Breakouts</span>
+                </button>
                 <div class="whiteboard-actions" id="whiteboardActions">
                     <button class="btn btn-whiteboard" id="toggleWhiteboard" title="Toggle Whiteboard">
                         <i data-lucide="pencil-ruler"></i>
@@ -350,6 +354,29 @@
                     <div class="participants-empty">
                         <i data-lucide="user-x"></i>
                         <p>No participants yet</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="breakouts-panel" id="breakoutsPanel" style="display: none;">
+                <div class="participants-header">
+                    <div class="participants-header-left">
+                        <h3><i data-lucide="panel-right-dashed"></i> Breakout Rooms</h3>
+                    </div>
+                    <div class="participants-header-right">
+                        <button class="btn btn-small btn-primary" id="createBreakoutBtn" title="Create breakout room">
+                            <i data-lucide="plus"></i>
+                            <span>Create</span>
+                        </button>
+                        <button class="btn-close-panel" id="closeBreakoutsBtn" title="Close">
+                            <i data-lucide="x"></i>
+                        </button>
+                    </div>
+                </div>
+                <div class="breakouts-content" id="breakoutsContent">
+                    <div class="participants-empty">
+                        <i data-lucide="layout-panel-top"></i>
+                        <p>No breakout rooms yet</p>
                     </div>
                 </div>
             </div>

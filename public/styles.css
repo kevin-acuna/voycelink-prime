@@ -2496,6 +2496,198 @@ body {
     animation: slideInRight 0.3s ease;
 }
 
+.breakouts-panel {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(880px, calc(100vw - 32px));
+    max-height: min(82vh, 820px);
+    background: rgba(39, 52, 69, 0.98);
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 18px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 28px 70px rgba(3, 7, 18, 0.45);
+    z-index: 1600;
+    animation: fadeInScale 0.22s ease;
+    backdrop-filter: blur(18px);
+}
+
+@keyframes fadeInScale {
+    from {
+        opacity: 0;
+        transform: translate(-50%, -48%) scale(0.98);
+    }
+    to {
+        opacity: 1;
+        transform: translate(-50%, -50%) scale(1);
+    }
+}
+
+.breakouts-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 18px 18px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 14px;
+    align-content: start;
+}
+
+.btn-breakouts {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    padding: 0.625rem 1rem;
+    border-radius: 8px;
+    font-size: 0.875rem;
+    font-weight: 500;
+    transition: all 0.2s;
+    border: 1px solid var(--border-color);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.btn-breakouts:hover,
+.btn-breakouts.active {
+    background: rgba(59, 130, 246, 0.14);
+    border-color: rgba(59, 130, 246, 0.42);
+}
+
+.breakout-room-card {
+    background: rgba(21, 30, 44, 0.86);
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    border-radius: 16px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.breakout-room-card-current,
+.breakout-room-card-lobby {
+    grid-column: 1 / -1;
+}
+
+.breakout-room-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.breakout-room-title-group {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.breakout-room-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.breakout-room-name-input {
+    flex: 1;
+    min-width: 0;
+    width: 100%;
+    padding: 0.7rem 0.85rem;
+    background: rgba(11, 18, 32, 0.9);
+    color: var(--text-primary);
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 12px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    outline: none;
+}
+
+.breakout-room-name-input:focus {
+    border-color: rgba(59, 130, 246, 0.5);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.14);
+}
+
+.breakout-room-name-input::placeholder {
+    color: var(--text-secondary);
+}
+
+.breakout-room-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    background: rgba(148, 163, 184, 0.14);
+    color: var(--text-secondary);
+}
+
+.breakout-room-status.is-open {
+    background: rgba(27, 143, 90, 0.14);
+    color: #7dd3a6;
+}
+
+.breakout-room-meta {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+}
+
+.breakout-room-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.breakout-room-actions .btn-small {
+    padding: 0.58rem 0.9rem;
+    font-size: 0.78rem;
+    border-radius: 999px;
+}
+
+.breakout-room-participants {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.breakout-room-participant {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    border-radius: 12px;
+}
+
+.breakout-room-participant-name {
+    font-size: 0.9rem;
+    color: var(--text-primary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.breakout-room-assignment-select {
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    background: rgba(11, 18, 32, 0.92);
+    color: var(--text-primary);
+    border-radius: 10px;
+    padding: 8px 10px;
+    font-size: 0.82rem;
+    min-width: 160px;
+}
+
 .participants-header {
     display: flex;
     align-items: center;
@@ -2823,6 +3015,15 @@ body {
         top: 60px;
         width: auto;
         bottom: 80px;
+    }
+
+    .breakouts-panel {
+        width: min(100vw - 16px, 720px);
+        max-height: min(88vh, 900px);
+    }
+
+    .breakouts-content {
+        grid-template-columns: 1fr;
     }
     
     .participant-actions {

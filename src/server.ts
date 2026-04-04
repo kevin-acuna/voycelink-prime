@@ -20,7 +20,11 @@ import { config, validateServerConfig } from './config';
 import { verifyCosmosConnection } from './infrastructure/cosmos-client';
 import { CosmosSessionRepository } from './infrastructure/repositories/CosmosSessionRepository';
 import { logger } from './logger';
-import { ParticipantId, Session as DomainSession } from './session/Session';
+import {
+    BreakoutRoomStatus,
+    ParticipantId,
+    Session as DomainSession,
+} from './session/Session';
 
 const app = express();
 const projectRoot = process.cwd();
@@ -52,7 +56,7 @@ const sessionRepository = new CosmosSessionRepository();
 // =============================================================================
 app.use(cors({
     origin: '*', // In production, restrict this to your frontend domain
-    methods: ['GET', 'POST', 'PATCH'],
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
 }));
@@ -95,6 +99,7 @@ const ROOM_ID_PATTERN = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
 const OPENVIDU_RETRY_ATTEMPTS = 3;
 const OPENVIDU_RETRY_DELAY_MS = 250;
 const permissionSubscriptions = new Map();
+const BREAKOUT_ROOM_ID_PATTERN = /^[a-z0-9-]{4,64}$/;
 
 function generateRoomId() {
     const chars = 'abcdefghijklmnopqrstuvwxyz';
@@ -102,6 +107,26 @@ function generateRoomId() {
         Array.from({ length }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 
     return `${createSegment(3)}-${createSegment(4)}-${createSegment(3)}`;
+}
+
+function generateBreakoutRoomId() {
+    return `breakout-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function isValidBreakoutRoomId(value) {
+    return typeof value === 'string' && BREAKOUT_ROOM_ID_PATTERN.test(value);
+}
+
+function getParticipantIdFromBody(req) {
+    if (typeof req.body?.participantId === 'string' && req.body.participantId.trim()) {
+        return req.body.participantId.trim();
+    }
+
+    if (typeof req.body?.previousParticipantId === 'string' && req.body.previousParticipantId.trim()) {
+        return req.body.previousParticipantId.trim();
+    }
+
+    return null;
 }
 
 function parseCookies(req) {
@@ -698,6 +723,11 @@ function requirePermission(permission) {
 }
 
 function getParticipantIdFromRequest(req) {
+    const bodyParticipantId = getParticipantIdFromBody(req);
+    if (bodyParticipantId) {
+        return bodyParticipantId;
+    }
+
     if (typeof req.query.participantId === 'string' && req.query.participantId.trim()) {
         return req.query.participantId.trim();
     }
@@ -711,7 +741,7 @@ function getParticipantIdFromRequest(req) {
 }
 
 async function getAuthorizationContextForRequest(req) {
-    const participantId = getParticipantIdFromRequest(req);
+    const requestedParticipantId = getParticipantIdFromRequest(req);
     let grants = {};
     let sessionFlags = {
         chatEnabled: true,
@@ -721,12 +751,11 @@ async function getAuthorizationContextForRequest(req) {
     };
 
     if (req.auth?.roomId) {
-        const storedSession = await sessionRepository.findById(req.auth.roomId);
-        if (storedSession) {
-            sessionFlags = storedSession.getFeatureFlags();
-            if (participantId) {
-                grants = storedSession.getParticipantPermissions(new ParticipantId(participantId));
-            }
+        const storedSession = await loadStoredSessionOrFail(req.auth.roomId);
+        sessionFlags = storedSession.getFeatureFlags();
+        const participantId = resolveRootParticipantId(storedSession, requestedParticipantId);
+        if (participantId) {
+            grants = storedSession.getParticipantPermissions(new ParticipantId(participantId));
         }
     }
 
@@ -863,6 +892,205 @@ async function getCachedOrRemoteOpenViduSession(sessionId) {
 
     activeSessions.set(sessionId, remoteSession);
     return remoteSession;
+}
+
+function getBreakoutOpenViduSessionId(rootSessionId, breakoutRoomId) {
+    return `${rootSessionId}__breakout__${breakoutRoomId}`;
+}
+
+function generateRootParticipantId() {
+    return `prt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function ensureOpenViduSessionExists(sessionId) {
+    const existingSession = await getCachedOrRemoteOpenViduSession(sessionId);
+    if (existingSession) {
+        return existingSession;
+    }
+
+    const createdSession = await withOpenViduRetry(
+        'openvidu.createSession',
+        () => openvidu.createSession({ customSessionId: sessionId })
+    );
+    activeSessions.set(createdSession.sessionId, createdSession);
+    return createdSession;
+}
+
+function createHttpError(status, message, details) {
+    const error = new Error(message);
+    error.status = status;
+    if (details !== undefined) {
+        error.details = details;
+    }
+    return error;
+}
+
+async function loadStoredSessionOrFail(sessionId) {
+    const storedSession = await sessionRepository.findById(sessionId);
+    if (storedSession) {
+        return storedSession;
+    }
+
+    const runtimeSession = await getCachedOrRemoteOpenViduSession(sessionId);
+    if (runtimeSession) {
+        logger.error(
+            { sessionId, openviduSessionId: runtimeSession.sessionId },
+            'Root session aggregate missing while OpenVidu session is still active'
+        );
+        throw createHttpError(
+            500,
+            `Root session aggregate for ${sessionId} is missing while the OpenVidu session is still active`
+        );
+    }
+
+    throw createHttpError(404, `Session ${sessionId} is not registered in the repository`);
+}
+
+async function getConsistentStoredSession(sessionId) {
+    return loadStoredSessionOrFail(sessionId);
+}
+
+function resolveRootParticipantId(storedSession, participantIdOrConnectionId = null) {
+    if (!storedSession || !participantIdOrConnectionId) {
+        return null;
+    }
+
+    if (storedSession.hasParticipant(new ParticipantId(participantIdOrConnectionId))) {
+        return participantIdOrConnectionId;
+    }
+
+    return storedSession.findParticipantIdByMediaConnection(participantIdOrConnectionId) || null;
+}
+
+function getRoomTargetForParticipant(storedSession, participantId = null) {
+    if (!participantId) {
+        return {
+            type: 'main',
+            breakoutRoomId: null,
+            openviduSessionId: storedSession.getSessionId(),
+            displayName: 'Main room',
+        };
+    }
+
+    const location = storedSession.getParticipantLocation(new ParticipantId(participantId));
+    if (location.type !== 'breakout' || !location.breakoutRoomId) {
+        return {
+            type: 'main',
+            breakoutRoomId: null,
+            openviduSessionId: storedSession.getSessionId(),
+            displayName: 'Main room',
+        };
+    }
+
+    const breakoutRoom = storedSession.getBreakoutRoom(location.breakoutRoomId);
+    if (!breakoutRoom || breakoutRoom.status !== BreakoutRoomStatus.OPEN || !breakoutRoom.openviduSessionId) {
+        return {
+            type: 'main',
+            breakoutRoomId: null,
+            openviduSessionId: storedSession.getSessionId(),
+            displayName: 'Main room',
+        };
+    }
+
+    return {
+        type: 'breakout',
+        breakoutRoomId: breakoutRoom.id,
+        openviduSessionId: breakoutRoom.openviduSessionId,
+        displayName: breakoutRoom.name,
+        status: breakoutRoom.status,
+    };
+}
+
+function buildBreakoutSnapshot(storedSession) {
+    return {
+        revision: storedSession.getRevision(),
+        breakoutRooms: storedSession.getBreakoutRooms(),
+        participantLocations: storedSession.getParticipantLocations(),
+        participantProfiles: storedSession.getParticipantProfiles(),
+        participantRoles: storedSession.getParticipantRoles(),
+        participantPermissions: storedSession.getAllParticipantPermissions(),
+        participantPresence: storedSession.getParticipantPresenceMap(),
+        participantMediaConnections: storedSession.getParticipantMediaConnections(),
+        whiteboardState: storedSession.getWhiteboardStateSnapshot(),
+    };
+}
+
+function summarizeStoredSessionForLogs(storedSession) {
+    if (!storedSession) {
+        return null;
+    }
+
+    const participantPresence = storedSession.getParticipantPresenceMap();
+    const participantLocations = storedSession.getParticipantLocations();
+    const breakoutRooms = storedSession.getBreakoutRooms();
+
+    return {
+        revision: storedSession.getRevision(),
+        connectedParticipantCount: Object.values(participantPresence).filter((presence) => presence === 'connected').length,
+        participantLocations,
+        breakoutRooms: breakoutRooms.map((room) => ({
+            id: room.id,
+            name: room.name,
+            status: room.status,
+            openviduSessionId: room.openviduSessionId,
+            participantIds: room.participantIds,
+        })),
+    };
+}
+
+function resolveWhiteboardLocation(payload = {}) {
+    if (payload?.roomType === 'breakout') {
+        if (!payload.breakoutRoomId || !isValidBreakoutRoomId(payload.breakoutRoomId)) {
+            throw new Error('A valid breakoutRoomId is required for breakout whiteboard state');
+        }
+
+        return {
+            type: 'breakout',
+            breakoutRoomId: payload.breakoutRoomId,
+        };
+    }
+
+    return {
+        type: 'main',
+        breakoutRoomId: null,
+    };
+}
+
+function buildWhiteboardStatePayload(storedSession, location) {
+    const roomState = storedSession.getWhiteboardRoomState(location);
+    return {
+        roomType: location.type,
+        breakoutRoomId: location.breakoutRoomId ?? null,
+        roomState,
+        whiteboardState: storedSession.getWhiteboardStateSnapshot(),
+    };
+}
+
+function broadcastWhiteboardState(rootSessionId, storedSession, location) {
+    broadcastPermissionUpdate(rootSessionId, {
+        type: 'whiteboard_state_updated',
+        sessionId: rootSessionId,
+        ...buildWhiteboardStatePayload(storedSession, location),
+        ...buildBreakoutSnapshot(storedSession),
+    });
+}
+
+function broadcastBreakoutSnapshot(rootSessionId, storedSession) {
+    broadcastPermissionUpdate(rootSessionId, {
+        type: 'breakout_rooms_updated',
+        sessionId: rootSessionId,
+        ...buildBreakoutSnapshot(storedSession),
+    });
+}
+
+function broadcastRoomTransferRequested(rootSessionId, storedSession, participantId, targetRoom) {
+    broadcastPermissionUpdate(rootSessionId, {
+        type: 'room_transfer_requested',
+        sessionId: rootSessionId,
+        participantId,
+        targetRoom,
+        ...buildBreakoutSnapshot(storedSession),
+    });
 }
 
 function canManageRequestedPermissions(role, permissionPatch) {
@@ -1053,10 +1281,36 @@ app.get('/api/azure-speech-token', requirePermission(Permission.JOIN_SESSION), (
 
 app.get('/api/me/permissions', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
     try {
-        const authorizationContext = await getAuthorizationContextForRequest(req);
+        const storedSession = req.auth.roomId
+            ? await loadStoredSessionOrFail(req.auth.roomId)
+            : null;
+        const participantId = resolveRootParticipantId(storedSession, getParticipantIdFromRequest(req));
+        const authorizationContext = await getAuthorizationContextForRequest({
+            ...req,
+            query: participantId ? { ...req.query, participantId } : req.query,
+        });
         const permissions = getEffectivePermissions(authorizationContext);
         const authSession = createAccessSession(req.auth.role, req.auth.roomId ?? null);
         issueBootstrapCookies(res, authSession);
+        const roomTarget = storedSession
+            ? getRoomTargetForParticipant(storedSession, participantId)
+            : {
+                type: 'main',
+                breakoutRoomId: null,
+                openviduSessionId: req.auth.roomId ?? null,
+                displayName: 'Main room',
+            };
+
+        logger.info(
+            {
+                roomId: req.auth.roomId ?? null,
+                participantId,
+                role: req.auth.role,
+                roomTarget,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Resolved /api/me/permissions'
+        );
 
         res.json({
             role: req.auth.role,
@@ -1064,6 +1318,20 @@ app.get('/api/me/permissions', requirePermission(Permission.JOIN_SESSION), async
             permissions,
             session: authorizationContext.session,
             grants: authorizationContext.grants ?? {},
+            currentRootParticipantId: participantId,
+            roomTarget,
+            revision: storedSession?.getRevision?.() ?? 0,
+            breakoutRooms: storedSession?.getBreakoutRooms?.() || [],
+            participantLocations: storedSession?.getParticipantLocations?.() || {},
+            participantProfiles: storedSession?.getParticipantProfiles?.() || {},
+            participantRoles: storedSession?.getParticipantRoles?.() || {},
+            participantPermissions: storedSession?.getAllParticipantPermissions?.() || {},
+            participantPresence: storedSession?.getParticipantPresenceMap?.() || {},
+            participantMediaConnections: storedSession?.getParticipantMediaConnections?.() || {},
+            whiteboardState: storedSession?.getWhiteboardStateSnapshot?.() || {
+                main: { isOpen: false, canvasState: null, updatedAt: null },
+                breakouts: {},
+            },
         });
     } catch (error) {
         logger.error({ err: error }, 'Failed to resolve current permissions');
@@ -1101,6 +1369,447 @@ app.get('/api/sessions/:sessionId/invite-link', requirePermission(Permission.CRE
     }
 });
 
+app.get('/api/sessions/:sessionId/room-target', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+
+        const participantId = resolveRootParticipantId(storedSession, getParticipantIdFromRequest(req));
+        const authorizationContext = await getAuthorizationContextForRequest(req);
+        const roomTarget = getRoomTargetForParticipant(storedSession, participantId);
+
+        logger.info(
+            {
+                sessionId,
+                participantId,
+                role: req.auth.role,
+                roomTarget,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Resolved room target'
+        );
+
+        return res.json({
+            sessionId,
+            participantId,
+            currentRootParticipantId: participantId,
+            roomTarget,
+            role: req.auth.role,
+            permissions: getEffectivePermissions(authorizationContext),
+            ...buildBreakoutSnapshot(storedSession),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to resolve room target');
+        return res.status(500).json({
+            error: 'Failed to resolve room target',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.get('/api/sessions/:sessionId/breakouts', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        logger.info(
+            {
+                sessionId,
+                requesterRole: req.auth.role,
+                requesterParticipantId: getParticipantIdFromRequest(req),
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Serving breakout snapshot'
+        );
+
+        return res.json(buildBreakoutSnapshot(storedSession));
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to list breakout rooms');
+        return res.status(500).json({
+            error: 'Failed to list breakout rooms',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.post('/api/sessions/:sessionId/breakouts', requirePermission(Permission.MANAGE_BREAKOUT_ROOMS), async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const requestedName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+        const breakoutRoomName = requestedName || `Breakout ${Date.now().toString(36).slice(-4).toUpperCase()}`;
+
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+
+        const breakoutRoomId = generateBreakoutRoomId();
+        storedSession.createBreakoutRoom(breakoutRoomId, breakoutRoomName);
+        await sessionRepository.save(storedSession);
+        logger.info(
+            {
+                sessionId,
+                breakoutRoomId,
+                breakoutRoomName,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Created breakout room'
+        );
+        broadcastBreakoutSnapshot(sessionId, storedSession);
+
+        return res.status(201).json({
+            breakoutRoom: storedSession.getBreakoutRoom(breakoutRoomId),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to create breakout room');
+        return res.status(error?.status || 400).json({
+            error: 'Failed to create breakout room',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.patch('/api/sessions/:sessionId/breakouts/:breakoutRoomId', requirePermission(Permission.MANAGE_BREAKOUT_ROOMS), async (req, res) => {
+    try {
+        const { sessionId, breakoutRoomId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+
+        storedSession.updateBreakoutRoom(breakoutRoomId, {
+            name: typeof req.body?.name === 'string' ? req.body.name : undefined,
+        });
+        await sessionRepository.save(storedSession);
+        logger.info(
+            {
+                sessionId,
+                breakoutRoomId,
+                requestedName: req.body?.name,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Updated breakout room'
+        );
+        broadcastBreakoutSnapshot(sessionId, storedSession);
+
+        return res.json({
+            breakoutRoom: storedSession.getBreakoutRoom(breakoutRoomId),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to update breakout room');
+        return res.status(error?.status || 400).json({
+            error: 'Failed to update breakout room',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.post('/api/sessions/:sessionId/breakouts/:breakoutRoomId/open', requirePermission(Permission.MANAGE_BREAKOUT_ROOMS), async (req, res) => {
+    try {
+        const { sessionId, breakoutRoomId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+
+        const breakoutRoom = storedSession.getBreakoutRoom(breakoutRoomId);
+        if (!breakoutRoom) {
+            return res.status(404).json({
+                error: 'Breakout room not found',
+                details: `Breakout room ${breakoutRoomId} does not exist`,
+            });
+        }
+
+        const openviduSessionId =
+            breakoutRoom.openviduSessionId || getBreakoutOpenViduSessionId(sessionId, breakoutRoomId);
+
+        await ensureOpenViduSessionExists(openviduSessionId);
+        storedSession.openBreakoutRoom(breakoutRoomId, openviduSessionId, new Date().toISOString());
+        await sessionRepository.save(storedSession);
+        logger.info(
+            {
+                sessionId,
+                breakoutRoomId,
+                openviduSessionId,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Opened breakout room'
+        );
+        broadcastBreakoutSnapshot(sessionId, storedSession);
+
+        return res.json({
+            breakoutRoom: storedSession.getBreakoutRoom(breakoutRoomId),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to open breakout room');
+        return sendOpenViduError(res, error, 'Failed to open breakout room');
+    }
+});
+
+app.post('/api/sessions/:sessionId/breakouts/:breakoutRoomId/close', requirePermission(Permission.MANAGE_BREAKOUT_ROOMS), async (req, res) => {
+    try {
+        const { sessionId, breakoutRoomId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+
+        const breakoutRoom = storedSession.getBreakoutRoom(breakoutRoomId);
+        if (!breakoutRoom) {
+            return res.status(404).json({
+                error: 'Breakout room not found',
+                details: `Breakout room ${breakoutRoomId} does not exist`,
+            });
+        }
+
+        const movedParticipantIds = [...breakoutRoom.participantIds];
+        storedSession.closeBreakoutRoom(breakoutRoomId, new Date().toISOString());
+        await sessionRepository.save(storedSession);
+        logger.info(
+            {
+                sessionId,
+                breakoutRoomId,
+                movedParticipantIds,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Closed breakout room'
+        );
+        broadcastBreakoutSnapshot(sessionId, storedSession);
+
+        for (const participantId of movedParticipantIds) {
+            broadcastRoomTransferRequested(
+                sessionId,
+                storedSession,
+                participantId,
+                getRoomTargetForParticipant(storedSession, participantId)
+            );
+        }
+
+        return res.json({
+            breakoutRoom: storedSession.getBreakoutRoom(breakoutRoomId),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to close breakout room');
+        return res.status(error?.status || 400).json({
+            error: 'Failed to close breakout room',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.delete('/api/sessions/:sessionId/breakouts/:breakoutRoomId', requirePermission(Permission.MANAGE_BREAKOUT_ROOMS), async (req, res) => {
+    try {
+        const { sessionId, breakoutRoomId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const breakoutRoom = storedSession.getBreakoutRoom(breakoutRoomId);
+        if (!breakoutRoom) {
+            return res.status(404).json({
+                error: 'Breakout room not found',
+                details: `Breakout room ${breakoutRoomId} does not exist`,
+            });
+        }
+
+        const connectedParticipantIds = (breakoutRoom.participantIds || []).filter((participantId) => {
+            return storedSession.getParticipantPresence(new ParticipantId(participantId)) === 'connected';
+        });
+
+        if (connectedParticipantIds.length > 0) {
+            return res.status(409).json({
+                error: 'Breakout room not empty',
+                details: 'Connected participants must return to the main room before deleting this breakout room',
+            });
+        }
+
+        if (breakoutRoom.status === BreakoutRoomStatus.OPEN) {
+            storedSession.closeBreakoutRoom(breakoutRoomId, new Date().toISOString());
+        }
+
+        storedSession.deleteBreakoutRoom(breakoutRoomId);
+        await sessionRepository.save(storedSession);
+        logger.info(
+            {
+                sessionId,
+                breakoutRoomId,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Deleted breakout room'
+        );
+        broadcastBreakoutSnapshot(sessionId, storedSession);
+
+        return res.status(204).send();
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to delete breakout room');
+        return res.status(error?.status || 400).json({
+            error: 'Failed to delete breakout room',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.put('/api/sessions/:sessionId/participants/:participantId/location', requirePermission(Permission.MOVE_PARTICIPANT_BETWEEN_ROOMS), async (req, res) => {
+    try {
+        const { sessionId, participantId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+
+        const resolvedParticipantId = resolveRootParticipantId(storedSession, participantId);
+        if (!resolvedParticipantId) {
+            return res.status(404).json({
+                error: 'Participant not found',
+                details: `Participant ${participantId} is not registered in session ${sessionId}`,
+            });
+        }
+        const participantRef = new ParticipantId(resolvedParticipantId);
+
+        const targetType = req.body?.target === 'breakout' ? 'breakout' : 'main';
+        const breakoutRoomId = req.body?.breakoutRoomId;
+        const participantPresence = storedSession.getParticipantPresence(participantRef);
+
+        if (participantPresence !== 'connected' && targetType === 'breakout') {
+            return res.status(409).json({
+                error: 'Participant disconnected',
+                details: `Participant ${participantId} must rejoin the conference before being moved to a breakout room`,
+            });
+        }
+
+        if (targetType === 'breakout') {
+            if (!isValidBreakoutRoomId(breakoutRoomId)) {
+                return res.status(400).json({
+                    error: 'Invalid breakout room',
+                    details: 'A valid breakoutRoomId is required',
+                });
+            }
+
+            const breakoutRoom = storedSession.getBreakoutRoom(breakoutRoomId);
+            if (!breakoutRoom) {
+                return res.status(404).json({
+                    error: 'Breakout room not found',
+                    details: `Breakout room ${breakoutRoomId} does not exist`,
+                });
+            }
+
+            if (breakoutRoom.status !== BreakoutRoomStatus.OPEN) {
+                return res.status(409).json({
+                    error: 'Breakout room not open',
+                    details: `Breakout room ${breakoutRoomId} must be opened before moving participants`,
+                });
+            }
+
+            storedSession.assignParticipantToBreakout(participantRef, breakoutRoomId);
+        } else {
+            storedSession.returnParticipantToMain(participantRef);
+        }
+
+        await sessionRepository.save(storedSession);
+        logger.info(
+            {
+                sessionId,
+                resolvedParticipantId,
+                targetType,
+                breakoutRoomId: targetType === 'breakout' ? breakoutRoomId : null,
+                resultingRoomTarget: getRoomTargetForParticipant(storedSession, resolvedParticipantId),
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Moved participant between rooms'
+        );
+        broadcastBreakoutSnapshot(sessionId, storedSession);
+        broadcastRoomTransferRequested(
+            sessionId,
+            storedSession,
+            resolvedParticipantId,
+            getRoomTargetForParticipant(storedSession, resolvedParticipantId)
+        );
+
+        return res.json({
+            participantId: resolvedParticipantId,
+            roomTarget: getRoomTargetForParticipant(storedSession, resolvedParticipantId),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to move participant between rooms');
+        return res.status(error?.status || 400).json({
+            error: 'Failed to move participant between rooms',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.post('/api/sessions/:sessionId/participants/:participantId/disconnect', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const { sessionId, participantId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const requestParticipantId = resolveRootParticipantId(
+            await getConsistentStoredSession(sessionId),
+            getParticipantIdFromRequest(req)
+        );
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const resolvedParticipantId = resolveRootParticipantId(storedSession, participantId);
+        const isSelfDisconnect = requestParticipantId && resolvedParticipantId && requestParticipantId === resolvedParticipantId;
+        const canModerateDisconnect =
+            canPerform({ role: req.auth.role }, Permission.KICK_PARTICIPANT).allowed ||
+            canPerform({ role: req.auth.role }, Permission.MOVE_PARTICIPANT_BETWEEN_ROOMS).allowed;
+
+        if (!isSelfDisconnect && !canModerateDisconnect) {
+            return res.status(403).json({
+                error: 'Forbidden',
+                details: 'You cannot disconnect another participant',
+            });
+        }
+
+        if (!resolvedParticipantId) {
+            return res.status(204).send();
+        }
+        const participantRef = new ParticipantId(resolvedParticipantId);
+
+        storedSession.markParticipantDisconnected(participantRef);
+        await sessionRepository.save(storedSession);
+        logger.info(
+            {
+                sessionId,
+                resolvedParticipantId,
+                isSelfDisconnect,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Marked participant disconnected'
+        );
+        broadcastBreakoutSnapshot(sessionId, storedSession);
+        broadcastPermissionUpdate(sessionId, {
+            type: 'participant_left_conference',
+            sessionId,
+            participantId: resolvedParticipantId,
+            ...buildBreakoutSnapshot(storedSession),
+        });
+
+        return res.status(204).send();
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to mark participant disconnected');
+        return res.status(error?.status || 400).json({
+            error: 'Failed to mark participant disconnected',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
 app.patch('/api/sessions/:sessionId/participants/:participantId/permissions', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
     try {
         const { sessionId, participantId } = req.params;
@@ -1125,41 +1834,128 @@ app.patch('/api/sessions/:sessionId/participants/:participantId/permissions', re
             });
         }
 
-        const storedSession = await sessionRepository.findById(sessionId);
-        if (!storedSession) {
-            return res.status(404).json({
-                error: 'Session not found',
-                details: `Session ${sessionId} is not registered in the repository`,
-            });
-        }
+        const storedSession = await getConsistentStoredSession(sessionId);
 
-        if (!storedSession.getParticipantIds().includes(participantId)) {
+        const resolvedParticipantId = resolveRootParticipantId(storedSession, participantId);
+        if (!resolvedParticipantId) {
             return res.status(404).json({
                 error: 'Participant not found',
                 details: `Participant ${participantId} is not registered in session ${sessionId}`,
             });
         }
 
-        const participantRef = new ParticipantId(participantId);
+        const participantRef = new ParticipantId(resolvedParticipantId);
         storedSession.updateParticipantPermissions(participantRef, permissionPatch);
         await sessionRepository.save(storedSession);
 
         const participantPermissions = storedSession.getParticipantPermissions(participantRef);
+        logger.info(
+            {
+                sessionId,
+                resolvedParticipantId,
+                permissionPatch,
+                participantPermissions,
+                snapshot: summarizeStoredSessionForLogs(storedSession),
+            },
+            'Updated participant permissions'
+        );
         broadcastPermissionUpdate(sessionId, {
             type: 'participant_access_updated',
             sessionId,
-            participantId,
+            participantId: resolvedParticipantId,
             permissions: participantPermissions,
+            ...buildBreakoutSnapshot(storedSession),
         });
 
         return res.json({
-            participantId,
+            participantId: resolvedParticipantId,
             permissions: participantPermissions,
         });
     } catch (error) {
         logger.error({ err: error }, 'Failed to update participant permissions');
-        return res.status(400).json({
+        return res.status(error?.status || 400).json({
             error: 'Failed to update participant permissions',
+            details: getErrorMessage(error),
+        });
+    }
+});
+
+app.patch('/api/sessions/:sessionId/whiteboard-state', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const location = resolveWhiteboardLocation(req.body ?? {});
+        const roomTarget =
+            location.type === 'breakout'
+                ? storedSession.getBreakoutRoom(location.breakoutRoomId)
+                : { status: 'open' };
+
+        if (location.type === 'breakout' && !roomTarget) {
+            return res.status(404).json({
+                error: 'Breakout room not found',
+                details: `Breakout room ${location.breakoutRoomId} does not exist`,
+            });
+        }
+
+        const requestedParticipantId = resolveRootParticipantId(storedSession, getParticipantIdFromRequest(req));
+        const authorizationContext = await getAuthorizationContextForRequest({
+            ...req,
+            query: requestedParticipantId ? { ...req.query, participantId: requestedParticipantId } : req.query,
+        });
+
+        if (typeof req.body?.isOpen === 'boolean') {
+            const authorization = canPerform({ role: req.auth.role }, Permission.MANAGE_WHITEBOARD);
+            if (!authorization.allowed) {
+                return res.status(403).json({
+                    error: 'Forbidden',
+                    details: authorization.reason,
+                });
+            }
+        }
+
+        if (req.body?.canvasState !== undefined) {
+            const authorization = canPerform(authorizationContext, Permission.USE_WHITEBOARD);
+            if (!authorization.allowed) {
+                return res.status(403).json({
+                    error: 'Forbidden',
+                    details: authorization.reason,
+                });
+            }
+
+            if (req.body.canvasState !== null && typeof req.body.canvasState !== 'string') {
+                return res.status(400).json({
+                    error: 'Invalid whiteboard state',
+                    details: 'canvasState must be a string or null',
+                });
+            }
+        }
+
+        const updates = {};
+        if (typeof req.body?.isOpen === 'boolean') {
+            updates.isOpen = req.body.isOpen;
+        }
+        if (req.body?.canvasState !== undefined) {
+            updates.canvasState = req.body.canvasState;
+        }
+        updates.updatedAt = new Date().toISOString();
+
+        storedSession.updateWhiteboardRoomState(location, updates);
+        await sessionRepository.save(storedSession);
+        broadcastWhiteboardState(sessionId, storedSession, location);
+
+        return res.json({
+            sessionId,
+            ...buildWhiteboardStatePayload(storedSession, location),
+            revision: storedSession.getRevision(),
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to update whiteboard state');
+        return res.status(error?.status || 400).json({
+            error: 'Failed to update whiteboard state',
             details: getErrorMessage(error),
         });
     }
@@ -1173,58 +1969,52 @@ app.delete('/api/sessions/:sessionId/participants/:participantId', requirePermis
             return;
         }
 
-        const storedSession = await sessionRepository.findById(sessionId);
-        if (!storedSession) {
-            return res.status(404).json({
-                error: 'Session not found',
-                details: `Session ${sessionId} is not registered in the repository`,
-            });
-        }
+        const storedSession = await getConsistentStoredSession(sessionId);
 
-        if (!storedSession.getParticipantIds().includes(participantId)) {
+        const resolvedParticipantId = resolveRootParticipantId(storedSession, participantId);
+        if (!resolvedParticipantId) {
             return res.status(404).json({
                 error: 'Participant not found',
                 details: `Participant ${participantId} is not registered in session ${sessionId}`,
             });
         }
 
-        const session = await getCachedOrRemoteOpenViduSession(sessionId);
-        if (!session) {
-            await sessionRepository.delete(sessionId);
-            return res.status(404).json({
-                error: 'Session not found',
-                details: `Session ${sessionId} does not exist in OpenVidu`,
-            });
+        const participantRef = new ParticipantId(resolvedParticipantId);
+        const participantLocation = storedSession.getParticipantLocation(participantRef);
+        const breakoutRoom =
+            participantLocation.type === 'breakout' && participantLocation.breakoutRoomId
+                ? storedSession.getBreakoutRoom(participantLocation.breakoutRoomId)
+                : null;
+        const targetOpenViduSessionId = breakoutRoom?.openviduSessionId || sessionId;
+        const mediaConnectionId = storedSession.getParticipantMediaConnection(participantRef);
+
+        const session = await getCachedOrRemoteOpenViduSession(targetOpenViduSessionId);
+        if (session) {
+            await withOpenViduRetry(
+                'openvidu.fetchSessionBeforeDisconnect',
+                () => session.fetch()
+            );
+
+            const targetConnection =
+                session.connections.find((connection) => connection.connectionId === mediaConnectionId) ||
+                session.activeConnections.find((connection) => connection.connectionId === mediaConnectionId);
+
+            if (targetConnection) {
+                await withOpenViduRetry(
+                    'openvidu.forceDisconnect',
+                    () => session.forceDisconnect(targetConnection)
+                );
+            }
         }
 
-        await withOpenViduRetry(
-            'openvidu.fetchSessionBeforeDisconnect',
-            () => session.fetch()
-        );
-
-        const targetConnection =
-            session.connections.find((connection) => connection.connectionId === participantId) ||
-            session.activeConnections.find((connection) => connection.connectionId === participantId);
-
-        if (!targetConnection) {
-            return res.status(404).json({
-                error: 'Participant not found',
-                details: `Connection ${participantId} does not exist in OpenVidu session ${sessionId}`,
-            });
-        }
-
-        await withOpenViduRetry(
-            'openvidu.forceDisconnect',
-            () => session.forceDisconnect(targetConnection)
-        );
-
-        storedSession.removeParticipant(new ParticipantId(participantId));
+        storedSession.removeParticipant(participantRef);
         await sessionRepository.save(storedSession);
+        broadcastBreakoutSnapshot(sessionId, storedSession);
 
         logger.info(
             {
                 sessionId,
-                participantId,
+                participantId: resolvedParticipantId,
                 requestedBy: req.auth?.role ?? null,
             },
             'Participant removed from session'
@@ -1348,14 +2138,19 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
         const existingSession = await getCachedOrRemoteOpenViduSession(sessionProperties.customSessionId);
 
         if (existingSession) {
-            let sessionModel = storedSession;
             if (!storedSession) {
-                sessionModel = DomainSession.create(existingSession.sessionId, normalizedRoomConfiguration);
-                await sessionRepository.save(sessionModel);
-            } else {
-                storedSession.updateFeatureFlags(normalizedRoomConfiguration);
-                await sessionRepository.save(storedSession);
+                logger.error(
+                    { sessionId: existingSession.sessionId },
+                    'Refusing to recreate missing root session aggregate for an existing OpenVidu session'
+                );
+                throw createHttpError(
+                    500,
+                    `Root session aggregate for ${existingSession.sessionId} is missing while the OpenVidu session is still active`
+                );
             }
+
+            storedSession.updateFeatureFlags(normalizedRoomConfiguration);
+            await sessionRepository.save(storedSession);
 
             logger.info({ sessionId: existingSession.sessionId }, 'Returning existing session');
             const authSession = createAccessSession(req.auth.role, existingSession.sessionId);
@@ -1366,7 +2161,7 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
             }
             return res.json({
                 sessionId: existingSession.sessionId,
-                roomConfiguration: sessionModel?.getFeatureFlags?.() || normalizedRoomConfiguration,
+                roomConfiguration: storedSession.getFeatureFlags(),
             });
         }
 
@@ -1376,6 +2171,30 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
         );
         
         activeSessions.set(session.sessionId, session);
+
+        if (storedSession) {
+            storedSession.updateFeatureFlags(normalizedRoomConfiguration);
+            await sessionRepository.save(storedSession);
+
+            logger.info(
+                {
+                    sessionId: session.sessionId,
+                    snapshot: summarizeStoredSessionForLogs(storedSession),
+                },
+                'Recreated main OpenVidu session while preserving root aggregate'
+            );
+            const authSession = createAccessSession(req.auth.role, session.sessionId);
+            issueBootstrapCookies(res, authSession);
+            if (req.auth.role === Role.HOST) {
+                ownedRooms.add(session.sessionId);
+                issueOwnedRoomsCookie(res, ownedRooms);
+            }
+            return res.json({
+                sessionId: session.sessionId,
+                roomConfiguration: storedSession.getFeatureFlags(),
+            });
+        }
+
         const domainSession = DomainSession.create(session.sessionId, normalizedRoomConfiguration);
         await sessionRepository.save(domainSession);
         
@@ -1398,8 +2217,20 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
                 req.body.sessionProperties?.customSessionId ||
                 req.auth.roomId;
 
-            const domainSession = DomainSession.create(sessionId, normalizedRoomConfiguration);
-            await sessionRepository.save(domainSession);
+            const existingStoredSession = await sessionRepository.findById(sessionId);
+            if (!existingStoredSession) {
+                logger.error(
+                    { sessionId },
+                    'Refusing to recreate missing root session aggregate after OpenVidu reported an existing session'
+                );
+                return res.status(500).json({
+                    error: 'Root session aggregate missing',
+                    details: `Root session aggregate for ${sessionId} is missing while the OpenVidu session already exists`,
+                });
+            }
+
+            existingStoredSession.updateFeatureFlags(normalizedRoomConfiguration);
+            await sessionRepository.save(existingStoredSession);
             logger.info({ sessionId }, 'Session already exists on server');
             const authSession = createAccessSession(req.auth.role, sessionId);
             issueBootstrapCookies(res, authSession);
@@ -1409,7 +2240,7 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
             }
             return res.json({
                 sessionId,
-                roomConfiguration: domainSession.getFeatureFlags(),
+                roomConfiguration: existingStoredSession.getFeatureFlags(),
             });
         }
         
@@ -1433,73 +2264,307 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
 app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
     try {
         const { sessionId } = req.params;
-        const { nickname, preferredLanguage, connectionProperties = {} } = req.body;
+        const {
+            nickname,
+            preferredLanguage,
+            connectionProperties = {},
+            previousParticipantId,
+            rootParticipantId,
+            isAuxiliaryMedia,
+            auxiliaryMediaKind,
+        } = req.body;
 
         if (!validateRoomBinding(req, res, sessionId)) {
             return;
         }
 
+        const storedSession = await getConsistentStoredSession(sessionId);
+
+        const participantReferenceId =
+            (typeof rootParticipantId === 'string' && rootParticipantId.trim())
+            || (typeof previousParticipantId === 'string' && previousParticipantId.trim())
+            || null;
+        const currentParticipantId = resolveRootParticipantId(storedSession, participantReferenceId);
+        const stableParticipantId =
+            currentParticipantId
+            || (isAuxiliaryMedia ? null : generateRootParticipantId());
+
+        const roomTarget = getRoomTargetForParticipant(storedSession, currentParticipantId);
+        const targetOpenViduSessionId = roomTarget.openviduSessionId || sessionId;
+
         // Build connection data - this will be available to all participants
-        // Crucial for AI dubbing: we store language preference in connection data
         const connectionData = JSON.stringify({
             nickname: nickname || `User_${Date.now()}`,
             preferredLanguage: preferredLanguage || 'en',
             role: req.auth.role,
-            joinedAt: new Date().toISOString()
+            joinedAt: new Date().toISOString(),
+            rootSessionId: sessionId,
+            roomType: roomTarget.type,
+            breakoutRoomId: roomTarget.breakoutRoomId ?? null,
+            rootParticipantId: stableParticipantId,
+            isScreenShare: Boolean(isAuxiliaryMedia && auxiliaryMediaKind === 'screen-share'),
+            auxiliaryMediaKind: isAuxiliaryMedia ? auxiliaryMediaKind || 'auxiliary' : null,
         });
 
-        // Merge with any additional connection properties
         const finalConnectionProperties = {
             data: connectionData,
             ...connectionProperties
         };
 
-        const storedSession = await sessionRepository.findById(sessionId);
-        if (!storedSession) {
-            return res.status(404).json({
-                error: 'Session not found',
-                details: `Session ${sessionId} is not registered in the repository`,
-            });
-        }
-
-        try {
-            const session = await getCachedOrRemoteOpenViduSession(sessionId);
+        const createConnectionInTargetRoom = async () => {
+            const session = await ensureOpenViduSessionExists(targetOpenViduSessionId);
             if (!session) {
-                await sessionRepository.delete(sessionId);
-                return res.status(404).json({
-                    error: 'Session not found',
-                    details: `Session ${sessionId} does not exist`,
-                });
+                return { session: null, connection: null };
             }
 
             const connection = await withOpenViduRetry(
                 'openvidu.createConnection',
                 () => session.createConnection(finalConnectionProperties)
             );
+            return { session, connection };
+        };
 
-            const participantId = new ParticipantId(connection.connectionId);
-            storedSession.addParticipant(participantId);
-            storedSession.setParticipantRole(participantId, req.auth.role);
-            await sessionRepository.save(storedSession);
+        try {
+            const { session, connection } = await createConnectionInTargetRoom();
+            if (!session || !connection) {
+                return res.status(404).json({
+                    error: 'Session not found',
+                    details: `Session ${targetOpenViduSessionId} does not exist`,
+                });
+            }
+
+            const mediaConnectionId = connection.connectionId;
+            const participantProfile = {
+                nickname: nickname || `User_${Date.now()}`,
+                preferredLanguage: preferredLanguage || 'en',
+            };
+
+            if (isAuxiliaryMedia) {
+                logger.info(
+                    {
+                        sessionId,
+                        targetOpenViduSessionId,
+                        connectionId: mediaConnectionId,
+                        rootParticipantId: currentParticipantId,
+                        auxiliaryMediaKind: auxiliaryMediaKind || 'auxiliary',
+                        roomType: roomTarget.type,
+                        breakoutRoomId: roomTarget.breakoutRoomId ?? null,
+                    },
+                    'Generated auxiliary media connection token'
+                );
+            } else if (currentParticipantId) {
+                const previousMediaConnectionId = storedSession.getParticipantMediaConnection(
+                    new ParticipantId(currentParticipantId)
+                );
+                const previousConnection =
+                    session.connections.find((candidate) => candidate.connectionId === previousMediaConnectionId) ||
+                    session.activeConnections.find((candidate) => candidate.connectionId === previousMediaConnectionId);
+
+                if (previousConnection) {
+                    try {
+                        await withOpenViduRetry(
+                            'openvidu.forceDisconnectPreviousParticipant',
+                            () => session.forceDisconnect(previousConnection)
+                        );
+                    } catch (disconnectError) {
+                        logger.warn(
+                            {
+                                err: disconnectError,
+                                sessionId,
+                                targetOpenViduSessionId,
+                                previousParticipantId: currentParticipantId,
+                            },
+                            'Failed to disconnect previous participant connection before replacement'
+                        );
+                    }
+                }
+
+                const participantRef = new ParticipantId(currentParticipantId);
+                storedSession.markParticipantConnected(participantRef);
+                storedSession.setParticipantProfile(participantRef, participantProfile);
+                storedSession.setParticipantRole(participantRef, req.auth.role);
+                storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
+                if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
+                    storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
+                } else {
+                    storedSession.returnParticipantToMain(participantRef);
+                }
+            } else {
+                const participantRef = new ParticipantId(stableParticipantId);
+                storedSession.addParticipant(participantRef);
+                storedSession.setParticipantRole(participantRef, req.auth.role);
+                storedSession.setParticipantProfile(participantRef, participantProfile);
+                storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
+                if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
+                    storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
+                }
+            }
+
+            if (!isAuxiliaryMedia) {
+                await sessionRepository.save(storedSession);
+            }
             
-            logger.info({ sessionId, nickname, connectionId: connection.connectionId }, 'Generated connection token');
+            logger.info(
+                {
+                    sessionId,
+                    targetOpenViduSessionId,
+                    stableParticipantId,
+                    currentParticipantId,
+                    mediaConnectionId,
+                    roomTarget,
+                    isAuxiliaryMedia: Boolean(isAuxiliaryMedia),
+                    snapshot: !isAuxiliaryMedia ? summarizeStoredSessionForLogs(storedSession) : undefined,
+                },
+                'Created room connection'
+            );
+            logger.info(
+                {
+                    sessionId,
+                    targetOpenViduSessionId,
+                    nickname,
+                    previousParticipantId: currentParticipantId,
+                    connectionId: mediaConnectionId,
+                    rootParticipantId: stableParticipantId,
+                    roomType: roomTarget.type,
+                    breakoutRoomId: roomTarget.breakoutRoomId ?? null,
+                },
+                'Generated connection token'
+            );
             const authSession = createAccessSession(req.auth.role, sessionId);
             issueBootstrapCookies(res, authSession);
+            if (!isAuxiliaryMedia) {
+                broadcastBreakoutSnapshot(sessionId, storedSession);
+            }
             
             return res.json({ 
                 token: connection.token,
-                connectionId: connection.connectionId,
+                connectionId: mediaConnectionId,
+                roomTarget: roomTarget,
+                rootParticipantId: stableParticipantId,
             });
         } catch (connectionError) {
             if (connectionError.message && connectionError.message.includes('404')) {
-                logger.warn({ sessionId }, 'Session was closed before connection creation');
-                activeSessions.delete(sessionId);
-                await sessionRepository.delete(sessionId);
+                logger.warn(
+                    { sessionId, targetOpenViduSessionId, roomTarget },
+                    'Target room cache was stale before connection creation'
+                );
+                activeSessions.delete(targetOpenViduSessionId);
 
-                return res.status(404).json({
-                    error: 'Session not found',
-                    details: `Session ${sessionId} is no longer active`,
-                });
+                try {
+                    if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
+                        const refreshedOpenViduSessionId =
+                            getBreakoutOpenViduSessionId(sessionId, roomTarget.breakoutRoomId);
+                        await ensureOpenViduSessionExists(refreshedOpenViduSessionId);
+                        storedSession.openBreakoutRoom(
+                            roomTarget.breakoutRoomId,
+                            refreshedOpenViduSessionId,
+                            new Date().toISOString()
+                        );
+                        await sessionRepository.save(storedSession);
+                    } else {
+                        await ensureOpenViduSessionExists(targetOpenViduSessionId);
+                    }
+
+                    const recreated = await createConnectionInTargetRoom();
+                    if (!recreated.session || !recreated.connection) {
+                        return res.status(404).json({
+                            error: 'Session not found',
+                            details: `Target room ${targetOpenViduSessionId} is no longer active`,
+                        });
+                    }
+
+                    const connection = recreated.connection;
+                    const mediaConnectionId = connection.connectionId;
+                    const participantProfile = {
+                        nickname: nickname || `User_${Date.now()}`,
+                        preferredLanguage: preferredLanguage || 'en',
+                    };
+
+                    if (isAuxiliaryMedia) {
+                        logger.info(
+                            {
+                                sessionId,
+                                targetOpenViduSessionId,
+                                connectionId: mediaConnectionId,
+                                rootParticipantId: currentParticipantId,
+                                auxiliaryMediaKind: auxiliaryMediaKind || 'auxiliary',
+                                roomType: roomTarget.type,
+                                breakoutRoomId: roomTarget.breakoutRoomId ?? null,
+                            },
+                            'Generated auxiliary media connection token after breakout session recovery'
+                        );
+                    } else if (currentParticipantId) {
+                        const participantRef = new ParticipantId(currentParticipantId);
+                        storedSession.markParticipantConnected(participantRef);
+                        storedSession.setParticipantProfile(participantRef, participantProfile);
+                        storedSession.setParticipantRole(participantRef, req.auth.role);
+                        storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
+                        if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
+                            storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
+                        } else {
+                            storedSession.returnParticipantToMain(participantRef);
+                        }
+                    } else {
+                        const participantRef = new ParticipantId(stableParticipantId);
+                        storedSession.addParticipant(participantRef);
+                        storedSession.setParticipantRole(participantRef, req.auth.role);
+                        storedSession.setParticipantProfile(participantRef, participantProfile);
+                        storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
+                        if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
+                            storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
+                        }
+                    }
+
+                    if (!isAuxiliaryMedia) {
+                        await sessionRepository.save(storedSession);
+                        broadcastBreakoutSnapshot(sessionId, storedSession);
+                    }
+
+                    const authSession = createAccessSession(req.auth.role, sessionId);
+                    issueBootstrapCookies(res, authSession);
+                    return res.json({
+                        token: connection.token,
+                        connectionId: mediaConnectionId,
+                        roomTarget,
+                        rootParticipantId: stableParticipantId,
+                    });
+                } catch (recoveryError) {
+                    if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
+                        const breakoutRoom = storedSession.getBreakoutRoom(roomTarget.breakoutRoomId);
+                        if (breakoutRoom && breakoutRoom.status === BreakoutRoomStatus.OPEN) {
+                            const movedParticipantIds = [...(breakoutRoom.participantIds || [])];
+                            storedSession.closeBreakoutRoom(roomTarget.breakoutRoomId, new Date().toISOString());
+                            await sessionRepository.save(storedSession);
+                            logger.warn(
+                                {
+                                    sessionId,
+                                    breakoutRoomId: roomTarget.breakoutRoomId,
+                                    targetOpenViduSessionId,
+                                    movedParticipantIds,
+                                    snapshot: summarizeStoredSessionForLogs(storedSession),
+                                },
+                                'Closed breakout room after unrecoverable target room failure'
+                            );
+                            broadcastBreakoutSnapshot(sessionId, storedSession);
+                            movedParticipantIds.forEach((participantId) => {
+                                broadcastRoomTransferRequested(
+                                    sessionId,
+                                    storedSession,
+                                    participantId,
+                                    getRoomTargetForParticipant(storedSession, participantId)
+                                );
+                            });
+                        }
+                    }
+                    logger.warn(
+                        { err: recoveryError, sessionId, targetOpenViduSessionId, roomTarget },
+                        'Target room recovery failed before connection creation'
+                    );
+                    return res.status(404).json({
+                        error: 'Session not found',
+                        details: `Target room ${targetOpenViduSessionId} is no longer active`,
+                    });
+                }
             }
             throw connectionError;
         }
@@ -1522,17 +2587,29 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
             return;
         }
         
-        const storedSession = await sessionRepository.findById(sessionId);
-        if (!storedSession) {
-            return res.status(404).json({ error: 'Session not found', details: `Session ${sessionId} is not registered in the repository` });
-        }
+        const storedSession = await getConsistentStoredSession(sessionId);
 
         const session = await fetchOpenViduSessionById(sessionId);
         
         if (!session) {
             activeSessions.delete(sessionId);
-            await sessionRepository.delete(sessionId);
-            return res.status(404).json({ error: 'Session not found', details: `Session ${sessionId} is no longer active in OpenVidu` });
+            return res.json({
+                sessionId,
+                createdAt: null,
+                revision: storedSession.getRevision(),
+                roomConfiguration: storedSession.getFeatureFlags(),
+                persistedParticipants: storedSession.getParticipantIds(),
+                participantProfiles: storedSession.getParticipantProfiles(),
+                participantLocations: storedSession.getParticipantLocations(),
+                participantRoles: storedSession.getParticipantRoles(),
+                participantPermissions: storedSession.getAllParticipantPermissions(),
+                participantPresence: storedSession.getParticipantPresenceMap(),
+                participantMediaConnections: storedSession.getParticipantMediaConnections(),
+                breakoutRooms: storedSession.getBreakoutRooms(),
+                whiteboardState: storedSession.getWhiteboardStateSnapshot(),
+                connections: [],
+                openviduActive: false,
+            });
         }
 
         activeSessions.set(sessionId, session);
@@ -1540,9 +2617,18 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
         res.json({
             sessionId: session.sessionId,
             createdAt: session.createdAt,
+            revision: storedSession.getRevision(),
             roomConfiguration: storedSession.getFeatureFlags(),
             persistedParticipants: storedSession.getParticipantIds(),
+            participantProfiles: storedSession.getParticipantProfiles(),
+            participantLocations: storedSession.getParticipantLocations(),
             participantRoles: storedSession.getParticipantRoles(),
+            participantPermissions: storedSession.getAllParticipantPermissions(),
+            participantPresence: storedSession.getParticipantPresenceMap(),
+            participantMediaConnections: storedSession.getParticipantMediaConnections(),
+            breakoutRooms: storedSession.getBreakoutRooms(),
+            whiteboardState: storedSession.getWhiteboardStateSnapshot(),
+            openviduActive: true,
             connections: session.activeConnections.map(conn => ({
                 connectionId: conn.connectionId,
                 data: conn.data,
@@ -1838,6 +2924,22 @@ function setupPermissionsWebSocket() {
             addPermissionSubscription(roomId, ws);
             wsLogger.info({ roomId, role: decoded.role, participantId }, 'Permissions WebSocket connected');
             ws.send(JSON.stringify({ type: 'connected', roomId, participantId }));
+
+            getConsistentStoredSession(roomId, { broadcast: false })
+                .then((storedSession) => {
+                    if (!storedSession || ws.readyState !== WebSocket.OPEN) {
+                        return;
+                    }
+
+                    ws.send(JSON.stringify({
+                        type: 'breakout_rooms_updated',
+                        sessionId: roomId,
+                        ...buildBreakoutSnapshot(storedSession),
+                    }));
+                })
+                .catch((error) => {
+                    wsLogger.warn({ err: error, roomId }, 'Failed to send initial breakout snapshot');
+                });
 
             ws.on('close', () => {
                 removePermissionSubscription(roomId, ws);

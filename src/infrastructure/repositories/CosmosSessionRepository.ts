@@ -26,6 +26,7 @@ export class CosmosSessionRepository implements SessionRepository {
   }
 
   async save(session: Session): Promise<void> {
+    session.touch();
     const document: CosmosSessionDocument = {
       ...session.toPrimitives(),
       entityType: 'session',

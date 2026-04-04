@@ -18,10 +18,21 @@ const CONFIG = {
         MY_PERMISSIONS: '/api/me/permissions',
         HOST_SESSION_BOOTSTRAP: '/api/bootstrap/host-session',
         SESSIONS: '/api/sessions',
+        SESSION: (sessionId) => `/api/sessions/${sessionId}`,
         SESSION_INVITE_LINK: (sessionId) => `/api/sessions/${sessionId}/invite-link`,
+        SESSION_ROOM_TARGET: (sessionId) => `/api/sessions/${sessionId}/room-target`,
+        SESSION_BREAKOUTS: (sessionId) => `/api/sessions/${sessionId}/breakouts`,
+        SESSION_BREAKOUT: (sessionId, breakoutRoomId) => `/api/sessions/${sessionId}/breakouts/${breakoutRoomId}`,
+        SESSION_BREAKOUT_OPEN: (sessionId, breakoutRoomId) => `/api/sessions/${sessionId}/breakouts/${breakoutRoomId}/open`,
+        SESSION_BREAKOUT_CLOSE: (sessionId, breakoutRoomId) => `/api/sessions/${sessionId}/breakouts/${breakoutRoomId}/close`,
+        WHITEBOARD_STATE: (sessionId) => `/api/sessions/${sessionId}/whiteboard-state`,
+        PARTICIPANT_LOCATION: (sessionId, participantId) =>
+            `/api/sessions/${sessionId}/participants/${participantId}/location`,
         CONNECTIONS: (sessionId) => `/api/sessions/${sessionId}/connections`,
         SESSION_PARTICIPANT: (sessionId, participantId) =>
             `/api/sessions/${sessionId}/participants/${participantId}`,
+        PARTICIPANT_DISCONNECT: (sessionId, participantId) =>
+            `/api/sessions/${sessionId}/participants/${participantId}/disconnect`,
         PARTICIPANT_PERMISSIONS: (sessionId, participantId) =>
             `/api/sessions/${sessionId}/participants/${participantId}/permissions`
     },

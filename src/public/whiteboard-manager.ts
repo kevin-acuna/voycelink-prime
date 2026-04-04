@@ -33,20 +33,23 @@ class WhiteboardManager {
         // Callbacks
         this.onOpen = null;
         this.onClose = null;
+        this.onPersistState = null;
+        this.roomTarget = {
+            type: 'main',
+            breakoutRoomId: null,
+        };
     }
 
     /**
      * Initialize the whiteboard with OpenVidu session
      */
-    initialize(session) {
+    initialize(session, options = {}) {
         this.session = session;
+        this.roomTarget = options.roomTarget || this.roomTarget;
+        this.onPersistState = options.onPersistState || null;
         this.setupSignalHandlers();
         console.log('[Whiteboard] Initialized');
-        
-        // Request whiteboard state from other participants (for late joiners)
-        setTimeout(() => {
-            this.requestSync();
-        }, 500);
+        this.applyRoomState(options.initialState || { isOpen: false, canvasState: null });
     }
 
     setAccess({ canManage = false, canDraw = false } = {}) {
@@ -231,6 +234,33 @@ class WhiteboardManager {
         this.canvas.renderAll();
     }
 
+    applyRoomState(roomState = {}) {
+        const nextState = {
+            isOpen: Boolean(roomState.isOpen),
+            canvasState: roomState.canvasState || null,
+        };
+
+        if (nextState.isOpen) {
+            this.openAsViewer({ canvasState: nextState.canvasState });
+        } else {
+            this.closeAsViewer();
+        }
+    }
+
+    persistState(updates = {}) {
+        if (typeof this.onPersistState !== 'function') {
+            return;
+        }
+
+        const payload = {
+            ...updates,
+        };
+
+        this.onPersistState(payload).catch((error) => {
+            console.error('Error persisting whiteboard state:', error);
+        });
+    }
+
     /**
      * Set active tool
      */
@@ -336,6 +366,7 @@ class WhiteboardManager {
             } else {
                 this.addToHistory();
                 this.broadcastObject(text, 'add');
+                this.persistState({ canvasState: JSON.stringify(this.canvas.toJSON()) });
             }
         });
         
@@ -464,6 +495,7 @@ class WhiteboardManager {
         this.currentShape.setCoords();
         this.addToHistory();
         this.broadcastObject(this.currentShape, 'add');
+        this.persistState({ canvasState: JSON.stringify(this.canvas.toJSON()) });
         this.currentShape = null;
     }
 
@@ -559,6 +591,7 @@ class WhiteboardManager {
             this.canvas.renderAll();
             this.addToHistory();
             this.broadcastClear();
+            this.persistState({ canvasState: JSON.stringify(this.canvas.toJSON()) });
         }
     }
 
@@ -614,14 +647,7 @@ class WhiteboardManager {
             
             // Send current state and open status to requester
             if (this.canvas && this.isOpen) {
-                // First tell them whiteboard is open
-                this.session.signal({
-                    data: JSON.stringify({ isOpen: true }),
-                    type: 'whiteboard-state',
-                    to: [event.from]
-                }).catch(err => console.error('Error sending whiteboard state:', err));
-                
-                // Then send the canvas content
+                // Send the canvas content for active room peers
                 setTimeout(() => {
                     this.session.signal({
                         data: JSON.stringify({ state: JSON.stringify(this.canvas.toJSON()) }),
@@ -632,25 +658,12 @@ class WhiteboardManager {
             }
         });
         
-        // Receive whiteboard open/close state from others
-        this.session.on('signal:whiteboard-state', (event) => {
-            if (event.from.connectionId === this.session.connection.connectionId) return;
-            
-            const data = JSON.parse(event.data);
-            if (data.isOpen && !this.isOpen) {
-                // Someone opened whiteboard, open it locally too
-                this.openAsViewer();
-            } else if (!data.isOpen && this.isOpen) {
-                // Someone closed whiteboard, close it locally too
-                this.closeAsViewer();
-            }
-        });
     }
     
     /**
      * Open whiteboard as viewer (triggered by remote signal)
      */
-    openAsViewer() {
+    openAsViewer(options = {}) {
         const wrapper = document.getElementById('whiteboardWrapper');
         const videoGrid = document.getElementById('videoGrid');
         const btn = document.getElementById('toggleWhiteboard');
@@ -664,9 +677,13 @@ class WhiteboardManager {
                 if (!this.canvas) {
                     this.setupCanvas();
                     this.setupToolbar();
-                    this.requestSync();
                 } else {
                     this.resizeCanvas();
+                }
+
+                if (options.canvasState) {
+                    this.loadState(options.canvasState);
+                } else if (!this.canvas || this.canvas.getObjects().length === 0) {
                     this.requestSync();
                 }
 
@@ -712,6 +729,7 @@ class WhiteboardManager {
             }),
             type: 'whiteboard-object'
         }).catch(err => console.error('Error broadcasting whiteboard object:', err));
+        this.persistState({ canvasState: JSON.stringify(this.canvas.toJSON()) });
     }
 
     /**
@@ -739,6 +757,7 @@ class WhiteboardManager {
             }),
             type: 'whiteboard-sync'
         }).catch(err => console.error('Error broadcasting whiteboard state:', err));
+        this.persistState({ canvasState: JSON.stringify(this.canvas.toJSON()) });
     }
 
     /**
@@ -809,9 +828,10 @@ class WhiteboardManager {
             
             if (btn) btn.classList.add('active');
             if (this.onOpen) this.onOpen();
-            
-            // Broadcast that whiteboard is open
-            this.broadcastWhiteboardState(true);
+            this.persistState({
+                isOpen: true,
+                canvasState: this.canvas ? JSON.stringify(this.canvas.toJSON()) : null,
+            });
         }
     }
 
@@ -834,22 +854,8 @@ class WhiteboardManager {
             
             if (btn) btn.classList.remove('active');
             if (this.onClose) this.onClose();
-            
-            // Broadcast that whiteboard is closed
-            this.broadcastWhiteboardState(false);
+            this.persistState({ isOpen: false });
         }
-    }
-    
-    /**
-     * Broadcast whiteboard open/close state
-     */
-    broadcastWhiteboardState(isOpen) {
-        if (!this.session) return;
-        
-        this.session.signal({
-            data: JSON.stringify({ isOpen }),
-            type: 'whiteboard-state'
-        }).catch(err => console.error('Error broadcasting whiteboard state:', err));
     }
 
     /**
