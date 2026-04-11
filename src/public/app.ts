@@ -311,6 +311,7 @@ const elements = {
     participantsList: document.getElementById('participantsList'),
     participantsPanelCount: document.getElementById('participantsPanelCount'),
     closeParticipantsBtn: document.getElementById('closeParticipantsBtn'),
+    waitingRoomBadge: document.getElementById('waitingRoomBadge'),
     toggleBreakoutsBtn: document.getElementById('toggleBreakouts'),
     breakoutsPanel: document.getElementById('breakoutsPanel'),
     breakoutsContent: document.getElementById('breakoutsContent'),
@@ -928,6 +929,24 @@ function summarizeSnapshotPayload(payload = {}) {
     };
 }
 
+function updateWaitingRoomBadge() {
+    if (!canAdmitWaitingRoom()) {
+        elements.waitingRoomBadge.style.display = 'none';
+        return;
+    }
+
+    const pendingCount = (appState.waitingRoomRequests || []).filter(
+        (request) => request?.status === 'pending'
+    ).length;
+
+    if (pendingCount > 0) {
+        elements.waitingRoomBadge.textContent = pendingCount > 99 ? '99+' : pendingCount;
+        elements.waitingRoomBadge.style.display = 'flex';
+    } else {
+        elements.waitingRoomBadge.style.display = 'none';
+    }
+}
+
 function syncWaitingRoomNotificationState(payload = {}, options = {}) {
     const { primeOnly = false } = options;
     const pendingRequests = Array.isArray(payload.waitingRoomRequests)
@@ -938,6 +957,8 @@ function syncWaitingRoomNotificationState(payload = {}, options = {}) {
             .map((request) => request?.id)
             .filter((requestId) => typeof requestId === 'string' && requestId)
     );
+
+    updateWaitingRoomBadge();
 
     if (!waitingRoomNotificationPrimed || primeOnly) {
         knownPendingWaitingRoomRequestIds = pendingIds;
@@ -1238,6 +1259,48 @@ async function handleParticipantAccessAction(connectionId, action) {
     await updateParticipantPermissions(connectionId, patch);
     closeParticipantAccessMenu();
     showNotification('Participant access updated.', 'info');
+}
+
+async function bulkUpdateParticipantPermissions(permissionsPatch) {
+    if (!canManageParticipantMedia()) {
+        showNotification('You do not have permission to manage participant media.', 'error');
+        return;
+    }
+
+    const targets = getGlobalParticipantsForPanels().filter((participant) => {
+        if (participant.isLocal) return false;
+        if (!canManageTargetParticipantRole(participant.role)) return false;
+        if (participant.presence !== 'connected') return false;
+        return true;
+    });
+
+    if (targets.length === 0) {
+        showNotification('No eligible participants to update.', 'info');
+        return;
+    }
+
+    let updatedCount = 0;
+    const errors = [];
+
+    for (const participant of targets) {
+        try {
+            await updateParticipantPermissions(participant.connectionId, permissionsPatch);
+            updatedCount++;
+        } catch (error) {
+            errors.push(participant.nickname);
+        }
+    }
+
+    if (updatedCount > 0) {
+        showNotification(`Updated access for ${updatedCount} participant${updatedCount > 1 ? 's' : ''}.`, 'info');
+    }
+    if (errors.length > 0) {
+        showNotification(`Failed to update: ${errors.join(', ')}`, 'error');
+    }
+
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
 }
 
 async function handleParticipantPermissionToggle(connectionId, permissionKey, enabled) {
@@ -3208,6 +3271,28 @@ function parseOpenViduConnectionData(connection) {
     };
 }
 
+function getRoleTagHtml(role) {
+    if (role === 'host') {
+        return '<span class="role-tag role-tag-host">Host</span>';
+    }
+    if (role === 'co_host') {
+        return '<span class="role-tag role-tag-cohost">Co-host</span>';
+    }
+    return '';
+}
+
+function updateVideoRoleTag(wrapper, role) {
+    if (!wrapper) return;
+    const labelLeft = wrapper.querySelector('.video-label-left');
+    if (!labelLeft) return;
+    const existing = labelLeft.querySelector('.role-tag');
+    if (existing) existing.remove();
+    const tagHtml = getRoleTagHtml(role);
+    if (tagHtml) {
+        labelLeft.insertAdjacentHTML('beforeend', tagHtml);
+    }
+}
+
 function getParticipantRolePriority(role) {
     if (role === 'host') return 0;
     if (role === 'co_host') return 1;
@@ -3295,6 +3380,7 @@ async function syncParticipantRolesFromSession() {
             const wrapper = wrapperId ? document.getElementById(wrapperId) : null;
             if (wrapper) {
                 wrapper.dataset.role = role;
+                updateVideoRoleTag(wrapper, role);
             }
         });
 
@@ -3327,6 +3413,7 @@ function showConferenceRoom() {
     localWrapper.dataset.role = appState.authRole || 'participant';
     localWrapper.dataset.nickname = appState.nickname || 'You';
     setupAvatar(localWrapper, appState.nickname, localAvatar, localAvatarInitial);
+    updateVideoRoleTag(localWrapper, appState.authRole || 'participant');
     
     syncLocalMediaControlUi();
 
@@ -3510,6 +3597,7 @@ function createRemoteVideoElement(subscriberOrConnection) {
         existingWrapper.classList.toggle('camera-off', !stream || !stream.videoActive);
         existingWrapper.dataset.role = connectionData.role || 'participant';
         existingWrapper.dataset.nickname = nickname;
+        updateVideoRoleTag(existingWrapper, connectionData.role || 'participant');
 
         if (subscriber) {
             const video = document.getElementById(`video-element-${connectionId}`);
@@ -3553,6 +3641,7 @@ function createRemoteVideoElement(subscriberOrConnection) {
         <div class="video-label-left">
             <span class="speaking-indicator" id="speaking-${connectionId}"></span>
             <span>${nickname}</span>
+            ${getRoleTagHtml(connectionData.role)}
         </div>
         <span class="language-badge">${connectionData.preferredLanguage.toUpperCase()}</span>
     `;
@@ -4831,7 +4920,22 @@ function renderParticipantsList() {
         `;
     }).join('');
 
+    const showBulkActions = canManageParticipantMedia() && sortedParticipants.filter(p => !p.isLocal && canManageTargetParticipantRole(p.role) && p.presence === 'connected').length > 1;
+    const bulkActionsMarkup = showBulkActions ? `
+        <div class="participants-bulk-actions">
+            <button class="bulk-action-btn bulk-enable-all" title="Enable mic & camera for all participants">
+                <i data-lucide="mic"></i>
+                <span>Enable all</span>
+            </button>
+            <button class="bulk-action-btn bulk-disable-all" title="Disable mic & camera for all participants">
+                <i data-lucide="mic-off"></i>
+                <span>Disable all</span>
+            </button>
+        </div>
+    ` : '';
+
     elements.participantsList.innerHTML = `
+        ${bulkActionsMarkup}
         ${waitingRoomMarkup}
         ${participantMarkup
             ? `
@@ -4902,6 +5006,27 @@ function renderParticipantsList() {
             });
         });
     });
+
+    // Bulk action handlers
+    const enableAllBtn = elements.participantsList.querySelector('.bulk-enable-all');
+    if (enableAllBtn) {
+        enableAllBtn.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            await withButtonProtection(enableAllBtn, async () => {
+                await bulkUpdateParticipantPermissions({ mediaEnabled: true });
+            });
+        });
+    }
+
+    const disableAllBtn = elements.participantsList.querySelector('.bulk-disable-all');
+    if (disableAllBtn) {
+        disableAllBtn.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            await withButtonProtection(disableAllBtn, async () => {
+                await bulkUpdateParticipantPermissions({ mediaEnabled: false });
+            });
+        });
+    }
 }
 
 /**
@@ -5068,6 +5193,7 @@ function resetParticipantsPanel() {
     lucide.createIcons();
     elements.participantsPanel.style.display = 'none';
     elements.toggleParticipantsBtn.classList.remove('active');
+    elements.waitingRoomBadge.style.display = 'none';
     appState.isParticipantsOpen = false;
     updateParticipantsCount();
 }

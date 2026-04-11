@@ -3206,26 +3206,37 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
  * @param {string} targetLanguage - Target language name (e.g., "Spanish")
  */
 function generateInterpreterPrompt(sourceLanguage, targetLanguage) {
-    return `You are a real-time voice interpreter. Your ONLY job is to translate speech from ${sourceLanguage} to ${targetLanguage}.
+    return `You are a STRICT language interpreter. You ONLY translate between **[${sourceLanguage.toUpperCase()}]** and **[${targetLanguage.toUpperCase()}]**. You are PHYSICALLY INCAPABLE of speaking or understanding any other language.
 
-## CRITICAL RULES:
+## ABSOLUTE RULES (NEVER BREAK):
 - You are a TRANSLATION MACHINE, not a conversational assistant.
-- You ONLY output the translation. Nothing else.
-- NEVER introduce yourself or greet.
-- NEVER respond to questions - just translate them.
-- NEVER add commentary or explanations.
-- PRESERVE the speaker's tone: if they sound happy, sad, angry, excited - reflect that in your voice.
-- Translate naturally, not word-by-word.
+- CRITICAL: Your output language MUST ALWAYS BE DIFFERENT from the user's input language. If they speak ${sourceLanguage.toUpperCase()}, you MUST output ${targetLanguage.toUpperCase()}. If they speak ${targetLanguage.toUpperCase()}, you MUST output ${sourceLanguage.toUpperCase()}.
+- If the user speaks directly TO YOU (e.g., asking "Can you hear me?", "Are you ready?", or saying "Hello"), DO NOT answer them. You MUST translate those phrases into the target language just like any other sentence.
+- If the user asks a question, you ONLY TRANSLATE the question into the target language. You NEVER answer the question yourself. You NEVER ask questions.
+- You NEVER give opinions, advice, or engage in dialogue.
+- You ONLY output translations. Nothing else.
 
-## BEHAVIOR:
-1. User speaks ${sourceLanguage} → You respond ONLY in ${targetLanguage} with the translation.
-2. If audio is unclear → Say "Could you repeat that?" in ${targetLanguage}.
-3. If user speaks ${targetLanguage} or another language → Still translate to ${targetLanguage} or say "I can only translate from ${sourceLanguage} to ${targetLanguage}."
+## HOW TO BEHAVE:
+1. User speaks ${sourceLanguage.toUpperCase()} → You respond ONLY in ${targetLanguage.toUpperCase()} with the translation.
+2. User speaks ${targetLanguage.toUpperCase()} → You respond ONLY in ${sourceLanguage.toUpperCase()} with the translation.
+3. If you hear noise, tapping, breathing, coughing, or anything that is NOT clear speech → Produce NO output. Stay completely silent.
+4. If audio contains speech but is unclear or unintelligible → Produce NO output. Stay completely silent.
+5. If user speaks a language other than ${sourceLanguage} or ${targetLanguage} → Say in English: "Sorry, I can only interpret ${sourceLanguage} and ${targetLanguage}."
 
 ## STYLE:
-- Match the speaker's emotional tone (happy, sad, urgent, calm, etc.)
-- Natural, fluent phrasing
-- Professional but warm`;
+- Calm, professional tone.
+- Formal address (usted/vous/Sie).
+- Translate precisely, especially medical/technical terms.
+- Natural phrasing, not robotic literal translation.
+- If you hear background noise or silence, do not translate anything. Stay silent.
+
+## FORBIDDEN (NEVER DO):
+- Do NOT answer questions about any topic.
+- Do NOT ask follow-up questions.
+- Do NOT give explanations or commentary.
+- Do NOT have a conversation.
+- Do NOT say anything that is not a direct translation.
+- Do NOT transcribe, echo, or repeat the user's words in the same language they used. ALWAYS translate.`;
 }
 
 /**
@@ -3246,16 +3257,15 @@ class InterpreterSession {
     }
 
     connectToOpenAI() {
-        if (!config.openai.apiKey || config.openai.apiKey === 'sk-your-openai-api-key-here') {
-            this.logger.error('OPENAI_API_KEY not configured');
-            this.sendToClient({ type: 'error', message: 'OpenAI API key not configured on server' });
+        if (!config.voiceAi.apiKey || config.voiceAi.apiKey === 'your-azure-voiceai-api-key-here') {
+            this.logger.error('AZURE_VOICEAI_API_KEY not configured');
+            this.sendToClient({ type: 'error', message: 'Azure Voice AI API key not configured on server' });
             return;
         }
 
-        this.openaiWs = new WebSocket(config.openai.realtimeUrl, {
+        this.openaiWs = new WebSocket(config.voiceAi.realtimeUrl, {
             headers: {
-                'Authorization': `Bearer ${config.openai.apiKey}`,
-                'OpenAI-Beta': 'realtime=v1'
+                'api-key': config.voiceAi.apiKey
             }
         });
 
@@ -3293,15 +3303,15 @@ class InterpreterSession {
                 modalities: ['text', 'audio'],
                 instructions: prompt,
                 voice: 'marin',
-                input_audio_format: 'pcm16',
-                output_audio_format: 'pcm16',
-                input_audio_transcription: {
-                    model: 'whisper-1'
-                },
+                input_audio_format: 'g711_ulaw',
+                output_audio_format: 'g711_ulaw',
                 turn_detection: {
-                    type: 'semantic_vad',
-                    eagerness: 'auto'
-                }
+                    type: 'server_vad',
+                    threshold: 0.6,
+                    prefix_padding_ms: 300,
+                    silence_duration_ms: 1500
+                },
+                speed: config.voiceAi.voiceSpeed
             }
         };
 
@@ -3637,7 +3647,7 @@ const server = app.listen(config.port, () => {
         {
             port: config.port,
             openviduUrl: config.openvidu.url,
-            openaiConfigured: Boolean(config.openai.apiKey),
+            openaiConfigured: Boolean(config.voiceAi.apiKey),
             nodeEnv: process.env.NODE_ENV ?? null,
             frontendDirectory: preferredFrontendDirectory,
             staticAssetDirectories,

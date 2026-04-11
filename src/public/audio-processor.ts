@@ -49,9 +49,9 @@ class AudioProcessor {
         }
 
         try {
-            // Create AudioContext
+            // Create AudioContext at 8kHz for G.711 μ-law
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: 24000 // OpenAI expects 24kHz
+                sampleRate: 8000 // G.711 μ-law uses 8kHz
             });
 
             // Create a MediaStream from the track
@@ -101,11 +101,11 @@ class AudioProcessor {
 
                 const inputData = event.inputBuffer.getChannelData(0);
                 
-                // Convert Float32 to PCM16
-                const pcm16 = this.float32ToPcm16(inputData);
+                // Convert Float32 to G.711 μ-law
+                const ulaw = this.float32ToUlaw(inputData);
                 
                 // Convert to base64
-                const base64 = this.arrayBufferToBase64(pcm16.buffer);
+                const base64 = this.arrayBufferToBase64(ulaw.buffer);
                 
                 // Send to server
                 this.ws.send(JSON.stringify({
@@ -186,12 +186,8 @@ class AudioProcessor {
             bytes[i] = binaryString.charCodeAt(i);
         }
         
-        // Convert PCM16 to Float32 for Web Audio
-        const pcm16 = new Int16Array(bytes.buffer);
-        const float32 = new Float32Array(pcm16.length);
-        for (let i = 0; i < pcm16.length; i++) {
-            float32[i] = pcm16[i] / 32768;
-        }
+        // Convert G.711 μ-law to Float32 for Web Audio
+        const float32 = this.ulawToFloat32(bytes);
 
         this.playbackQueue.push(float32);
         
@@ -222,7 +218,7 @@ class AudioProcessor {
         const audioData = this.playbackQueue.shift();
 
         // Create an AudioBuffer
-        const audioBuffer = this.audioContext.createBuffer(1, audioData.length, 24000);
+        const audioBuffer = this.audioContext.createBuffer(1, audioData.length, 8000);
         audioBuffer.getChannelData(0).set(audioData);
 
         // Create a buffer source
@@ -238,15 +234,48 @@ class AudioProcessor {
     }
 
     /**
-     * Convert Float32Array to Int16Array (PCM16)
+     * Convert Float32 sample to G.711 μ-law byte
      */
-    float32ToPcm16(float32Array) {
-        const pcm16 = new Int16Array(float32Array.length);
+    float32ToUlaw(float32Array) {
+        const BIAS = 0x84;
+        const CLIP = 32635;
+        const ulawBytes = new Uint8Array(float32Array.length);
+
         for (let i = 0; i < float32Array.length; i++) {
-            const s = Math.max(-1, Math.min(1, float32Array[i]));
-            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            let sample = Math.max(-1, Math.min(1, float32Array[i]));
+            let pcm = Math.round(sample * 32767);
+            let sign = 0;
+            if (pcm < 0) {
+                sign = 0x80;
+                pcm = -pcm;
+            }
+            if (pcm > CLIP) pcm = CLIP;
+            pcm += BIAS;
+
+            let exponent = 7;
+            for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+            const mantissa = (pcm >> (exponent + 3)) & 0x0F;
+            ulawBytes[i] = ~(sign | (exponent << 4) | mantissa) & 0xFF;
         }
-        return pcm16;
+        return ulawBytes;
+    }
+
+    /**
+     * Convert G.711 μ-law bytes to Float32Array
+     */
+    ulawToFloat32(ulawBytes) {
+        const float32 = new Float32Array(ulawBytes.length);
+        for (let i = 0; i < ulawBytes.length; i++) {
+            let mulaw = ~ulawBytes[i] & 0xFF;
+            const sign = mulaw & 0x80;
+            const exponent = (mulaw >> 4) & 0x07;
+            const mantissa = mulaw & 0x0F;
+            let sample = ((mantissa << 3) + 0x84) << exponent;
+            sample -= 0x84;
+            if (sign !== 0) sample = -sample;
+            float32[i] = sample / 32768;
+        }
+        return float32;
     }
 
     /**

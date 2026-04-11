@@ -17,10 +17,11 @@ export const config = {
     url: env.OPENVIDU_URL,
     secret: env.OPENVIDU_SECRET,
   },
-  openai: {
-    apiKey: env.OPENAI_API_KEY,
-    realtimeUrl:
+  voiceAi: {
+    apiKey: env.AZURE_VOICEAI_API_KEY,
+    realtimeUrl: env.AZURE_VOICEAI_REALTIME_URL ||
       'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+    voiceSpeed: Number(env.VOICE_SPEED || '1.0'),
   },
   azure: {
     speechKey: env.AZURE_SPEECH_KEY,

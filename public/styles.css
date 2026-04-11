@@ -849,10 +849,34 @@ body {
     min-width: 0;
 }
 
-.video-label-left span:last-child {
+.video-label-left span:not(.role-tag):not(.speaking-indicator) {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+/* Role tags on video cards */
+.role-tag {
+    font-size: 0.6rem;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+    letter-spacing: 0.02em;
+    flex-shrink: 0;
+    line-height: 1.4;
+    text-transform: uppercase;
+}
+
+.role-tag-host {
+    background: rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.role-tag-cohost {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.65);
+    border: 1px solid rgba(255, 255, 255, 0.15);
 }
 
 /* Speaking indicator */
@@ -1632,7 +1656,8 @@ body {
 }
 
 /* Chat badge for unread messages */
-.chat-badge {
+.chat-badge,
+.waiting-room-badge {
     position: absolute;
     top: -6px;
     right: -6px;
@@ -2526,6 +2551,7 @@ body {
     font-weight: 500;
     cursor: pointer;
     transition: all 0.2s;
+    position: relative;
 }
 
 .btn-participants:hover {
@@ -2895,6 +2921,59 @@ body {
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.06em;
+}
+
+/* Bulk actions bar */
+.participants-bulk-actions {
+    display: flex;
+    gap: 6px;
+    padding: 0 0 6px;
+    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 4px;
+}
+
+.bulk-action-btn {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 6px 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 0.7rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.bulk-action-btn svg {
+    width: 13px;
+    height: 13px;
+}
+
+.bulk-action-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+}
+
+.bulk-enable-all:hover {
+    background: rgba(34, 197, 94, 0.15);
+    border-color: #22c55e;
+    color: #22c55e;
+}
+
+.bulk-disable-all:hover {
+    background: rgba(239, 68, 68, 0.15);
+    border-color: #ef4444;
+    color: #ef4444;
+}
+
+.bulk-action-btn.processing {
+    opacity: 0.6;
+    pointer-events: none;
 }
 
 /* Participant item */
