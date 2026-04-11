@@ -2,7 +2,7 @@
 /**
  * Chat Manager
  * 
- * Manages chat messages using OpenVidu signals with automatic translation
+ * Manages chat messages using LiveKit signals with automatic translation
  * to each user's native language using Azure Translator API.
  */
 
@@ -38,23 +38,29 @@ class ChatManager {
     /**
      * Initialize the chat manager
      */
-    initialize(session, localNickname, localLanguage) {
-        this.session = session;
+    initialize(livekitClientRef, localNickname, localLanguage) {
+        this.session = livekitClientRef;
         this.localNickname = localNickname;
         this.localLanguage = localLanguage;
-        this.localConnectionId = session?.connection?.connectionId || null;
+        this.localConnectionId = livekitClientRef?.room?.localParticipant?.identity || null;
         this.messages = [];
         this.unreadCount = 0;
         
         // Assign color to local user
         this.getUserColor(localNickname);
         
-        // Listen for incoming chat messages
-        this.session.on('signal:chat', async (event) => {
-            await this.handleIncomingMessage(event);
-        });
-        
         console.log('[ChatManager] Initialized');
+    }
+
+    /**
+     * Handle incoming chat data message (called from app.ts onDataReceived)
+     */
+    async handleChatData(parsed, senderIdentity) {
+        const event = {
+            data: JSON.stringify(parsed),
+            from: { connectionId: senderIdentity },
+        };
+        await this.handleIncomingMessage(event);
     }
 
     /**
@@ -230,11 +236,8 @@ class ChatManager {
         }
         
         try {
-            // Send via OpenVidu signal to all participants
-            await this.session.signal({
-                data: JSON.stringify(messageData),
-                type: 'chat'
-            });
+            // Send via LiveKit data channel to all participants
+            await this.session.sendData('chat', messageData);
             
             return true;
         } catch (error) {

@@ -2,7 +2,7 @@
 /**
  * Whiteboard Manager
  * 
- * Manages collaborative whiteboard using Fabric.js and OpenVidu signals
+ * Manages collaborative whiteboard using Fabric.js and LiveKit signals
  */
 
 class WhiteboardManager {
@@ -41,10 +41,10 @@ class WhiteboardManager {
     }
 
     /**
-     * Initialize the whiteboard with OpenVidu session
+     * Initialize the whiteboard with LiveKit client
      */
-    initialize(session, options = {}) {
-        this.session = session;
+    initialize(livekitClientRef, options = {}) {
+        this.session = livekitClientRef;
         this.roomTarget = options.roomTarget || this.roomTarget;
         this.onPersistState = options.onPersistState || null;
         this.setupSignalHandlers();
@@ -596,68 +596,55 @@ class WhiteboardManager {
     }
 
     /**
-     * Setup OpenVidu signal handlers for receiving whiteboard updates
+     * Setup LiveKit data channel handlers for receiving whiteboard updates
      */
     setupSignalHandlers() {
-        if (!this.session) return;
+        // Signal handlers are managed centrally via app.ts onDataReceived
+        // This method is kept for compatibility but no longer registers listeners directly
+    }
 
-        // Receive new objects
-        this.session.on('signal:whiteboard-object', (event) => {
-            if (event.from.connectionId === this.session.connection.connectionId) return;
-            
-            const data = JSON.parse(event.data);
-            if (!this.canvas) {
-                // Queue objects if canvas not ready
-                this._pendingObjects = this._pendingObjects || [];
-                this._pendingObjects.push(data);
-            } else {
-                this.handleRemoteObject(data);
-            }
-        });
+    /**
+     * Handle incoming whiteboard data message (called from app.ts onDataReceived)
+     */
+    handleWhiteboardData(topic, parsed, senderIdentity) {
+        const localIdentity = this.session?.room?.localParticipant?.identity;
+        if (senderIdentity === localIdentity) return;
 
-        // Receive clear command
-        this.session.on('signal:whiteboard-clear', (event) => {
-            if (event.from.connectionId === this.session.connection.connectionId) return;
-            if (!this.canvas) return;
-            
-            this.canvas.clear();
-            this.canvas.backgroundColor = '#1a1a2e';
-            this.canvas.renderAll();
-        });
-
-        // Receive full state sync (for new joiners)
-        // Use flag to only accept first sync response and ignore duplicates
-        this.session.on('signal:whiteboard-sync', (event) => {
-            if (event.from.connectionId === this.session.connection.connectionId) return;
-            
-            const data = JSON.parse(event.data);
-            if (data.state) {
-                // Only load if we don't have content yet or canvas is empty
+        switch (topic) {
+            case 'whiteboard-object':
                 if (!this.canvas) {
-                    this._pendingSyncState = data.state;
+                    this._pendingObjects = this._pendingObjects || [];
+                    this._pendingObjects.push(parsed);
                 } else {
-                    this.loadState(data.state);
+                    this.handleRemoteObject(parsed);
                 }
-            }
-        });
-
-        // Request sync when whiteboard opens or new participant joins
-        this.session.on('signal:whiteboard-request-sync', (event) => {
-            if (event.from.connectionId === this.session.connection.connectionId) return;
-            
-            // Send current state and open status to requester
-            if (this.canvas && this.isOpen) {
-                // Send the canvas content for active room peers
-                setTimeout(() => {
-                    this.session.signal({
-                        data: JSON.stringify({ state: JSON.stringify(this.canvas.toJSON()) }),
-                        type: 'whiteboard-sync',
-                        to: [event.from]
-                    }).catch(err => console.error('Error sending whiteboard sync:', err));
-                }, 200);
-            }
-        });
-        
+                break;
+            case 'whiteboard-clear':
+                if (!this.canvas) return;
+                this.canvas.clear();
+                this.canvas.backgroundColor = '#1a1a2e';
+                this.canvas.renderAll();
+                break;
+            case 'whiteboard-sync':
+                if (parsed.state) {
+                    if (!this.canvas) {
+                        this._pendingSyncState = parsed.state;
+                    } else {
+                        this.loadState(parsed.state);
+                    }
+                }
+                break;
+            case 'whiteboard-request-sync':
+                if (this.canvas && this.isOpen) {
+                    setTimeout(() => {
+                        this.session?.sendData('whiteboard-sync',
+                            { state: JSON.stringify(this.canvas.toJSON()) },
+                            [senderIdentity]
+                        ).catch(err => console.error('Error sending whiteboard sync:', err));
+                    }, 200);
+                }
+                break;
+        }
     }
     
     /**
@@ -722,12 +709,9 @@ class WhiteboardManager {
     broadcastObject(obj, action) {
         if (!this.session) return;
 
-        this.session.signal({
-            data: JSON.stringify({
-                action: action,
-                object: obj.toJSON()
-            }),
-            type: 'whiteboard-object'
+        this.session.sendData('whiteboard-object', {
+            action: action,
+            object: obj.toJSON()
         }).catch(err => console.error('Error broadcasting whiteboard object:', err));
         this.persistState({ canvasState: JSON.stringify(this.canvas.toJSON()) });
     }
@@ -738,10 +722,8 @@ class WhiteboardManager {
     broadcastClear() {
         if (!this.session) return;
 
-        this.session.signal({
-            data: JSON.stringify({ action: 'clear' }),
-            type: 'whiteboard-clear'
-        }).catch(err => console.error('Error broadcasting whiteboard clear:', err));
+        this.session.sendData('whiteboard-clear', { action: 'clear' })
+            .catch(err => console.error('Error broadcasting whiteboard clear:', err));
     }
 
     /**
@@ -750,12 +732,9 @@ class WhiteboardManager {
     broadcastState(action) {
         if (!this.session || !this.canvas) return;
 
-        this.session.signal({
-            data: JSON.stringify({
-                action: action,
-                state: JSON.stringify(this.canvas.toJSON())
-            }),
-            type: 'whiteboard-sync'
+        this.session.sendData('whiteboard-state', {
+            action: action,
+            state: JSON.stringify(this.canvas.toJSON())
         }).catch(err => console.error('Error broadcasting whiteboard state:', err));
         this.persistState({ canvasState: JSON.stringify(this.canvas.toJSON()) });
     }
@@ -783,10 +762,8 @@ class WhiteboardManager {
     requestSync() {
         if (!this.session) return;
 
-        this.session.signal({
-            data: JSON.stringify({ request: true }),
-            type: 'whiteboard-request-sync'
-        }).catch(err => console.error('Error requesting whiteboard sync:', err));
+        this.session.sendData('whiteboard-request-sync', { request: true })
+            .catch(err => console.error('Error requesting whiteboard sync:', err));
     }
 
     /**

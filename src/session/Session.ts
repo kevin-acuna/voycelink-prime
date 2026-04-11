@@ -40,7 +40,7 @@ export type BreakoutRoomPrimitives = {
   name: string;
   status: BreakoutRoomStatus;
   participantIds: string[];
-  openviduSessionId: string | null;
+  livekitRoomName: string | null;
   openedAt: string | null;
   closedAt: string | null;
 };
@@ -99,7 +99,7 @@ type BreakoutRoomState = {
   name: string;
   status: BreakoutRoomStatus;
   participantIds: Set<string>;
-  openviduSessionId: string | null;
+  livekitRoomName: string | null;
   openedAt: string | null;
   closedAt: string | null;
 };
@@ -420,7 +420,7 @@ export class Session {
       name,
       status: BreakoutRoomStatus.DRAFT,
       participantIds: new Set(),
-      openviduSessionId: null,
+      livekitRoomName: null,
       openedAt: null,
       closedAt: null,
     });
@@ -434,10 +434,10 @@ export class Session {
     }
   }
 
-  openBreakoutRoom(id: string, openviduSessionId: string, openedAt: string) {
+  openBreakoutRoom(id: string, livekitRoomName: string, openedAt: string) {
     const breakoutRoom = this.getBreakoutRoomState(id);
     breakoutRoom.status = BreakoutRoomStatus.OPEN;
-    breakoutRoom.openviduSessionId = openviduSessionId;
+    breakoutRoom.livekitRoomName = livekitRoomName;
     breakoutRoom.openedAt = openedAt;
     breakoutRoom.closedAt = null;
   }
@@ -683,7 +683,7 @@ export class Session {
       name: room.name,
       status: room.status,
       participantIds: Array.from(room.participantIds),
-      openviduSessionId: room.openviduSessionId,
+      livekitRoomName: room.livekitRoomName,
       openedAt: room.openedAt,
       closedAt: room.closedAt,
     };

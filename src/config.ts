@@ -10,12 +10,13 @@ export const config = {
   port: Number(env.PORT || 3000),
   logLevel: env.LOG_LEVEL || 'info',
   auth: {
-    jwtSecret: env.AUTH_JWT_SECRET || env.OPENVIDU_SECRET,
+    jwtSecret: env.AUTH_JWT_SECRET || env.LIVEKIT_API_SECRET,
     tokenTtl: '15m',
   },
-  openvidu: {
-    url: env.OPENVIDU_URL,
-    secret: env.OPENVIDU_SECRET,
+  livekit: {
+    url: env.LIVEKIT_URL,
+    apiKey: env.LIVEKIT_API_KEY,
+    apiSecret: env.LIVEKIT_API_SECRET,
   },
   voiceAi: {
     apiKey: env.AZURE_VOICEAI_API_KEY,
@@ -40,14 +41,15 @@ export const config = {
 
 export function validateServerConfig() {
   if (
-    !config.openvidu.url ||
-    !config.openvidu.secret ||
+    !config.livekit.url ||
+    !config.livekit.apiKey ||
+    !config.livekit.apiSecret ||
     !config.auth.jwtSecret ||
     !config.cosmos.connectionString
   ) {
     process.stderr.write('ERROR: Missing required environment variables.\n');
     process.stderr.write(
-      'Please ensure OPENVIDU_URL, OPENVIDU_SECRET, COSMOS_DB_CONNECTION_STRING, and optionally AUTH_JWT_SECRET are set in the environment or local .env file.\n'
+      'Please ensure LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, COSMOS_DB_CONNECTION_STRING are set in the environment or local .env file.\n'
     );
     process.exit(1);
   }

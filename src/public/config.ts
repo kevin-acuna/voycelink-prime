@@ -12,6 +12,9 @@ const CONFIG = {
     // For local development, use: 'http://localhost:3000'
     // BACKEND_URL: 'http://localhost:3000',
     
+    // LiveKit server URL (fallback - normally returned by the backend with the token)
+    LIVEKIT_URL: '',
+    
     // API Endpoints
     ENDPOINTS: {
         HEALTH: '/api/health',
@@ -44,7 +47,7 @@ const CONFIG = {
             `/api/sessions/${sessionId}/participants/${participantId}/role`
     },
     
-    // OpenVidu Publisher Settings
+    // Publisher Settings
     PUBLISHER_SETTINGS: {
         audioSource: undefined,     // Default microphone
         videoSource: undefined,     // Default camera

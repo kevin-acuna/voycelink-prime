@@ -2,8 +2,8 @@
 /**
  * AI Live Dubbing Platform - Backend BFF
  * 
- * This server acts as a secure proxy between the frontend and Azure OpenVidu Server.
- * It handles session creation, token generation, and OpenAI Realtime translation proxy.
+ * This server acts as a secure proxy between the frontend and LiveKit Server.
+ * It handles room management, token generation, and OpenAI Realtime translation proxy.
  */
 
 import cors from 'cors';
@@ -11,7 +11,7 @@ import express from 'express';
 import fs from 'fs';
 import jwt from 'jsonwebtoken';
 import path from 'path';
-import { OpenVidu } from 'openvidu-node-client';
+import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
 import WebSocket from 'ws';
 import { canPerform, getEffectivePermissions } from './authz';
 import { Permission } from './authz/permissions';
@@ -47,9 +47,13 @@ const frontendDocumentPath = path.join(preferredFrontendDirectory, 'index.html')
 validateServerConfig();
 
 // =============================================================================
-// OpenVidu Client Initialization
+// LiveKit Client Initialization
 // =============================================================================
-const openvidu = new OpenVidu(config.openvidu.url, config.openvidu.secret);
+const livekitRoomService = new RoomServiceClient(
+    config.livekit.url.replace('wss://', 'https://'),
+    config.livekit.apiKey,
+    config.livekit.apiSecret
+);
 const sessionRepository = new CosmosSessionRepository();
 
 // =============================================================================
@@ -84,10 +88,8 @@ app.use((req, res, next) => {
 });
 
 // =============================================================================
-// In-Memory Session Store
-// Map<sessionId, Session> - Tracks active OpenVidu sessions
+// Constants & In-Memory State
 // =============================================================================
-const activeSessions = new Map();
 const AUTH_TOKEN_TTL_SECONDS = 15 * 60;
 const REFRESH_TOKEN_TTL_SECONDS = 12 * 60 * 60;
 const INVITE_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -97,8 +99,8 @@ const AUTH_REFRESH_COOKIE_NAME = 'voycelink_auth_refresh';
 const BOOTSTRAP_COOKIE_NAME = 'voycelink_bootstrap';
 const OWNER_COOKIE_NAME = 'voycelink_owner_rooms';
 const ROOM_ID_PATTERN = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
-const OPENVIDU_RETRY_ATTEMPTS = 3;
-const OPENVIDU_RETRY_DELAY_MS = 250;
+const LIVEKIT_RETRY_ATTEMPTS = 3;
+const LIVEKIT_RETRY_DELAY_MS = 250;
 const permissionSubscriptions = new Map();
 const BREAKOUT_ROOM_ID_PATTERN = /^[a-z0-9-]{4,64}$/;
 
@@ -806,7 +808,7 @@ function getErrorMessage(error) {
     return error?.message || 'Unexpected error';
 }
 
-function getOpenViduStatusCode(error) {
+function getHttpStatusCode(error) {
     const directStatus = error?.status || error?.statusCode || error?.response?.status;
     if (typeof directStatus === 'number') {
         return directStatus;
@@ -817,9 +819,9 @@ function getOpenViduStatusCode(error) {
     return match ? Number(match[1]) : null;
 }
 
-function isRetryableOpenViduError(error) {
-    const statusCode = getOpenViduStatusCode(error);
-    if (statusCode === 408 || statusCode === 409 || statusCode === 429) {
+function isRetryableError(error) {
+    const statusCode = getHttpStatusCode(error);
+    if (statusCode === 408 || statusCode === 429) {
         return true;
     }
 
@@ -837,15 +839,15 @@ function isRetryableOpenViduError(error) {
     );
 }
 
-async function withOpenViduRetry(operationName, handler) {
+async function withRetry(operationName, handler) {
     let lastError = null;
 
-    for (let attempt = 1; attempt <= OPENVIDU_RETRY_ATTEMPTS; attempt += 1) {
+    for (let attempt = 1; attempt <= LIVEKIT_RETRY_ATTEMPTS; attempt += 1) {
         try {
             return await handler();
         } catch (error) {
             lastError = error;
-            const retryable = isRetryableOpenViduError(error);
+            const retryable = isRetryableError(error);
 
             logger.warn(
                 {
@@ -854,41 +856,27 @@ async function withOpenViduRetry(operationName, handler) {
                     attempt,
                     retryable,
                 },
-                'OpenVidu operation failed'
+                'LiveKit operation failed'
             );
 
-            if (!retryable || attempt === OPENVIDU_RETRY_ATTEMPTS) {
+            if (!retryable || attempt === LIVEKIT_RETRY_ATTEMPTS) {
                 throw error;
             }
 
-            await delay(OPENVIDU_RETRY_DELAY_MS * attempt);
+            await delay(LIVEKIT_RETRY_DELAY_MS * attempt);
         }
     }
 
     throw lastError;
 }
 
-function sendOpenViduError(res, error, fallbackMessage) {
-    const statusCode = getOpenViduStatusCode(error);
+function sendServiceError(res, error, fallbackMessage) {
+    const statusCode = getHttpStatusCode(error);
     const details = getErrorMessage(error);
 
     if (statusCode === 404) {
         return res.status(404).json({
-            error: 'Session not found',
-            details,
-        });
-    }
-
-    if (statusCode === 409) {
-        return res.status(409).json({
-            error: fallbackMessage,
-            details,
-        });
-    }
-
-    if (statusCode === 429) {
-        return res.status(429).json({
-            error: 'OpenVidu rate limit reached',
+            error: 'Room not found',
             details,
         });
     }
@@ -906,27 +894,19 @@ function sendOpenViduError(res, error, fallbackMessage) {
     });
 }
 
-async function fetchOpenViduSessionById(sessionId) {
-    await withOpenViduRetry('openvidu.fetch', () => openvidu.fetch());
-    return openvidu.activeSessions.find((candidate) => candidate.sessionId === sessionId) || null;
+/**
+ * Check if a LiveKit room exists
+ */
+async function livekitRoomExists(roomName) {
+    try {
+        const rooms = await livekitRoomService.listRooms([roomName]);
+        return rooms.length > 0;
+    } catch {
+        return false;
+    }
 }
 
-async function getCachedOrRemoteOpenViduSession(sessionId) {
-    const cachedSession = activeSessions.get(sessionId);
-    if (cachedSession) {
-        return cachedSession;
-    }
-
-    const remoteSession = await fetchOpenViduSessionById(sessionId);
-    if (!remoteSession) {
-        return null;
-    }
-
-    activeSessions.set(sessionId, remoteSession);
-    return remoteSession;
-}
-
-function getBreakoutOpenViduSessionId(rootSessionId, breakoutRoomId) {
+function getBreakoutLivekitRoomName(rootSessionId, breakoutRoomId) {
     return `${rootSessionId}__breakout__${breakoutRoomId}`;
 }
 
@@ -934,18 +914,40 @@ function generateRootParticipantId() {
     return `prt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function ensureOpenViduSessionExists(sessionId) {
-    const existingSession = await getCachedOrRemoteOpenViduSession(sessionId);
-    if (existingSession) {
-        return existingSession;
-    }
+/**
+ * Generate a LiveKit access token for a participant
+ */
+async function generateLivekitToken(roomName, participantIdentity, metadata = {}) {
+    const at = new AccessToken(config.livekit.apiKey, config.livekit.apiSecret, {
+        identity: participantIdentity,
+        metadata: JSON.stringify(metadata),
+    });
+    at.addGrant({
+        roomJoin: true,
+        room: roomName,
+        canPublish: true,
+        canSubscribe: true,
+        canPublishData: true,
+    });
+    return await at.toJwt();
+}
 
-    const createdSession = await withOpenViduRetry(
-        'openvidu.createSession',
-        () => openvidu.createSession({ customSessionId: sessionId })
-    );
-    activeSessions.set(createdSession.sessionId, createdSession);
-    return createdSession;
+/**
+ * Remove a participant from a LiveKit room
+ */
+async function removeLivekitParticipant(roomName, participantIdentity) {
+    try {
+        await withRetry('livekit.removeParticipant', () =>
+            livekitRoomService.removeParticipant(roomName, participantIdentity)
+        );
+        return true;
+    } catch (error) {
+        logger.warn(
+            { err: error, roomName, participantIdentity },
+            'Failed to remove LiveKit participant'
+        );
+        return false;
+    }
 }
 
 function createHttpError(status, message, details) {
@@ -963,15 +965,15 @@ async function loadStoredSessionOrFail(sessionId) {
         return storedSession;
     }
 
-    const runtimeSession = await getCachedOrRemoteOpenViduSession(sessionId);
-    if (runtimeSession) {
+    const roomExists = await livekitRoomExists(sessionId);
+    if (roomExists) {
         logger.error(
-            { sessionId, openviduSessionId: runtimeSession.sessionId },
-            'Root session aggregate missing while OpenVidu session is still active'
+            { sessionId },
+            'Root session aggregate missing while LiveKit room is still active'
         );
         throw createHttpError(
             500,
-            `Root session aggregate for ${sessionId} is missing while the OpenVidu session is still active`
+            `Root session aggregate for ${sessionId} is missing while the LiveKit room is still active`
         );
     }
 
@@ -999,7 +1001,7 @@ function getRoomTargetForParticipant(storedSession, participantId = null) {
         return {
             type: 'main',
             breakoutRoomId: null,
-            openviduSessionId: storedSession.getSessionId(),
+            livekitRoomName: storedSession.getSessionId(),
             displayName: 'Main room',
         };
     }
@@ -1009,17 +1011,17 @@ function getRoomTargetForParticipant(storedSession, participantId = null) {
         return {
             type: 'main',
             breakoutRoomId: null,
-            openviduSessionId: storedSession.getSessionId(),
+            livekitRoomName: storedSession.getSessionId(),
             displayName: 'Main room',
         };
     }
 
     const breakoutRoom = storedSession.getBreakoutRoom(location.breakoutRoomId);
-    if (!breakoutRoom || breakoutRoom.status !== BreakoutRoomStatus.OPEN || !breakoutRoom.openviduSessionId) {
+    if (!breakoutRoom || breakoutRoom.status !== BreakoutRoomStatus.OPEN || !breakoutRoom.livekitRoomName) {
         return {
             type: 'main',
             breakoutRoomId: null,
-            openviduSessionId: storedSession.getSessionId(),
+            livekitRoomName: storedSession.getSessionId(),
             displayName: 'Main room',
         };
     }
@@ -1027,7 +1029,7 @@ function getRoomTargetForParticipant(storedSession, participantId = null) {
     return {
         type: 'breakout',
         breakoutRoomId: breakoutRoom.id,
-        openviduSessionId: breakoutRoom.openviduSessionId,
+        livekitRoomName: breakoutRoom.livekitRoomName,
         displayName: breakoutRoom.name,
         status: breakoutRoom.status,
     };
@@ -1073,7 +1075,7 @@ function summarizeStoredSessionForLogs(storedSession) {
             id: room.id,
             name: room.name,
             status: room.status,
-            openviduSessionId: room.openviduSessionId,
+            livekitRoomName: room.livekitRoomName,
             participantIds: room.participantIds,
         })),
     };
@@ -1282,7 +1284,7 @@ app.get('/api/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         timestamp: new Date().toISOString(),
-        openviduUrl: config.openvidu.url,
+        livekitUrl: config.livekit.url,
         cosmosDatabase: config.cosmos.databaseName,
         cosmosContainers: [
             config.cosmos.roomsContainerName,
@@ -1363,10 +1365,11 @@ app.get('/api/me/permissions', requirePermission(Permission.JOIN_SESSION), async
             ? await loadStoredSessionOrFail(req.auth.roomId)
             : null;
         const participantId = resolveRootParticipantId(storedSession, getParticipantIdFromRequest(req));
-        const authorizationContext = await getAuthorizationContextForRequest({
-            ...req,
-            query: participantId ? { ...req.query, participantId } : req.query,
-        });
+        const authorizationContext = await getAuthorizationContextForRequest(
+            Object.assign(Object.create(Object.getPrototypeOf(req)), req, {
+                query: participantId ? { ...req.query, participantId } : req.query,
+            })
+        );
         const permissions = getEffectivePermissions(authorizationContext);
         const authSession = createAccessSession(req.auth.role, req.auth.roomId ?? null);
         issueBootstrapCookies(res, authSession);
@@ -1375,7 +1378,7 @@ app.get('/api/me/permissions', requirePermission(Permission.JOIN_SESSION), async
             : {
                 type: 'main',
                 breakoutRoomId: null,
-                openviduSessionId: req.auth.roomId ?? null,
+                livekitRoomName: req.auth.roomId ?? null,
                 displayName: 'Main room',
             };
 
@@ -1850,17 +1853,17 @@ app.post('/api/sessions/:sessionId/breakouts/:breakoutRoomId/open', requirePermi
             });
         }
 
-        const openviduSessionId =
-            breakoutRoom.openviduSessionId || getBreakoutOpenViduSessionId(sessionId, breakoutRoomId);
+        const livekitRoomName =
+            breakoutRoom.livekitRoomName || getBreakoutLivekitRoomName(sessionId, breakoutRoomId);
 
-        await ensureOpenViduSessionExists(openviduSessionId);
-        storedSession.openBreakoutRoom(breakoutRoomId, openviduSessionId, new Date().toISOString());
+        // LiveKit rooms are created on-the-fly when first participant connects
+        storedSession.openBreakoutRoom(breakoutRoomId, livekitRoomName, new Date().toISOString());
         await sessionRepository.save(storedSession);
         logger.info(
             {
                 sessionId,
                 breakoutRoomId,
-                openviduSessionId,
+                livekitRoomName,
                 snapshot: summarizeStoredSessionForLogs(storedSession),
             },
             'Opened breakout room'
@@ -1872,7 +1875,7 @@ app.post('/api/sessions/:sessionId/breakouts/:breakoutRoomId/open', requirePermi
         });
     } catch (error) {
         logger.error({ err: error }, 'Failed to open breakout room');
-        return sendOpenViduError(res, error, 'Failed to open breakout room');
+        return sendServiceError(res, error, 'Failed to open breakout room');
     }
 });
 
@@ -2318,10 +2321,11 @@ app.patch('/api/sessions/:sessionId/whiteboard-state', requirePermission(Permiss
         }
 
         const requestedParticipantId = resolveRootParticipantId(storedSession, getParticipantIdFromRequest(req));
-        const authorizationContext = await getAuthorizationContextForRequest({
-            ...req,
-            query: requestedParticipantId ? { ...req.query, participantId: requestedParticipantId } : req.query,
-        });
+        const authorizationContext = await getAuthorizationContextForRequest(
+            Object.assign(Object.create(Object.getPrototypeOf(req)), req, {
+                query: requestedParticipantId ? { ...req.query, participantId: requestedParticipantId } : req.query,
+            })
+        );
 
         if (typeof req.body?.isOpen === 'boolean') {
             const authorization = canPerform({ role: req.auth.role }, Permission.MANAGE_WHITEBOARD);
@@ -2410,26 +2414,12 @@ app.delete('/api/sessions/:sessionId/participants/:participantId', requirePermis
             participantLocation.type === 'breakout' && participantLocation.breakoutRoomId
                 ? storedSession.getBreakoutRoom(participantLocation.breakoutRoomId)
                 : null;
-        const targetOpenViduSessionId = breakoutRoom?.openviduSessionId || sessionId;
+        const targetRoomName = breakoutRoom?.livekitRoomName || sessionId;
         const mediaConnectionId = storedSession.getParticipantMediaConnection(participantRef);
 
-        const session = await getCachedOrRemoteOpenViduSession(targetOpenViduSessionId);
-        if (session) {
-            await withOpenViduRetry(
-                'openvidu.fetchSessionBeforeDisconnect',
-                () => session.fetch()
-            );
-
-            const targetConnection =
-                session.connections.find((connection) => connection.connectionId === mediaConnectionId) ||
-                session.activeConnections.find((connection) => connection.connectionId === mediaConnectionId);
-
-            if (targetConnection) {
-                await withOpenViduRetry(
-                    'openvidu.forceDisconnect',
-                    () => session.forceDisconnect(targetConnection)
-                );
-            }
+        // Remove participant from LiveKit room
+        if (mediaConnectionId) {
+            await removeLivekitParticipant(targetRoomName, mediaConnectionId);
         }
 
         storedSession.removeParticipant(participantRef);
@@ -2448,7 +2438,7 @@ app.delete('/api/sessions/:sessionId/participants/:participantId', requirePermis
         return res.status(204).send();
     } catch (error) {
         logger.error({ err: error }, 'Failed to remove participant from session');
-        return sendOpenViduError(res, error, 'Failed to remove participant from the session');
+        return sendServiceError(res, error, 'Failed to remove participant from the session');
     }
 });
 
@@ -2518,7 +2508,7 @@ app.post('/api/translate', requirePermission(Permission.JOIN_SESSION), async (re
 
 /**
  * POST /api/sessions
- * Creates a new OpenVidu session or returns existing one
+ * Creates a new session or returns existing one
  * 
  * Body: { sessionId?: string, sessionProperties?: object }
  * Response: { sessionId: string }
@@ -2561,120 +2551,45 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
             return;
         }
         
-        sessionProperties.customSessionId = resolvedSessionId;
-
+        // With LiveKit, rooms are created on-the-fly when the first participant connects.
+        // We only need to ensure the domain session exists in our repository.
         const storedSession = await sessionRepository.findById(resolvedSessionId);
-        const existingSession = await getCachedOrRemoteOpenViduSession(sessionProperties.customSessionId);
-
-        if (existingSession) {
-            if (!storedSession) {
-                logger.error(
-                    { sessionId: existingSession.sessionId },
-                    'Refusing to recreate missing root session aggregate for an existing OpenVidu session'
-                );
-                throw createHttpError(
-                    500,
-                    `Root session aggregate for ${existingSession.sessionId} is missing while the OpenVidu session is still active`
-                );
-            }
-
-            storedSession.updateFeatureFlags(normalizedRoomConfiguration);
-            await sessionRepository.save(storedSession);
-
-            logger.info({ sessionId: existingSession.sessionId }, 'Returning existing session');
-            const authSession = createAccessSession(req.auth.role, existingSession.sessionId);
-            issueBootstrapCookies(res, authSession);
-            if (req.auth.role === Role.HOST) {
-                ownedRooms.add(existingSession.sessionId);
-                issueOwnedRoomsCookie(res, ownedRooms);
-            }
-            return res.json({
-                sessionId: existingSession.sessionId,
-                roomConfiguration: storedSession.getFeatureFlags(),
-            });
-        }
-
-        const session = await withOpenViduRetry(
-            'openvidu.createSession',
-            () => openvidu.createSession(sessionProperties)
-        );
-        
-        activeSessions.set(session.sessionId, session);
 
         if (storedSession) {
             storedSession.updateFeatureFlags(normalizedRoomConfiguration);
             await sessionRepository.save(storedSession);
 
-            logger.info(
-                {
-                    sessionId: session.sessionId,
-                    snapshot: summarizeStoredSessionForLogs(storedSession),
-                },
-                'Recreated main OpenVidu session while preserving root aggregate'
-            );
-            const authSession = createAccessSession(req.auth.role, session.sessionId);
+            logger.info({ sessionId: resolvedSessionId }, 'Returning existing session');
+            const authSession = createAccessSession(req.auth.role, resolvedSessionId);
             issueBootstrapCookies(res, authSession);
             if (req.auth.role === Role.HOST) {
-                ownedRooms.add(session.sessionId);
+                ownedRooms.add(resolvedSessionId);
                 issueOwnedRoomsCookie(res, ownedRooms);
             }
             return res.json({
-                sessionId: session.sessionId,
+                sessionId: resolvedSessionId,
                 roomConfiguration: storedSession.getFeatureFlags(),
             });
         }
 
-        const domainSession = DomainSession.create(session.sessionId, normalizedRoomConfiguration);
+        const domainSession = DomainSession.create(resolvedSessionId, normalizedRoomConfiguration);
         await sessionRepository.save(domainSession);
         
-        logger.info({ sessionId: session.sessionId }, 'Created new session');
-        const authSession = createAccessSession(req.auth.role, session.sessionId);
+        logger.info({ sessionId: resolvedSessionId }, 'Created new session');
+        const authSession = createAccessSession(req.auth.role, resolvedSessionId);
         issueBootstrapCookies(res, authSession);
         if (req.auth.role === Role.HOST) {
-            ownedRooms.add(session.sessionId);
+            ownedRooms.add(resolvedSessionId);
             issueOwnedRoomsCookie(res, ownedRooms);
         }
         res.json({
-            sessionId: session.sessionId,
+            sessionId: resolvedSessionId,
             roomConfiguration: domainSession.getFeatureFlags(),
         });
 
     } catch (error) {
-        if (error.message && error.message.includes('409')) {
-            const sessionId =
-                req.body.sessionId ||
-                req.body.sessionProperties?.customSessionId ||
-                req.auth.roomId;
-
-            const existingStoredSession = await sessionRepository.findById(sessionId);
-            if (!existingStoredSession) {
-                logger.error(
-                    { sessionId },
-                    'Refusing to recreate missing root session aggregate after OpenVidu reported an existing session'
-                );
-                return res.status(500).json({
-                    error: 'Root session aggregate missing',
-                    details: `Root session aggregate for ${sessionId} is missing while the OpenVidu session already exists`,
-                });
-            }
-
-            existingStoredSession.updateFeatureFlags(normalizedRoomConfiguration);
-            await sessionRepository.save(existingStoredSession);
-            logger.info({ sessionId }, 'Session already exists on server');
-            const authSession = createAccessSession(req.auth.role, sessionId);
-            issueBootstrapCookies(res, authSession);
-            if (req.auth.role === Role.HOST) {
-                ownedRooms.add(sessionId);
-                issueOwnedRoomsCookie(res, ownedRooms);
-            }
-            return res.json({
-                sessionId,
-                roomConfiguration: existingStoredSession.getFeatureFlags(),
-            });
-        }
-        
         logger.error({ err: error }, 'Failed to create session');
-        return sendOpenViduError(res, error, 'Failed to create session');
+        return sendServiceError(res, error, 'Failed to create session');
     }
 });
 
@@ -2682,13 +2597,12 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
  * POST /api/sessions/:sessionId/connections
  * Generates a connection token for a participant to join the session
  * 
- * Params: sessionId - The OpenVidu session ID
+ * Params: sessionId - The room/session ID
  * Body: { 
  *   nickname?: string,           // Display name for the participant
- *   preferredLanguage?: string,  // e.g., 'en', 'es', 'fr' - for future AI dubbing
- *   connectionProperties?: object 
+ *   preferredLanguage?: string,  // e.g., 'en', 'es', 'fr' - for AI dubbing
  * }
- * Response: { token: string }
+ * Response: { token: string, livekitUrl: string }
  */
 app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JOIN_SESSION), async (req, res) => {
     try {
@@ -2778,10 +2692,10 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
         }
 
         const roomTarget = getRoomTargetForParticipant(storedSession, currentParticipantId);
-        const targetOpenViduSessionId = roomTarget.openviduSessionId || sessionId;
+        const targetRoomName = roomTarget.livekitRoomName || sessionId;
 
-        // Build connection data - this will be available to all participants
-        const connectionData = JSON.stringify({
+        // Build participant metadata - embedded in the LiveKit token
+        const participantMetadata = {
             nickname: nickname || `User_${Date.now()}`,
             preferredLanguage: preferredLanguage || 'en',
             role: req.auth.role,
@@ -2792,274 +2706,100 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
             rootParticipantId: stableParticipantId,
             isScreenShare: Boolean(isAuxiliaryMedia && auxiliaryMediaKind === 'screen-share'),
             auxiliaryMediaKind: isAuxiliaryMedia ? auxiliaryMediaKind || 'auxiliary' : null,
-        });
-
-        const finalConnectionProperties = {
-            data: connectionData,
-            ...connectionProperties
         };
 
-        const createConnectionInTargetRoom = async () => {
-            const session = await ensureOpenViduSessionExists(targetOpenViduSessionId);
-            if (!session) {
-                return { session: null, connection: null };
-            }
+        // Use stableParticipantId as the LiveKit identity for the participant
+        const participantIdentity = isAuxiliaryMedia
+            ? `${stableParticipantId || currentParticipantId}__${auxiliaryMediaKind || 'aux'}`
+            : stableParticipantId;
 
-            const connection = await withOpenViduRetry(
-                'openvidu.createConnection',
-                () => session.createConnection(finalConnectionProperties)
+        // Disconnect previous connection for the same identity if reconnecting
+        if (!isAuxiliaryMedia && currentParticipantId) {
+            const previousMediaConnectionId = storedSession.getParticipantMediaConnection(
+                new ParticipantId(currentParticipantId)
             );
-            return { session, connection };
-        };
-
-        try {
-            const { session, connection } = await createConnectionInTargetRoom();
-            if (!session || !connection) {
-                return res.status(404).json({
-                    error: 'Session not found',
-                    details: `Session ${targetOpenViduSessionId} does not exist`,
-                });
+            if (previousMediaConnectionId) {
+                await removeLivekitParticipant(targetRoomName, previousMediaConnectionId);
             }
-
-            const mediaConnectionId = connection.connectionId;
-            const participantProfile = {
-                nickname: nickname || `User_${Date.now()}`,
-                preferredLanguage: preferredLanguage || 'en',
-            };
-
-            if (isAuxiliaryMedia) {
-                logger.info(
-                    {
-                        sessionId,
-                        targetOpenViduSessionId,
-                        connectionId: mediaConnectionId,
-                        rootParticipantId: currentParticipantId,
-                        auxiliaryMediaKind: auxiliaryMediaKind || 'auxiliary',
-                        roomType: roomTarget.type,
-                        breakoutRoomId: roomTarget.breakoutRoomId ?? null,
-                    },
-                    'Generated auxiliary media connection token'
-                );
-            } else if (currentParticipantId) {
-                const previousMediaConnectionId = storedSession.getParticipantMediaConnection(
-                    new ParticipantId(currentParticipantId)
-                );
-                const previousConnection =
-                    session.connections.find((candidate) => candidate.connectionId === previousMediaConnectionId) ||
-                    session.activeConnections.find((candidate) => candidate.connectionId === previousMediaConnectionId);
-
-                if (previousConnection) {
-                    try {
-                        await withOpenViduRetry(
-                            'openvidu.forceDisconnectPreviousParticipant',
-                            () => session.forceDisconnect(previousConnection)
-                        );
-                    } catch (disconnectError) {
-                        logger.warn(
-                            {
-                                err: disconnectError,
-                                sessionId,
-                                targetOpenViduSessionId,
-                                previousParticipantId: currentParticipantId,
-                            },
-                            'Failed to disconnect previous participant connection before replacement'
-                        );
-                    }
-                }
-
-                const participantRef = new ParticipantId(currentParticipantId);
-                storedSession.markParticipantConnected(participantRef);
-                storedSession.setParticipantProfile(participantRef, participantProfile);
-                storedSession.setParticipantRole(participantRef, req.auth.role);
-                storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
-                if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
-                    storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
-                } else {
-                    storedSession.returnParticipantToMain(participantRef);
-                }
-            } else {
-                const participantRef = new ParticipantId(stableParticipantId);
-                storedSession.addParticipant(participantRef);
-                storedSession.setParticipantRole(participantRef, req.auth.role);
-                storedSession.setParticipantProfile(participantRef, participantProfile);
-                storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
-                if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
-                    storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
-                }
-            }
-
-            if (!isAuxiliaryMedia) {
-                await sessionRepository.save(storedSession);
-            }
-            
-            logger.info(
-                {
-                    sessionId,
-                    targetOpenViduSessionId,
-                    stableParticipantId,
-                    currentParticipantId,
-                    mediaConnectionId,
-                    roomTarget,
-                    isAuxiliaryMedia: Boolean(isAuxiliaryMedia),
-                    snapshot: !isAuxiliaryMedia ? summarizeStoredSessionForLogs(storedSession) : undefined,
-                },
-                'Created room connection'
-            );
-            logger.info(
-                {
-                    sessionId,
-                    targetOpenViduSessionId,
-                    nickname,
-                    previousParticipantId: currentParticipantId,
-                    connectionId: mediaConnectionId,
-                    rootParticipantId: stableParticipantId,
-                    roomType: roomTarget.type,
-                    breakoutRoomId: roomTarget.breakoutRoomId ?? null,
-                },
-                'Generated connection token'
-            );
-            const authSession = createAccessSession(req.auth.role, sessionId);
-            issueBootstrapCookies(res, authSession);
-            if (!isAuxiliaryMedia) {
-                broadcastBreakoutSnapshot(sessionId, storedSession);
-            }
-            
-            return res.json({ 
-                token: connection.token,
-                connectionId: mediaConnectionId,
-                roomTarget: roomTarget,
-                rootParticipantId: stableParticipantId,
-            });
-        } catch (connectionError) {
-            if (connectionError.message && connectionError.message.includes('404')) {
-                logger.warn(
-                    { sessionId, targetOpenViduSessionId, roomTarget },
-                    'Target room cache was stale before connection creation'
-                );
-                activeSessions.delete(targetOpenViduSessionId);
-
-                try {
-                    if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
-                        const refreshedOpenViduSessionId =
-                            getBreakoutOpenViduSessionId(sessionId, roomTarget.breakoutRoomId);
-                        await ensureOpenViduSessionExists(refreshedOpenViduSessionId);
-                        storedSession.openBreakoutRoom(
-                            roomTarget.breakoutRoomId,
-                            refreshedOpenViduSessionId,
-                            new Date().toISOString()
-                        );
-                        await sessionRepository.save(storedSession);
-                    } else {
-                        await ensureOpenViduSessionExists(targetOpenViduSessionId);
-                    }
-
-                    const recreated = await createConnectionInTargetRoom();
-                    if (!recreated.session || !recreated.connection) {
-                        return res.status(404).json({
-                            error: 'Session not found',
-                            details: `Target room ${targetOpenViduSessionId} is no longer active`,
-                        });
-                    }
-
-                    const connection = recreated.connection;
-                    const mediaConnectionId = connection.connectionId;
-                    const participantProfile = {
-                        nickname: nickname || `User_${Date.now()}`,
-                        preferredLanguage: preferredLanguage || 'en',
-                    };
-
-                    if (isAuxiliaryMedia) {
-                        logger.info(
-                            {
-                                sessionId,
-                                targetOpenViduSessionId,
-                                connectionId: mediaConnectionId,
-                                rootParticipantId: currentParticipantId,
-                                auxiliaryMediaKind: auxiliaryMediaKind || 'auxiliary',
-                                roomType: roomTarget.type,
-                                breakoutRoomId: roomTarget.breakoutRoomId ?? null,
-                            },
-                            'Generated auxiliary media connection token after breakout session recovery'
-                        );
-                    } else if (currentParticipantId) {
-                        const participantRef = new ParticipantId(currentParticipantId);
-                        storedSession.markParticipantConnected(participantRef);
-                        storedSession.setParticipantProfile(participantRef, participantProfile);
-                        storedSession.setParticipantRole(participantRef, req.auth.role);
-                        storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
-                        if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
-                            storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
-                        } else {
-                            storedSession.returnParticipantToMain(participantRef);
-                        }
-                    } else {
-                        const participantRef = new ParticipantId(stableParticipantId);
-                        storedSession.addParticipant(participantRef);
-                        storedSession.setParticipantRole(participantRef, req.auth.role);
-                        storedSession.setParticipantProfile(participantRef, participantProfile);
-                        storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
-                        if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
-                            storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
-                        }
-                    }
-
-                    if (!isAuxiliaryMedia) {
-                        await sessionRepository.save(storedSession);
-                        broadcastBreakoutSnapshot(sessionId, storedSession);
-                    }
-
-                    const authSession = createAccessSession(req.auth.role, sessionId);
-                    issueBootstrapCookies(res, authSession);
-                    return res.json({
-                        token: connection.token,
-                        connectionId: mediaConnectionId,
-                        roomTarget,
-                        rootParticipantId: stableParticipantId,
-                    });
-                } catch (recoveryError) {
-                    if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
-                        const breakoutRoom = storedSession.getBreakoutRoom(roomTarget.breakoutRoomId);
-                        if (breakoutRoom && breakoutRoom.status === BreakoutRoomStatus.OPEN) {
-                            const movedParticipantIds = [...(breakoutRoom.participantIds || [])];
-                            storedSession.closeBreakoutRoom(roomTarget.breakoutRoomId, new Date().toISOString());
-                            await sessionRepository.save(storedSession);
-                            logger.warn(
-                                {
-                                    sessionId,
-                                    breakoutRoomId: roomTarget.breakoutRoomId,
-                                    targetOpenViduSessionId,
-                                    movedParticipantIds,
-                                    snapshot: summarizeStoredSessionForLogs(storedSession),
-                                },
-                                'Closed breakout room after unrecoverable target room failure'
-                            );
-                            broadcastBreakoutSnapshot(sessionId, storedSession);
-                            movedParticipantIds.forEach((participantId) => {
-                                broadcastRoomTransferRequested(
-                                    sessionId,
-                                    storedSession,
-                                    participantId,
-                                    getRoomTargetForParticipant(storedSession, participantId)
-                                );
-                            });
-                        }
-                    }
-                    logger.warn(
-                        { err: recoveryError, sessionId, targetOpenViduSessionId, roomTarget },
-                        'Target room recovery failed before connection creation'
-                    );
-                    return res.status(404).json({
-                        error: 'Session not found',
-                        details: `Target room ${targetOpenViduSessionId} is no longer active`,
-                    });
-                }
-            }
-            throw connectionError;
         }
+
+        // Generate LiveKit access token
+        const token = await generateLivekitToken(targetRoomName, participantIdentity, participantMetadata);
+        const mediaConnectionId = participantIdentity;
+
+        const participantProfile = {
+            nickname: nickname || `User_${Date.now()}`,
+            preferredLanguage: preferredLanguage || 'en',
+        };
+
+        if (isAuxiliaryMedia) {
+            logger.info(
+                {
+                    sessionId,
+                    targetRoomName,
+                    participantIdentity,
+                    rootParticipantId: currentParticipantId,
+                    auxiliaryMediaKind: auxiliaryMediaKind || 'auxiliary',
+                },
+                'Generated auxiliary media token'
+            );
+        } else if (currentParticipantId) {
+            const participantRef = new ParticipantId(currentParticipantId);
+            storedSession.markParticipantConnected(participantRef);
+            storedSession.setParticipantProfile(participantRef, participantProfile);
+            storedSession.setParticipantRole(participantRef, req.auth.role);
+            storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
+            if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
+                storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
+            } else {
+                storedSession.returnParticipantToMain(participantRef);
+            }
+        } else {
+            const participantRef = new ParticipantId(stableParticipantId);
+            storedSession.addParticipant(participantRef);
+            storedSession.setParticipantRole(participantRef, req.auth.role);
+            storedSession.setParticipantProfile(participantRef, participantProfile);
+            storedSession.setParticipantMediaConnection(participantRef, mediaConnectionId);
+            if (roomTarget.type === 'breakout' && roomTarget.breakoutRoomId) {
+                storedSession.assignParticipantToBreakout(participantRef, roomTarget.breakoutRoomId);
+            }
+        }
+
+        if (!isAuxiliaryMedia) {
+            await sessionRepository.save(storedSession);
+        }
+
+        logger.info(
+            {
+                sessionId,
+                targetRoomName,
+                stableParticipantId,
+                currentParticipantId,
+                mediaConnectionId,
+                roomTarget,
+                isAuxiliaryMedia: Boolean(isAuxiliaryMedia),
+                snapshot: !isAuxiliaryMedia ? summarizeStoredSessionForLogs(storedSession) : undefined,
+            },
+            'Created room connection'
+        );
+
+        const authSession = createAccessSession(req.auth.role, sessionId);
+        issueBootstrapCookies(res, authSession);
+        if (!isAuxiliaryMedia) {
+            broadcastBreakoutSnapshot(sessionId, storedSession);
+        }
+
+        return res.json({
+            token,
+            connectionId: mediaConnectionId,
+            livekitUrl: config.livekit.url,
+            roomTarget,
+            rootParticipantId: stableParticipantId,
+        });
 
     } catch (error) {
         logger.error({ err: error }, 'Failed to generate connection token');
-        return sendOpenViduError(res, error, 'Failed to generate connection token');
+        return sendServiceError(res, error, 'Failed to generate connection token');
     }
 });
 
@@ -3140,36 +2880,10 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
         }
         
         const storedSession = await getConsistentStoredSession(sessionId);
-
-        const session = await fetchOpenViduSessionById(sessionId);
-        
-        if (!session) {
-            activeSessions.delete(sessionId);
-            return res.json({
-                sessionId,
-                createdAt: null,
-                revision: storedSession.getRevision(),
-                roomConfiguration: storedSession.getFeatureFlags(),
-                persistedParticipants: storedSession.getParticipantIds(),
-                waitingRoomRequests: storedSession.getPendingWaitingRoomRequests(),
-                participantProfiles: storedSession.getParticipantProfiles(),
-                participantLocations: storedSession.getParticipantLocations(),
-                participantRoles: storedSession.getParticipantRoles(),
-                participantPermissions: storedSession.getAllParticipantPermissions(),
-                participantPresence: storedSession.getParticipantPresenceMap(),
-                participantMediaConnections: storedSession.getParticipantMediaConnections(),
-                breakoutRooms: storedSession.getBreakoutRooms(),
-                whiteboardState: storedSession.getWhiteboardStateSnapshot(),
-                connections: [],
-                openviduActive: false,
-            });
-        }
-
-        activeSessions.set(sessionId, session);
+        const roomActive = await livekitRoomExists(sessionId);
 
         res.json({
-            sessionId: session.sessionId,
-            createdAt: session.createdAt,
+            sessionId,
             revision: storedSession.getRevision(),
             roomConfiguration: storedSession.getFeatureFlags(),
             persistedParticipants: storedSession.getParticipantIds(),
@@ -3182,17 +2896,12 @@ app.get('/api/sessions/:sessionId', requirePermission(Permission.JOIN_SESSION), 
             participantMediaConnections: storedSession.getParticipantMediaConnections(),
             breakoutRooms: storedSession.getBreakoutRooms(),
             whiteboardState: storedSession.getWhiteboardStateSnapshot(),
-            openviduActive: true,
-            connections: session.activeConnections.map(conn => ({
-                connectionId: conn.connectionId,
-                data: conn.data,
-                createdAt: conn.createdAt
-            }))
+            livekitRoomActive: roomActive,
         });
 
     } catch (error) {
         logger.error({ err: error }, 'Failed to fetch session info');
-        return sendOpenViduError(res, error, 'Failed to fetch session info');
+        return sendServiceError(res, error, 'Failed to fetch session info');
     }
 });
 
@@ -3646,7 +3355,7 @@ const server = app.listen(config.port, () => {
     logger.info(
         {
             port: config.port,
-            openviduUrl: config.openvidu.url,
+            livekitUrl: config.livekit.url,
             openaiConfigured: Boolean(config.voiceAi.apiKey),
             nodeEnv: process.env.NODE_ENV ?? null,
             frontendDirectory: preferredFrontendDirectory,

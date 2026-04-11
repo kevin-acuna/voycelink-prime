@@ -2,7 +2,7 @@
 /**
  * Main Application Controller
  * 
- * Orchestrates the UI and OpenVidu client
+ * Orchestrates the UI and LiveKit client
  */
 // =============================================================================
 // Button Click Protection (Prevent Multiple Clicks)
@@ -187,7 +187,7 @@ const appState = {
     currentRoomTarget: {
         type: 'main',
         breakoutRoomId: null,
-        openviduSessionId: null,
+        livekitRoomName: null,
         displayName: 'Main room',
     },
     breakoutRooms: [],
@@ -1324,11 +1324,13 @@ async function enforceCurrentPermissions() {
     }
 
     if (!canPublishAudio() && isLocalAudioLive()) {
-        openviduClient.toggleAudio();
+        await livekitClient.toggleAudio();
+        appState.isAudioEnabled = false;
     }
 
     if (!canPublishVideo() && isLocalVideoLive()) {
-        openviduClient.toggleVideo();
+        await livekitClient.toggleVideo();
+        appState.isVideoEnabled = false;
     }
 
     if (!canShareScreen() && appState.isScreenSharing) {
@@ -2610,6 +2612,7 @@ async function getToken(sessionId, nickname, preferredLanguage, options = {}) {
         sessionId: resolvedSessionId,
         token: tokenData.token,
         connectionId: tokenData.connectionId,
+        livekitUrl: tokenData.livekitUrl || '',
         roomTarget: tokenData.roomTarget || appState.currentRoomTarget,
         rootParticipantId: tokenData.rootParticipantId || rootParticipantId || previousParticipantId || null,
     };
@@ -3061,41 +3064,23 @@ function updateMediaAvailabilityUI() {
 }
 
 function localPublisherHasTrack(kind) {
-    if (!openviduClient.publisher || !openviduClient.publisher.stream) {
-        return false;
+    if (kind === 'audio') {
+        return Boolean(livekitClient.localAudioTrack);
     }
-
-    const mediaStream = openviduClient.publisher.stream.getMediaStream();
-    if (!mediaStream) {
-        return false;
-    }
-
-    return kind === 'audio'
-        ? mediaStream.getAudioTracks().length > 0
-        : mediaStream.getVideoTracks().length > 0;
+    return Boolean(livekitClient.localVideoTrack);
 }
 
 function syncPublishedLocalMediaState() {
-    if (!openviduClient.publisher || !openviduClient.publisher.stream) {
-        appState.publishedAudioLive = false;
-        appState.publishedVideoLive = false;
-        return;
-    }
-
-    appState.publishedAudioLive =
-        localPublisherHasTrack('audio') && Boolean(openviduClient.publisher.stream.audioActive);
-    appState.publishedVideoLive =
-        localPublisherHasTrack('video') && Boolean(openviduClient.publisher.stream.videoActive);
+    appState.publishedAudioLive = livekitClient.isMicrophoneEnabled();
+    appState.publishedVideoLive = livekitClient.isCameraEnabled();
 }
 
 function isLocalAudioLive() {
-    syncPublishedLocalMediaState();
-    return appState.publishedAudioLive;
+    return livekitClient.isMicrophoneEnabled();
 }
 
 function isLocalVideoLive() {
-    syncPublishedLocalMediaState();
-    return appState.publishedVideoLive;
+    return livekitClient.isCameraEnabled();
 }
 
 function syncLocalMediaControlUi() {
@@ -3140,13 +3125,22 @@ async function publishLocalStreamWithCurrentPermissions() {
         return false;
     }
 
-    if (openviduClient.publisher && openviduClient.session) {
+    // Unpublish existing tracks before republishing
+    if (livekitClient.localVideoTrack || livekitClient.localAudioTrack) {
         try {
-            openviduClient.session.unpublish(openviduClient.publisher);
+            if (livekitClient.localVideoTrack) {
+                livekitClient.room?.localParticipant?.unpublishTrack(livekitClient.localVideoTrack);
+                livekitClient.localVideoTrack.stop();
+                livekitClient.localVideoTrack = null;
+            }
+            if (livekitClient.localAudioTrack) {
+                livekitClient.room?.localParticipant?.unpublishTrack(livekitClient.localAudioTrack);
+                livekitClient.localAudioTrack.stop();
+                livekitClient.localAudioTrack = null;
+            }
         } catch (error) {
-            console.error('Error unpublishing local stream:', error);
+            console.error('Error unpublishing local tracks:', error);
         }
-        openviduClient.publisher = null;
     }
 
     const publishOptions = {
@@ -3156,13 +3150,11 @@ async function publishLocalStreamWithCurrentPermissions() {
         publishVideo: canPublishLocalVideo
     };
 
-    await openviduClient.publish(elements.localVideo, publishOptions);
+    await livekitClient.publish(elements.localVideo, publishOptions);
 
-    if (openviduClient.publisher && openviduClient.publisher.stream) {
-        const mediaStream = openviduClient.publisher.stream.getMediaStream();
-        if (mediaStream) {
-            setupLocalSpeakingDetection(mediaStream);
-        }
+    if (livekitClient.localAudioTrack) {
+        const mediaStream = new MediaStream([livekitClient.localAudioTrack.mediaStreamTrack]);
+        setupLocalSpeakingDetection(mediaStream);
     }
 
     syncLocalMediaControlUi();
@@ -3244,7 +3236,7 @@ function setupAvatar(wrapper, nickname, avatarElement, initialElement) {
     initialElement.textContent = getInitial(nickname);
 }
 
-function parseOpenViduConnectionData(connection) {
+function parseParticipantMetadata(connection) {
     let connectionData = {};
 
     try {
@@ -3567,17 +3559,16 @@ function initializeLayoutTester() {
 /**
  * Create video element for a remote participant
  */
-function createRemoteVideoElement(subscriberOrConnection) {
-    const isSubscriber =
-        subscriberOrConnection &&
-        typeof subscriberOrConnection.addVideoElement === 'function' &&
-        subscriberOrConnection.stream;
-    const stream = isSubscriber ? subscriberOrConnection.stream : null;
-    const connection = stream?.connection || subscriberOrConnection;
-    const subscriber = isSubscriber ? subscriberOrConnection : null;
-    const connectionId = connection.connectionId;
-    const connectionData = parseOpenViduConnectionData(connection);
-    const nickname = connectionData.nickname;
+function createRemoteVideoElement(participantData) {
+    // Accept either LiveKit participant data or legacy connection object
+    const identity = participantData.identity || participantData.connectionId;
+    const metadata = participantData.metadata || (() => {
+        try { return JSON.parse(participantData.data || '{}'); } catch { return {}; }
+    })();
+    const track = participantData.track || null;
+    const connectionId = identity;
+    const nickname = metadata.nickname || 'Participant';
+    const connectionData = { ...metadata, nickname, preferredLanguage: metadata.preferredLanguage || 'en', role: metadata.role || 'participant' };
 
     const existingWrapper = document.getElementById(`video-${connectionId}`);
     if (existingWrapper) {
@@ -3591,18 +3582,14 @@ function createRemoteVideoElement(subscriberOrConnection) {
         if (languageBadge) {
             languageBadge.textContent = connectionData.preferredLanguage.toUpperCase();
         }
-        if (avatar) {
-            avatar.classList.toggle('visible', !stream || !stream.videoActive);
-        }
-        existingWrapper.classList.toggle('camera-off', !stream || !stream.videoActive);
-        existingWrapper.dataset.role = connectionData.role || 'participant';
+        existingWrapper.dataset.role = connectionData.role;
         existingWrapper.dataset.nickname = nickname;
-        updateVideoRoleTag(existingWrapper, connectionData.role || 'participant');
+        updateVideoRoleTag(existingWrapper, connectionData.role);
 
-        if (subscriber) {
+        if (track && track.kind === 'video') {
             const video = document.getElementById(`video-element-${connectionId}`);
             if (video) {
-                subscriber.addVideoElement(video);
+                track.attach(video);
             }
         }
 
@@ -3670,13 +3657,11 @@ function createRemoteVideoElement(subscriberOrConnection) {
     // Set up avatar with earthy color
     setupAvatar(wrapper, nickname, avatar, avatarCircle);
     
-    // Attach subscriber's stream to video element when available
-    if (subscriber) {
-        subscriber.addVideoElement(video);
-    }
-    
-    // Check if video is enabled and show avatar if not
-    if (!stream || !stream.videoActive) {
+    // Attach track to video element if available
+    if (track && track.kind === 'video') {
+        track.attach(video);
+    } else {
+        // No video track yet - show avatar
         wrapper.classList.add('camera-off');
         avatar.classList.add('visible');
     }
@@ -3718,41 +3703,24 @@ function setActiveScreenShare(connectionId) {
 /**
  * Create video element for a remote screen share
  */
-function createRemoteScreenShareElement(subscriber, options = {}) {
-    const stream = subscriber.stream;
-    const connectionId = stream.connection.connectionId;
+function createRemoteScreenShareElement(screenData, options = {}) {
+    const connectionId = screenData.identity;
+    const track = screenData.track || null;
     const shouldMutePlayback = Boolean(options.muteAudio);
     
-    // Parse connection data for nickname
-    // OpenVidu concatenates client and server data with '%/%' separator
-    let connectionData = {};
-    try {
-        const rawData = stream.connection.data;
-        // Handle OpenVidu's '%/%' separator format
-        const dataParts = rawData.split('%/%');
-        // Try to parse each part and merge
-        for (const part of dataParts) {
-            try {
-                const parsed = JSON.parse(part);
-                connectionData = { ...connectionData, ...parsed };
-            } catch (e) {}
-        }
-    } catch (e) {
-        connectionData = { nickname: 'Unknown' };
-    }
-    
-    // Extract nickname - remove "(Screen)" suffix if present since we add it in the label
-    let nickname = connectionData.nickname || 'Participant';
+    // Get nickname from participant metadata
+    const metadata = livekitClient.getParticipantMetadata(connectionId);
+    let nickname = metadata.nickname || 'Participant';
     nickname = nickname.replace(/\s*\(Screen\)\s*$/, '');
     
     const existingWrapper = document.getElementById(`screen-share-${connectionId}`);
     if (existingWrapper) {
         const video = existingWrapper.querySelector('video');
-        if (video) {
+        if (video && track) {
             video.muted = shouldMutePlayback;
             video.defaultMuted = shouldMutePlayback;
             video.volume = shouldMutePlayback ? 0 : 1;
-            subscriber.addVideoElement(video);
+            track.attach(video);
         }
         setActiveScreenShare(connectionId);
         return existingWrapper;
@@ -3793,8 +3761,10 @@ function createRemoteScreenShareElement(subscriber, options = {}) {
     // Insert at the beginning of the grid
     elements.videoGrid.insertBefore(wrapper, elements.videoGrid.firstChild);
     
-    // Attach subscriber's stream to video element
-    subscriber.addVideoElement(video);
+    // Attach track to video element
+    if (track) {
+        track.attach(video);
+    }
     
     setActiveScreenShare(connectionId);
     
@@ -3827,7 +3797,7 @@ function removeRemoteScreenShareElement(connectionId) {
  * Update debug panel with audio track information
  */
 function updateAudioTracksDebug() {
-    const tracks = openviduClient.getRemoteAudioTracks();
+    const tracks = livekitClient.getRemoteAudioTracks();
     elements.audioTracksList.innerHTML = '';
     
     if (tracks.size === 0) {
@@ -4053,7 +4023,7 @@ function updateInterpreterButtonState() {
         return;
     }
 
-    const remoteParticipants = openviduClient.subscribers.size;
+    const remoteParticipants = livekitClient.subscribers.size;
     const hasRemoteParticipant = remoteParticipants > 0;
     elements.toggleInterpreterBtn.disabled = !hasRemoteParticipant;
     
@@ -4066,15 +4036,15 @@ function updateInterpreterButtonState() {
  * Get all remote participants' info
  */
 function getAllRemoteParticipants() {
-    const subscribers = openviduClient.subscribers;
+    const subscribers = livekitClient.subscribers;
     if (subscribers.size === 0) return [];
     
     const participants = [];
     
-    for (const [connectionId, subscriber] of subscribers) {
+    for (const [connectionId, participant] of subscribers) {
         let connectionData = {};
         try {
-            connectionData = JSON.parse(subscriber.stream.connection.data);
+            connectionData = JSON.parse(participant.metadata || '{}');
         } catch (e) {
             connectionData = { preferredLanguage: 'en' };
         }
@@ -4082,12 +4052,12 @@ function getAllRemoteParticipants() {
         // Skip screen share connections
         if (connectionData.isScreenShare) continue;
         
-        const audioTrack = openviduClient.getAudioTrackForParticipant(connectionId);
+        const audioTrack = livekitClient.getAudioTrackForParticipant(connectionId);
         const videoElement = document.getElementById(`video-element-${connectionId}`);
         
         participants.push({
             connectionId,
-            subscriber,
+            subscriber: participant,
             language: connectionData.preferredLanguage || 'en',
             nickname: connectionData.nickname,
             audioTrack,
@@ -4102,22 +4072,22 @@ function getAllRemoteParticipants() {
  * Get a specific remote participant's info
  */
 function getRemoteParticipantInfo(connectionId) {
-    const subscriber = openviduClient.subscribers.get(connectionId);
-    if (!subscriber) return null;
+    const participant = livekitClient.subscribers.get(connectionId);
+    if (!participant) return null;
     
     let connectionData = {};
     try {
-        connectionData = JSON.parse(subscriber.stream.connection.data);
+        connectionData = JSON.parse(participant.metadata || '{}');
     } catch (e) {
         connectionData = { preferredLanguage: 'en' };
     }
     
-    const audioTrack = openviduClient.getAudioTrackForParticipant(connectionId);
+    const audioTrack = livekitClient.getAudioTrackForParticipant(connectionId);
     const videoElement = document.getElementById(`video-element-${connectionId}`);
     
     return {
         connectionId,
-        subscriber,
+        subscriber: participant,
         language: connectionData.preferredLanguage || 'en',
         nickname: connectionData.nickname,
         audioTrack,
@@ -4211,7 +4181,7 @@ function updateTranscriptionButtonState() {
         return;
     }
 
-    const remoteParticipants = openviduClient.subscribers.size;
+    const remoteParticipants = livekitClient.subscribers.size;
     const hasRemoteParticipant = remoteParticipants > 0;
     elements.toggleTranscriptionBtn.disabled = !hasRemoteParticipant;
 }
@@ -5033,7 +5003,7 @@ function renderParticipantsList() {
  * Request a participant to mute their microphone
  */
 function requestMuteParticipant(connectionId) {
-    if (!openviduClient.session) return;
+    if (!livekitClient.room) return;
     if (!connectionId) return;
     if (!canManageParticipantMedia()) {
         showNotification('You do not have permission to manage participant media.', 'error');
@@ -5047,18 +5017,10 @@ function requestMuteParticipant(connectionId) {
         return;
     }
     
-    // Send signal to request mute
-    openviduClient.session.signal({
-        data: JSON.stringify({ 
-            fromNickname: appState.nickname 
-        }),
-        to: [openviduClient.session.remoteConnections.get(connectionId)],
-        type: 'requestMute'
-    }).then(() => {
-        logEvent('info', `Sent mute request to ${participant.nickname}`);
-    }).catch(err => {
-        console.error('Error sending mute request:', err);
-    });
+    // Send data message to request mute
+    livekitClient.sendData('requestMute', { fromNickname: appState.nickname }, [connectionId])
+        .then(() => logEvent('info', `Sent mute request to ${participant.nickname}`))
+        .catch(err => console.error('Error sending mute request:', err));
 }
 
 /**
@@ -5107,7 +5069,7 @@ async function kickParticipant(connectionId) {
 /**
  * Handle incoming mute request signal
  */
-function handleMuteRequest(event) {
+async function handleMuteRequest(event) {
     try {
         const data = JSON.parse(event.data);
         const senderParticipant = getParticipantForModeration(event?.from?.connectionId);
@@ -5126,11 +5088,10 @@ function handleMuteRequest(event) {
         const message = `${data.fromNickname} has requested you to mute your microphone`;
         
         // Auto-mute the user
-        if (appState.isAudioEnabled) {
-            appState.isAudioEnabled = openviduClient.toggleAudio();
-            elements.toggleAudioBtn.classList.add('muted');
-            elements.toggleAudioBtn.innerHTML = '<i data-lucide="mic-off"></i>';
-            lucide.createIcons();
+        if (isLocalAudioLive()) {
+            await livekitClient.toggleAudio();
+            appState.isAudioEnabled = false;
+            syncLocalMediaControlUi();
         }
         
         // Show a brief notification
@@ -5272,8 +5233,8 @@ function sendReaction(reaction) {
         return;
     }
 
-    if (!openviduClient.session) {
-        console.error('[Reactions] No session available');
+    if (!livekitClient.room) {
+        console.error('[Reactions] No room available');
         return;
     }
     
@@ -5288,12 +5249,9 @@ function sendReaction(reaction) {
     
     console.log('[Reactions] Sending reaction:', signalData);
     
-    openviduClient.session.signal({
-        data: JSON.stringify(signalData),
-        type: 'reaction'
-    }).then(() => {
-        console.log('[Reactions] Signal sent successfully');
-    }).catch(err => console.error('[Reactions] Error sending reaction:', err));
+    livekitClient.sendData('reaction', signalData)
+        .then(() => console.log('[Reactions] Signal sent successfully'))
+        .catch(err => console.error('[Reactions] Error sending reaction:', err));
     
     logEvent('info', `Sent reaction: ${reaction}`);
 }
@@ -5322,29 +5280,12 @@ function showReactionOnVideo(wrapperId, reaction) {
 }
 
 /**
- * Initialize reaction signal handlers
+ * Handle received reaction (called from onDataReceived)
  */
-function initializeReactionSignals(session) {
-    session.on('signal:reaction', (event) => {
-        // Skip if it's our own signal
-        if (event.from.connectionId === openviduClient.session.connection.connectionId) return;
-        
-        try {
-            const data = JSON.parse(event.data);
-            const connectionId = event.from.connectionId;
-            
-            console.log('[Reactions] Received reaction from', connectionId, ':', data.reaction);
-            
-            // Show reaction on the sender's video
-            showReactionOnVideo(`video-${connectionId}`, data.reaction);
-            
-            logEvent('info', `${data.senderName} reacted: ${data.reaction}`);
-        } catch (err) {
-            console.error('[Reactions] Error processing reaction:', err);
-        }
-    });
-    
-    console.log('[Reactions] Signal handlers initialized');
+function handleReceivedReaction(data, senderIdentity) {
+    console.log('[Reactions] Received reaction from', senderIdentity, ':', data.reaction);
+    showReactionOnVideo(`video-${senderIdentity}`, data.reaction);
+    logEvent('info', `${data.senderName} reacted: ${data.reaction}`);
 }
 
 // =============================================================================
@@ -5352,47 +5293,34 @@ function initializeReactionSignals(session) {
 // =============================================================================
 
 /**
- * Initialize interpreter signal handlers
+ * Handle interpreter active signal (called from onDataReceived)
  */
-function initializeInterpreterSignals(session) {
-    // Listen for interpreter active state changes from other users
-    session.on('signal:interpreter-active', (event) => {
-        if (event.from.connectionId === openviduClient.session.connection.connectionId) return;
-        
-        const data = JSON.parse(event.data);
-        const connectionId = event.from.connectionId;
-        updateRemoteInterpreterAvatar(connectionId, 'active', data.active);
-    });
-    
-    // Listen for AI speaking state changes from other users
-    session.on('signal:ai-speaking', (event) => {
-        if (event.from.connectionId === openviduClient.session.connection.connectionId) return;
-        
-        const data = JSON.parse(event.data);
-        const connectionId = event.from.connectionId;
-        updateRemoteInterpreterAvatar(connectionId, 'speaking', data.speaking);
-    });
-    
-    // Listen for AI listening state changes from other users
-    session.on('signal:ai-listening', (event) => {
-        if (event.from.connectionId === openviduClient.session.connection.connectionId) return;
-        
-        const data = JSON.parse(event.data);
-        const connectionId = event.from.connectionId;
-        updateRemoteInterpreterAvatar(connectionId, 'listening', data.listening);
-    });
+function handleInterpreterActiveSignal(data, senderIdentity) {
+    updateRemoteInterpreterAvatar(senderIdentity, 'active', data.active);
+}
+
+/**
+ * Handle AI speaking signal (called from onDataReceived)
+ */
+function handleAiSpeakingSignal(data, senderIdentity) {
+    updateRemoteInterpreterAvatar(senderIdentity, 'speaking', data.speaking);
+}
+
+/**
+ * Handle AI listening signal (called from onDataReceived)
+ */
+function handleAiListeningSignal(data, senderIdentity) {
+    updateRemoteInterpreterAvatar(senderIdentity, 'listening', data.listening);
 }
 
 /**
  * Send interpreter active state signal to all participants
  */
 function sendInterpreterActiveSignal(active) {
-    if (!openviduClient.session) return;
+    if (!livekitClient.room) return;
     
-    openviduClient.session.signal({
-        data: JSON.stringify({ active }),
-        type: 'interpreter-active'
-    }).catch(err => console.error('Error sending interpreter signal:', err));
+    livekitClient.sendData('interpreter-active', { active })
+        .catch(err => console.error('Error sending interpreter signal:', err));
     
     // Update local AI avatar
     updateLocalInterpreterAvatar('active', active);
@@ -5402,12 +5330,10 @@ function sendInterpreterActiveSignal(active) {
  * Send AI speaking state signal to all participants
  */
 function sendAiSpeakingSignal(speaking) {
-    if (!openviduClient.session) return;
+    if (!livekitClient.room) return;
     
-    openviduClient.session.signal({
-        data: JSON.stringify({ speaking }),
-        type: 'ai-speaking'
-    }).catch(err => console.error('Error sending AI speaking signal:', err));
+    livekitClient.sendData('ai-speaking', { speaking })
+        .catch(err => console.error('Error sending AI speaking signal:', err));
     
     // Update local AI avatar speaking state
     updateLocalInterpreterAvatar('speaking', speaking);
@@ -5417,12 +5343,10 @@ function sendAiSpeakingSignal(speaking) {
  * Send AI listening state signal to all participants
  */
 function sendAiListeningSignal(listening) {
-    if (!openviduClient.session) return;
+    if (!livekitClient.room) return;
     
-    openviduClient.session.signal({
-        data: JSON.stringify({ listening }),
-        type: 'ai-listening'
-    }).catch(err => console.error('Error sending AI listening signal:', err));
+    livekitClient.sendData('ai-listening', { listening })
+        .catch(err => console.error('Error sending AI listening signal:', err));
     
     // Update local AI avatar listening state
     updateLocalInterpreterAvatar('listening', listening);
@@ -5527,218 +5451,245 @@ function updateRemoteInterpreterAvatar(connectionId, stateType, value) {
 }
 
 // =============================================================================
-// OpenVidu Event Handlers
+// LiveKit Event Handlers
 // =============================================================================
 
-function setupOpenViduCallbacks() {
-    openviduClient.onStreamCreated = (event, subscriber) => {
-        const stream = event.stream;
-        const connectionId = stream.connection.connectionId;
-        const connectionData = parseOpenViduConnectionData(stream.connection);
+function setupLiveKitCallbacks() {
+    // Track subscribed - a remote participant's track is ready to use
+    livekitClient.onTrackSubscribed = (track, publication, participant) => {
+        const identity = participant.identity;
+        const metadata = livekitClient.getParticipantMetadata(identity);
         
-        // Detailed logging for debugging
-        logEvent('info', `=== Stream Created Event ===`);
-        logEvent('info', `Connection ID: ${connectionId}`);
-        logEvent('info', `Stream typeOfVideo: ${stream.typeOfVideo}`);
+        logEvent('info', `Track subscribed: ${track.kind} from ${identity}`);
         
-        // Check if this is a screen share stream
-        const isScreenShare = stream.typeOfVideo === 'SCREEN';
-        logEvent('info', `Is Screen Share: ${isScreenShare}`);
+        const isScreenShare = track.source === 'screen_share' || track.source === 'screen_share_audio';
         
-        if (isScreenShare) {
-            if (!doesConnectionBelongToCurrentRoom(connectionData)) {
-                logEvent('info', `Ignoring screen share from ${connectionId} outside current room`);
+        if (isScreenShare && track.kind === 'video') {
+            if (!doesConnectionBelongToCurrentRoom(metadata)) {
+                logEvent('info', `Ignoring screen share from ${identity} outside current room`);
                 return;
             }
-            const isOwnScreenShare = isOwnScreenShareConnection(connectionId, connectionData);
-            if (isOwnScreenShare && typeof subscriber.subscribeToAudio === 'function') {
-                subscriber.subscribeToAudio(false);
-                logEvent('info', `Muted local playback for own screen share ${connectionId}`);
+            const isOwnScreenShare = isOwnScreenShareConnection(identity, metadata);
+            // Create screen share video element
+            const videoEl = track.attach();
+            createRemoteScreenShareElement({ identity, track, videoElement: videoEl }, { muteAudio: isOwnScreenShare });
+            logEvent('info', `Screen share displayed from ${identity}`);
+        } else if (track.kind === 'video') {
+            if (metadata.isScreenShare) return;
+            
+            // Regular camera track - attach to existing video element or create one
+            const videoElement = document.getElementById(`video-element-${identity}`);
+            if (videoElement) {
+                track.attach(videoElement);
+            } else {
+                createRemoteVideoElement({ identity, metadata, track, participant });
             }
-            // Create screen share video element (for both local sharer and remote viewers)
-            logEvent('info', `Creating screen share element...`);
-            createRemoteScreenShareElement(subscriber, { muteAudio: isOwnScreenShare });
-            logEvent('info', `Screen share displayed from ${connectionId}`);
-        } else {
-            // Skip creating camera element for screen share connections (they only publish SCREEN)
-            if (connectionData.isScreenShare) {
-                logEvent('info', `Skipping camera element for screen share connection`);
+            
+            // Show/hide avatar based on video state
+            const wrapper = document.getElementById(`video-${identity}`);
+            const avatar = document.getElementById(`avatar-${identity}`);
+            if (wrapper && avatar) {
+                wrapper.classList.remove('camera-off');
+                avatar.classList.remove('visible');
+            }
+        } else if (track.kind === 'audio') {
+            if (metadata.isScreenShare) {
+                // Screen share audio - attach for playback
+                const audioEl = track.attach();
+                audioEl.id = `screen-audio-${identity}`;
+                document.body.appendChild(audioEl);
                 return;
             }
             
-            // Regular camera stream
-            logEvent('info', `Creating regular video element for ${connectionId}`);
-            createRemoteVideoElement(subscriber);
+            // Regular audio track
+            const audioEl = track.attach();
+            audioEl.id = `audio-${identity}`;
+            audioEl.style.display = 'none';
+            document.body.appendChild(audioEl);
             
-            // Add to participants panel
-            addParticipantToPanel(connectionId, connectionData.nickname, false, connectionData.role);
-            syncParticipantRolesFromSession();
+            // Set up speaking detection
+            setupRemoteSpeakingDetection(identity, track.mediaStreamTrack);
             
-            updateParticipantCount();
-            updateAudioTracksDebug();
-            updateInterpreterButtonState();
-            
-            // Play notification sound for new participant
-            playJoinSound();
-            
-            // Update transcription button state
-            updateTranscriptionButtonState();
-            
-            // Set up speaking detection for remote participant
-            subscriber.on('streamPlaying', async () => {
-                const audioTrack = openviduClient.extractAudioTrack(connectionId, subscriber);
-                if (audioTrack) {
-                    setupRemoteSpeakingDetection(connectionId, audioTrack);
-                    
-                    // If interpreter is active, add this participant
-                    if (appState.isInterpreterActive) {
-                        const participantInfo = getRemoteParticipantInfo(connectionId);
-                        if (participantInfo) {
-                            await interpreterManager.addParticipant(participantInfo);
-                        }
-                    }
-                    
-                    // If transcription is active, add this participant
-                    if (appState.isTranscriptionActive) {
-                        const participantInfo = getRemoteParticipantInfo(connectionId);
-                        if (participantInfo) {
-                            await transcriptionManager.addParticipant(participantInfo);
-                        }
-                    }
+            // If interpreter is active, add this participant
+            if (appState.isInterpreterActive) {
+                const participantInfo = getRemoteParticipantInfo(identity);
+                if (participantInfo) {
+                    interpreterManager.addParticipant(participantInfo);
                 }
-                
-                // Broadcast current interpreter state to new participant
-                if (appState.isInterpreterActive) {
-                    sendInterpreterActiveSignal(true);
+            }
+            
+            // If transcription is active, add this participant
+            if (appState.isTranscriptionActive) {
+                const participantInfo = getRemoteParticipantInfo(identity);
+                if (participantInfo) {
+                    transcriptionManager.addParticipant(participantInfo);
                 }
-            });
+            }
+            
+            // Broadcast interpreter state to new participant
+            if (appState.isInterpreterActive) {
+                sendInterpreterActiveSignal(true);
+            }
         }
     };
     
-    openviduClient.onStreamPropertyChanged = (event) => {
-        const connectionId = event.stream.connection.connectionId;
-        const wrapper = document.getElementById(`video-${connectionId}`);
-        const avatar = document.getElementById(`avatar-${connectionId}`);
+    // Track unsubscribed
+    livekitClient.onTrackUnsubscribed = (track, publication, participant) => {
+        const identity = participant.identity;
+        const isScreenShare = track.source === 'screen_share' || track.source === 'screen_share_audio';
         
-        if (wrapper && avatar && event.changedProperty === 'videoActive') {
-            if (event.newValue) {
-                // Video turned ON
-                wrapper.classList.remove('camera-off');
-                avatar.classList.remove('visible');
-            } else {
-                // Video turned OFF
+        track.detach().forEach(el => el.remove());
+        
+        if (isScreenShare && track.kind === 'video') {
+            removeRemoteScreenShareElement(identity);
+            logEvent('info', `Remote screen share ended from ${identity}`);
+        } else if (track.kind === 'audio' && !isScreenShare) {
+            const audioEl = document.getElementById(`audio-${identity}`);
+            if (audioEl) audioEl.remove();
+            cleanupRemoteSpeakingDetection(identity);
+            
+            if (interpreterManager.isActive) {
+                interpreterManager.removeParticipant(identity);
+            }
+            if (transcriptionManager.isActive) {
+                transcriptionManager.removeParticipant(identity);
+            }
+        }
+    };
+    
+    // Track muted/unmuted - handle video avatar toggle
+    livekitClient.onTrackMuted = (publication, participant) => {
+        if (publication.kind === 'video' && publication.source === 'camera') {
+            const wrapper = document.getElementById(`video-${participant.identity}`);
+            const avatar = document.getElementById(`avatar-${participant.identity}`);
+            if (wrapper && avatar) {
                 wrapper.classList.add('camera-off');
                 avatar.classList.add('visible');
             }
         }
     };
     
-    openviduClient.onStreamDestroyed = (event) => {
-        const stream = event.stream;
-        const connectionId = stream.connection.connectionId;
-        const isScreenShare = stream.typeOfVideo === 'SCREEN';
-        
-        if (isScreenShare) {
-            // Remove remote screen share
-            removeRemoteScreenShareElement(connectionId);
-            logEvent('info', `Remote screen share ended from ${connectionId}`);
-        } else {
-            const hadParticipant = participantsData.has(connectionId);
-            removeRemoteVideoElement(connectionId);
-            removeParticipantFromPanel(connectionId);
-            cleanupRemoteSpeakingDetection(connectionId);
-            updateParticipantCount();
-            updateAudioTracksDebug();
-            updateInterpreterButtonState();
-            if (hadParticipant) {
-                playLeaveSound();
-            }
-            
-            // Update transcription button state
-            updateTranscriptionButtonState();
-            
-            // Remove interpreter for this participant if active
-            if (interpreterManager.isActive) {
-                interpreterManager.removeParticipant(connectionId);
-            }
-            
-            // Remove transcription for this participant if active
-            if (transcriptionManager.isActive) {
-                transcriptionManager.removeParticipant(connectionId);
+    livekitClient.onTrackUnmuted = (publication, participant) => {
+        if (publication.kind === 'video' && publication.source === 'camera') {
+            const wrapper = document.getElementById(`video-${participant.identity}`);
+            const avatar = document.getElementById(`avatar-${participant.identity}`);
+            if (wrapper && avatar) {
+                wrapper.classList.remove('camera-off');
+                avatar.classList.remove('visible');
             }
         }
     };
     
-    openviduClient.onConnectionCreated = (event) => {
-        const { connection } = event;
-        const localConnectionId = openviduClient.session?.connection?.connectionId;
-
-        if (!connection || connection.connectionId === localConnectionId) {
+    // Participant connected
+    livekitClient.onParticipantConnected = (participant) => {
+        const metadata = JSON.parse(participant.metadata || '{}');
+        if (!doesConnectionBelongToCurrentRoom(metadata)) {
             updateParticipantCount();
             return;
         }
-
-        const connectionData = parseOpenViduConnectionData(connection);
-        if (connectionData.rootParticipantId && connectionData.rootParticipantId === getCurrentRootParticipantId()) {
+        if (metadata.rootParticipantId === getCurrentRootParticipantId()) {
             updateParticipantCount();
             return;
         }
-        if (!doesConnectionBelongToCurrentRoom(connectionData)) {
-            updateParticipantCount();
-            return;
-        }
-
-        if (!connectionData.isScreenShare) {
-            createRemoteVideoElement(connection);
-            addParticipantToPanel(connection.connectionId, connectionData.nickname, false, connectionData.role);
+        
+        if (!metadata.isScreenShare) {
+            createRemoteVideoElement({ identity: participant.identity, metadata, participant });
+            addParticipantToPanel(participant.identity, metadata.nickname || 'Participant', false, metadata.role);
             syncParticipantRolesFromSession();
+            playJoinSound();
         }
-
+        
         updateParticipantCount();
+        updateAudioTracksDebug();
         updateInterpreterButtonState();
         updateTranscriptionButtonState();
     };
     
-    openviduClient.onConnectionDestroyed = (event) => {
-        const connectionId = event.connection.connectionId;
-        const connectionData = parseOpenViduConnectionData(event.connection);
-        if (!doesConnectionBelongToCurrentRoom(connectionData)) {
-            updateParticipantCount();
-            updateAudioTracksDebug();
-            return;
+    // Participant disconnected
+    livekitClient.onParticipantDisconnected = (participant) => {
+        const identity = participant.identity;
+        const hadParticipant = participantsData.has(identity);
+        
+        // Clean up all attached elements
+        const audioEl = document.getElementById(`audio-${identity}`);
+        if (audioEl) audioEl.remove();
+        const screenAudioEl = document.getElementById(`screen-audio-${identity}`);
+        if (screenAudioEl) screenAudioEl.remove();
+        
+        removeRemoteVideoElement(identity);
+        removeRemoteScreenShareElement(identity);
+        removeParticipantFromPanel(identity);
+        cleanupRemoteSpeakingDetection(identity);
+        
+        if (hadParticipant) {
+            playLeaveSound();
         }
-        removeRemoteVideoElement(connectionId);
-        if (!connectionData.isScreenShare) {
-            const hadParticipant = participantsData.has(connectionId);
-            removeParticipantFromPanel(connectionId);
-            if (hadParticipant) {
-                playLeaveSound();
-            }
-        }
+        
         updateParticipantCount();
         updateAudioTracksDebug();
-    };
-    
-    openviduClient.onException = (exception) => {
-        console.error('OpenVidu Exception:', exception);
+        updateInterpreterButtonState();
+        updateTranscriptionButtonState();
         
-        // Don't show alert for ICE disconnections - they're usually temporary
-        if (exception.name !== 'ICE_CONNECTION_DISCONNECTED') {
-            if (exception.name === 'ICE_CONNECTION_FAILED') {
-                handleConnectionLost('Connection failed');
-            }
+        if (interpreterManager.isActive) {
+            interpreterManager.removeParticipant(identity);
+        }
+        if (transcriptionManager.isActive) {
+            transcriptionManager.removeParticipant(identity);
         }
     };
     
-    openviduClient.onLog = (type, message) => {
+    // Data received - handles all data channel messages
+    livekitClient.onDataReceived = (data, participant, topic) => {
+        if (!participant) return;
+        const identity = participant.identity;
+        
+        // Skip our own messages
+        if (identity === livekitClient.room?.localParticipant?.identity) return;
+        
+        try {
+            const parsed = JSON.parse(data);
+            
+            switch (topic) {
+                case 'reaction':
+                    handleReceivedReaction(parsed, identity);
+                    break;
+                case 'requestMute':
+                    handleMuteRequest({ data, from: { connectionId: identity } });
+                    break;
+                case 'interpreter-active':
+                    handleInterpreterActiveSignal(parsed, identity);
+                    break;
+                case 'ai-speaking':
+                    handleAiSpeakingSignal(parsed, identity);
+                    break;
+                case 'ai-listening':
+                    handleAiListeningSignal(parsed, identity);
+                    break;
+                case 'chat':
+                    chatManager.handleChatData(parsed, identity);
+                    break;
+                case 'whiteboard-object':
+                case 'whiteboard-clear':
+                case 'whiteboard-sync':
+                case 'whiteboard-state':
+                case 'whiteboard-request-sync':
+                    whiteboardManager.handleWhiteboardData(topic, parsed, identity);
+                    break;
+            }
+        } catch (e) {
+            logEvent('error', `Error parsing data message: ${e.message}`);
+        }
+    };
+    
+    livekitClient.onLog = (type, message) => {
         logEvent(type, message);
     };
 
     // Handle reconnection events
-    openviduClient.onReconnecting = () => {
+    livekitClient.onReconnecting = () => {
         updateConnectionStatus(false);
         elements.connectionStatus.textContent = 'Reconnecting...';
-        elements.connectionStatus.style.background = '#f59e0b'; // Orange
+        elements.connectionStatus.style.background = '#f59e0b';
         logEvent('warn', 'Attempting to reconnect...');
         clearReconnectTimeout();
         reconnectTimeoutId = setTimeout(() => {
@@ -5746,25 +5697,17 @@ function setupOpenViduCallbacks() {
         }, 12000);
     };
 
-    openviduClient.onReconnected = () => {
+    livekitClient.onReconnected = () => {
         clearReconnectTimeout();
         updateConnectionStatus(true);
         logEvent('info', 'Connection restored!');
     };
 
-    openviduClient.onIceFailure = (exception) => {
-        handleConnectionLost('Connection failed');
-    };
-
-    openviduClient.onSessionDisconnected = (event) => {
+    livekitClient.onDisconnected = (reason) => {
         if (isLeavingSessionIntentional || isSwitchingRooms) {
             return;
         }
-
-        const reason = event?.reason === 'networkDisconnect'
-            ? 'Connection lost'
-            : 'Session disconnected';
-        handleConnectionLost(reason);
+        handleConnectionLost(reason || 'Session disconnected');
     };
 }
 
@@ -5822,7 +5765,7 @@ function clearCurrentRoomUiForReconnect() {
     const remoteVideos = document.querySelectorAll('.remote-video, .screen-share-video');
     remoteVideos.forEach((element) => element.remove());
 
-    openviduClient.disconnect();
+    livekitClient.disconnect();
     disconnectPermissionsWebSocket();
 }
 
@@ -5849,17 +5792,19 @@ async function reconnectToAssignedRoom() {
         clearCurrentRoomUiForReconnect();
         appState.currentParticipantId = null;
 
-        const { token, connectionId, roomTarget, rootParticipantId: nextRootParticipantId } = await getToken(
+        const tokenData = await getToken(
             appState.sessionId,
             appState.nickname,
             appState.preferredLanguage,
             { previousParticipantId: rootParticipantId || previousParticipantId, rootParticipantId: rootParticipantId || previousParticipantId }
         );
+        const { token, connectionId, roomTarget, rootParticipantId: nextRootParticipantId } = tokenData;
 
-        setupOpenViduCallbacks();
-        openviduClient.init();
-        await openviduClient.connect(token);
-        appState.currentParticipantId = connectionId || openviduClient.session.connection.connectionId;
+        setupLiveKitCallbacks();
+        livekitClient.init();
+        const reconnectLivekitUrl = tokenData.livekitUrl || CONFIG.LIVEKIT_URL || '';
+        await livekitClient.connect(reconnectLivekitUrl, token);
+        appState.currentParticipantId = connectionId || livekitClient.room?.localParticipant?.identity;
         appState.currentRootParticipantId = nextRootParticipantId || rootParticipantId || previousParticipantId || null;
         appState.currentRoomTarget = roomTarget || appState.currentRoomTarget;
         storeRoomParticipantId(appState.sessionId, appState.currentRootParticipantId);
@@ -5883,14 +5828,12 @@ async function reconnectToAssignedRoom() {
             await publishLocalStreamWithCurrentPermissions();
         }
 
-        initializeChat(openviduClient.session);
-        whiteboardManager.initialize(openviduClient.session, {
+        initializeChat(livekitClient);
+        whiteboardManager.initialize(livekitClient, {
             roomTarget: appState.currentRoomTarget,
             initialState: getCurrentRoomWhiteboardState(),
             onPersistState: persistWhiteboardState,
         });
-        initializeReactionSignals(openviduClient.session);
-        initializeInterpreterSignals(openviduClient.session);
         addParticipantToPanel(appState.currentParticipantId, appState.nickname, true, appState.authRole || 'participant');
         await syncParticipantRolesFromSession();
         if (appState.isParticipantsOpen) {
@@ -5911,7 +5854,7 @@ async function reconnectToAssignedRoom() {
             })}`
         );
         connectPermissionsWebSocket();
-        openviduClient.session.on('signal:requestMute', handleMuteRequest);
+        // Signal handlers are managed via onDataReceived callback
     } finally {
         isSwitchingRooms = false;
     }
@@ -5974,24 +5917,26 @@ async function joinSession(sessionId, nickname, preferredLanguage, options = {})
         // Get token from backend
         logEvent('info', 'Requesting token from backend...');
         const previousParticipantId = getStoredRoomParticipantId(resolvedSessionId);
-        const { token, connectionId, roomTarget, rootParticipantId: nextRootParticipantId } = await getToken(
+        const tokenData = await getToken(
             resolvedSessionId,
             nickname,
             preferredLanguage,
             { previousParticipantId, rootParticipantId: previousParticipantId, waitingRequestId }
         );
+        const { token, connectionId, roomTarget, rootParticipantId: nextRootParticipantId } = tokenData;
         logEvent('info', 'Token received');
         
-        // Initialize OpenVidu
-        setupOpenViduCallbacks();
-        openviduClient.init();
+        // Initialize LiveKit
+        setupLiveKitCallbacks();
+        livekitClient.init();
         
-        // Connect to session
-        logEvent('info', 'Connecting to OpenVidu...');
-        await openviduClient.connect(token);
+        // Connect to room
+        const livekitUrl = tokenData.livekitUrl || CONFIG.LIVEKIT_URL || '';
+        logEvent('info', 'Connecting to LiveKit...');
+        await livekitClient.connect(livekitUrl, token);
         updateConnectionStatus(true);
 
-        const localConnectionId = connectionId || openviduClient.session.connection.connectionId;
+        const localConnectionId = connectionId || livekitClient.room?.localParticipant?.identity;
         appState.currentParticipantId = localConnectionId;
         appState.currentRootParticipantId = nextRootParticipantId || previousParticipantId || null;
         appState.currentRoomTarget = roomTarget || appState.currentRoomTarget;
@@ -6023,36 +5968,27 @@ async function joinSession(sessionId, nickname, preferredLanguage, options = {})
         logEvent('info', 'Successfully joined session!');
         
         // Set up local speaking detection
-        if (openviduClient.publisher && openviduClient.publisher.stream) {
-            const mediaStream = openviduClient.publisher.stream.getMediaStream();
-            if (mediaStream) {
-                setupLocalSpeakingDetection(mediaStream);
-            }
+        if (livekitClient.localAudioTrack) {
+            const mediaStream = new MediaStream([livekitClient.localAudioTrack.mediaStreamTrack]);
+            setupLocalSpeakingDetection(mediaStream);
         }
         
-        // Initialize chat
-        initializeChat(openviduClient.session);
+        // Initialize chat with LiveKit data channels
+        initializeChat(livekitClient);
         
         // Initialize whiteboard
-        whiteboardManager.initialize(openviduClient.session, {
+        whiteboardManager.initialize(livekitClient, {
             roomTarget: appState.currentRoomTarget,
             initialState: getCurrentRoomWhiteboardState(),
             onPersistState: persistWhiteboardState,
         });
         
-        // Initialize reactions
-        initializeReactionSignals(openviduClient.session);
-        
-        // Initialize interpreter signals
-        initializeInterpreterSignals(openviduClient.session);
+        // Reactions and interpreter signals are handled via onDataReceived callback
         
         // Initialize participants panel with local user
         addParticipantToPanel(localConnectionId, nickname, true, appState.authRole || 'participant');
         await syncParticipantRolesFromSession();
         connectPermissionsWebSocket();
-        
-        // Register signal handlers for participants panel
-        openviduClient.session.on('signal:requestMute', handleMuteRequest);
         
     } catch (error) {
         console.error('Error joining session:', error);
@@ -6082,109 +6018,54 @@ async function toggleScreenShare() {
 
 /**
  * Start screen sharing
- * Creates a separate OpenVidu session/connection for screen share
- * (OpenVidu doesn't allow multiple publishers from same connection)
+ * In LiveKit, screen sharing publishes tracks via the same room connection
  */
 async function startScreenShare() {
     try {
         logEvent('info', 'Starting screen share...');
         
-        if (!appState.sessionId) {
-            logEvent('error', 'No active session');
+        if (!livekitClient.room) {
+            logEvent('error', 'No active room');
             return;
         }
         
-        // Step 1: Get a new token for screen share connection
-        logEvent('info', 'Step 1: Getting new token for screen share...');
-        const tokenData = await getToken(
-            appState.sessionId,
-            `${appState.nickname} (Screen)`,
-            appState.preferredLanguage,
-            {
-                rootParticipantId: getCurrentRootParticipantId(),
-                isAuxiliaryMedia: true,
-                auxiliaryMediaKind: 'screen-share',
-            }
-        );
-        const screenToken = tokenData.token;
-        logEvent('info', 'Step 2: Token received for screen share');
-        
-        // Step 2: Create new OpenVidu instance and session for screen share
-        const screenOV = new OpenVidu();
-        const screenSession = screenOV.initSession();
-        
-        // Step 3: Connect to session with new token
-        logEvent('info', 'Step 3: Connecting screen share session...');
-        await screenSession.connect(screenToken, JSON.stringify({ 
-            nickname: `${appState.nickname} (Screen)`,
-            preferredLanguage: appState.preferredLanguage,
-            isScreenShare: true,
-            rootParticipantId: getCurrentRootParticipantId(),
-            rootSessionId: appState.sessionId,
-            roomType: appState.currentRoomTarget?.type || 'main',
-            breakoutRoomId: appState.currentRoomTarget?.breakoutRoomId || null,
-            auxiliaryMediaKind: 'screen-share',
-        }));
-        
-        // Store the screen share connection ID to filter it out from remote streams
-        appState.screenConnectionId = screenSession.connection.connectionId;
-        logEvent('info', `Step 4: Screen share session connected (${appState.screenConnectionId})`);
-        
-        // Step 4: Initialize screen share publisher
-        logEvent('info', 'Step 5: Initializing screen publisher...');
-        let screenPublisher;
-        let isScreenAudioEnabled = true;
-
+        // Create screen share tracks
+        let screenTracks;
         try {
-            screenPublisher = await screenOV.initPublisherAsync(undefined, {
-                videoSource: 'screen',
-                audioSource: 'screen',
-                publishAudio: true,
-                publishVideo: true,
-                mirror: false
+            screenTracks = await LivekitClient.createLocalScreenTracks({
+                audio: true,
+                resolution: LivekitClient.VideoPresets.h1080.resolution,
             });
         } catch (screenAudioError) {
-            isScreenAudioEnabled = false;
-            logEvent('warn', `Screen audio unavailable, falling back to video-only share: ${screenAudioError?.message || screenAudioError}`);
-
-            screenPublisher = await screenOV.initPublisherAsync(undefined, {
-                videoSource: 'screen',
-                publishAudio: false,
-                publishVideo: true,
-                mirror: false
+            logEvent('warn', `Screen audio unavailable, trying video-only: ${screenAudioError?.message}`);
+            screenTracks = await LivekitClient.createLocalScreenTracks({
+                audio: false,
             });
         }
-        logEvent('info', 'Step 6: Screen publisher created');
         
-        // Handle when user stops sharing via browser UI
-        const mediaStream = screenPublisher.stream.getMediaStream();
-        if (mediaStream) {
-            const videoTracks = mediaStream.getVideoTracks();
-            if (videoTracks.length > 0) {
-                videoTracks[0].addEventListener('ended', () => {
+        // Publish screen share tracks
+        const publishedTracks = [];
+        for (const track of screenTracks) {
+            const publication = await livekitClient.room.localParticipant.publishTrack(track, {
+                source: track.kind === 'video'
+                    ? LivekitClient.Track.Source.ScreenShare
+                    : LivekitClient.Track.Source.ScreenShareAudio,
+            });
+            publishedTracks.push(track);
+            
+            // Handle when user stops sharing via browser UI
+            if (track.kind === 'video') {
+                track.mediaStreamTrack.addEventListener('ended', () => {
                     logEvent('info', 'Screen share stopped by user');
                     stopScreenShare();
                 });
             }
         }
         
-        // Step 5: Publish screen share stream (no local preview - we'll see it via main session)
-        logEvent('info', 'Step 7: Publishing screen share...');
-        // Note: We don't create a local preview because the main session will receive
-        // our own screen share stream and display it (filtered by screenConnectionId for others)
-        logEvent('info', 'Step 8: Publishing screen share...');
-        await screenSession.publish(screenPublisher);
-        logEvent('info', 'Step 9: Screen share published successfully!');
-        if (isScreenAudioEnabled) {
-            logEvent('info', 'Screen share includes system audio when allowed by the browser and selected by the user');
-        } else {
-            showNotification('Screen sharing started without system audio. Your browser may not support it for this capture.', 'info');
-        }
+        logEvent('info', 'Screen share published successfully');
         
         // Store references for cleanup
-        appState.screenOV = screenOV;
-        appState.screenSession = screenSession;
-        appState.screenPublisher = screenPublisher;
+        appState.screenTracks = publishedTracks;
         appState.isScreenSharing = true;
         
         // Update layout to presentation mode
@@ -6201,12 +6082,6 @@ async function startScreenShare() {
         logEvent('error', `Screen share error: ${error?.message || error}`);
         console.error('Screen share error:', error);
         
-        // Clean up
-        const screenWrapper = document.getElementById('screenShareWrapper');
-        if (screenWrapper) {
-            screenWrapper.remove();
-        }
-        
         if (error?.name === 'NotAllowedError') {
             logEvent('warn', 'Screen share cancelled by user');
         }
@@ -6220,29 +6095,19 @@ async function stopScreenShare() {
     try {
         logEvent('info', 'Stopping screen share...');
         
-        // Disconnect the screen share session
-        if (appState.screenSession) {
-            try {
-                appState.screenSession.disconnect();
-            } catch (e) {
-                // Ignore disconnect errors
+        // Unpublish and stop screen share tracks
+        if (appState.screenTracks) {
+            for (const track of appState.screenTracks) {
+                try {
+                    livekitClient.room?.localParticipant?.unpublishTrack(track);
+                    track.stop();
+                } catch (e) {
+                    // Ignore errors
+                }
             }
-            appState.screenSession = null;
+            appState.screenTracks = null;
         }
         
-        // Clean up screen publisher
-        if (appState.screenPublisher) {
-            try {
-                appState.screenPublisher.stream.disposeWebRtcPeer();
-                appState.screenPublisher.stream.disposeMediaStream();
-            } catch (e) {
-                // Ignore dispose errors
-            }
-            appState.screenPublisher = null;
-        }
-        
-        // Clean up OpenVidu instance and connection ID
-        appState.screenOV = null;
         appState.screenConnectionId = null;
         
         appState.isScreenSharing = false;
@@ -6328,7 +6193,7 @@ function leaveSession() {
     // Stop speaking detection
     stopSpeakingDetection();
     
-    openviduClient.disconnect();
+    livekitClient.disconnect();
     updateConnectionStatus(false);
     
     // Clear remote videos
@@ -6342,7 +6207,7 @@ function leaveSession() {
     appState.currentRoomTarget = {
         type: 'main',
         breakoutRoomId: null,
-        openviduSessionId: null,
+        livekitRoomName: null,
         displayName: 'Main room',
     };
     appState.breakoutRooms = [];
@@ -6452,75 +6317,72 @@ elements.cancelWaitingRoomBtn?.addEventListener('click', async () => {
 
 // Audio toggle
 elements.toggleAudioBtn.addEventListener('click', async () => {
-    if (!canPublishAudio()) {
-        showNotification(getMediaPermissionRestriction('audio') || 'You do not have permission to enable your microphone.', 'error');
-        return;
+    const currentlyLive = isLocalAudioLive();
+
+    // If trying to enable, check permission
+    if (!currentlyLive) {
+        if (!canPublishAudio()) {
+            showNotification(getMediaPermissionRestriction('audio') || 'You do not have permission to enable your microphone.', 'error');
+            return;
+        }
+        if (previewState.audioPermission !== 'granted') {
+            const granted = await requestDevicePermission('audio');
+            if (!granted) return;
+        }
+        const audioError = getDeviceAccessError('audio');
+        if (audioError) {
+            showNotification(audioError, 'error');
+            return;
+        }
     }
 
-    const wantsToEnableAudio = !appState.isAudioEnabled || !isLocalAudioLive();
-
-    if (wantsToEnableAudio && previewState.audioPermission !== 'granted') {
-        const granted = await requestDevicePermission('audio');
-        if (!granted) return;
-    }
-
-    const audioError = getDeviceAccessError('audio');
-    if (audioError) {
-        showNotification(audioError, 'error');
-        return;
-    }
-
-    if (wantsToEnableAudio) {
+    // Perform the toggle
+    if (!currentlyLive && !localPublisherHasTrack('audio')) {
+        // First time enabling - need to publish the track
         appState.isAudioEnabled = true;
-        if (!openviduClient.publisher || !localPublisherHasTrack('audio')) {
-            await publishLocalStreamWithCurrentPermissions();
-        } else if (!isLocalAudioLive()) {
-            openviduClient.toggleAudio();
-        }
+        await publishLocalStreamWithCurrentPermissions();
     } else {
-        appState.isAudioEnabled = false;
-        if (openviduClient.publisher && isLocalAudioLive()) {
-            openviduClient.toggleAudio();
-        }
+        // Track exists - just toggle mute state
+        const newState = await livekitClient.toggleAudio();
+        appState.isAudioEnabled = newState;
     }
     syncLocalMediaControlUi();
+    logEvent('info', appState.isAudioEnabled ? 'Microphone enabled' : 'Microphone muted');
 });
 
 // Video toggle
 elements.toggleVideoBtn.addEventListener('click', async () => {
-    if (!canPublishVideo()) {
-        showNotification(getMediaPermissionRestriction('video') || 'You do not have permission to enable your camera.', 'error');
-        return;
+    const currentlyLive = isLocalVideoLive();
+
+    // If trying to enable, check permission
+    if (!currentlyLive) {
+        if (!canPublishVideo()) {
+            showNotification(getMediaPermissionRestriction('video') || 'You do not have permission to enable your camera.', 'error');
+            return;
+        }
+        if (previewState.videoPermission !== 'granted') {
+            const granted = await requestDevicePermission('video');
+            if (!granted) return;
+        }
+        const videoError = getDeviceAccessError('video');
+        if (videoError) {
+            showNotification(videoError, 'error');
+            return;
+        }
     }
 
-    const wantsToEnableVideo = !appState.isVideoEnabled || !isLocalVideoLive();
-
-    if (wantsToEnableVideo && previewState.videoPermission !== 'granted') {
-        const granted = await requestDevicePermission('video');
-        if (!granted) return;
-    }
-
-    const videoError = getDeviceAccessError('video');
-    if (videoError) {
-        showNotification(videoError, 'error');
-        return;
-    }
-
-    if (wantsToEnableVideo) {
+    // Perform the toggle
+    if (!currentlyLive && !localPublisherHasTrack('video')) {
+        // First time enabling - need to publish the track
         appState.isVideoEnabled = true;
-        if (!openviduClient.publisher || !localPublisherHasTrack('video')) {
-            await publishLocalStreamWithCurrentPermissions();
-        } else if (!isLocalVideoLive()) {
-            openviduClient.toggleVideo();
-        }
+        await publishLocalStreamWithCurrentPermissions();
     } else {
-        appState.isVideoEnabled = false;
-        if (openviduClient.publisher && isLocalVideoLive()) {
-            openviduClient.toggleVideo();
-        }
+        // Track exists - just toggle mute state
+        const newState = await livekitClient.toggleVideo();
+        appState.isVideoEnabled = newState;
     }
     syncLocalMediaControlUi();
-    logEvent('info', appState.isVideoEnabled ? 'Video desired on' : 'Video desired off');
+    logEvent('info', appState.isVideoEnabled ? 'Camera enabled' : 'Camera disabled');
 });
 
 // Leave session
@@ -6668,7 +6530,7 @@ window.addEventListener('beforeunload', () => {
     stopPreview();
     if (appState.isConnected) {
         notifyParticipantDisconnected({ useBeacon: true });
-        openviduClient.disconnect();
+        livekitClient.disconnect();
     }
 });
 
