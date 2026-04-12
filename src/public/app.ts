@@ -6029,28 +6029,47 @@ async function startScreenShare() {
             return;
         }
         
-        // Create screen share tracks
+        // Create screen share tracks with high quality settings
         let screenTracks;
         try {
             screenTracks = await LivekitClient.createLocalScreenTracks({
                 audio: true,
-                resolution: LivekitClient.VideoPresets.h1080.resolution,
+                video: {
+                    resolution: { width: 1920, height: 1080 },
+                },
             });
         } catch (screenAudioError) {
             logEvent('warn', `Screen audio unavailable, trying video-only: ${screenAudioError?.message}`);
             screenTracks = await LivekitClient.createLocalScreenTracks({
                 audio: false,
+                video: {
+                    resolution: { width: 1920, height: 1080 },
+                },
             });
         }
         
-        // Publish screen share tracks
+        // Publish screen share tracks with high bitrate for crisp quality
         const publishedTracks = [];
         for (const track of screenTracks) {
-            const publication = await livekitClient.room.localParticipant.publishTrack(track, {
+            const publishOptions = {
                 source: track.kind === 'video'
                     ? LivekitClient.Track.Source.ScreenShare
                     : LivekitClient.Track.Source.ScreenShareAudio,
-            });
+            };
+            // Set high bitrate and disable simulcast for screen share
+            if (track.kind === 'video') {
+                publishOptions.videoEncoding = {
+                    maxBitrate: 3_000_000,
+                    maxFramerate: 30,
+                };
+                publishOptions.screenShareEncoding = {
+                    maxBitrate: 3_000_000,
+                    maxFramerate: 30,
+                };
+                publishOptions.simulcast = false;
+                publishOptions.screenShareSimulcastLayers = [];
+            }
+            const publication = await livekitClient.room.localParticipant.publishTrack(track, publishOptions);
             publishedTracks.push(track);
             
             // Handle when user stops sharing via browser UI
