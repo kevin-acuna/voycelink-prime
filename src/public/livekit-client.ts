@@ -171,6 +171,21 @@ class LiveKitClient {
         }
         await this.room.connect(livekitUrl, token);
         this.log('info', 'Connected to room');
+        
+        // Populate subscribers map with already-connected remote participants
+        // ParticipantConnected only fires for participants who join AFTER us
+        this.room.remoteParticipants.forEach((participant) => {
+            this.subscribers.set(participant.identity, participant);
+            this.log('info', `Pre-existing participant: ${participant.identity}`);
+        });
+    }
+
+    /**
+     * Get all remote participants already in the room (for initial enumeration)
+     */
+    getExistingParticipants() {
+        if (!this.room) return [];
+        return Array.from(this.room.remoteParticipants.values());
     }
 
     /**

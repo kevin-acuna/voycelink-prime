@@ -225,6 +225,7 @@ const appState = {
     isChatOpen: false,
     isParticipantsOpen: false,
     isBreakoutsOpen: false,
+    isHandRaised: false,
     isScreenSharing: false,
     screenPublisher: null,
     activeScreenShareConnectionId: null
@@ -302,6 +303,8 @@ const elements = {
     advancedWhiteboardLink: document.getElementById('advancedWhiteboardLink'),
     whiteboardWrapper: document.getElementById('whiteboardWrapper'),
     closeWhiteboardBtn: document.getElementById('closeWhiteboardBtn'),
+    // Raise hand
+    toggleRaiseHandBtn: document.getElementById('toggleRaiseHand'),
     // Reactions elements
     toggleReactionsBtn: document.getElementById('toggleReactions'),
     reactionsPopup: document.getElementById('reactionsPopup'),
@@ -1243,8 +1246,10 @@ async function toggleParticipantCoHostRole(connectionId, nextRole) {
 
 async function handleParticipantAccessAction(connectionId, action) {
     const actionMap = {
-        enableMedia: { mediaEnabled: true },
-        disableMedia: { mediaEnabled: false },
+        enableAudio: { audioEnabled: true },
+        disableAudio: { audioEnabled: false },
+        enableVideo: { videoEnabled: true },
+        disableVideo: { videoEnabled: false },
         enableScreenShare: { screenShareEnabled: true },
         disableScreenShare: { screenShareEnabled: false },
         enableWhiteboard: { whiteboardEnabled: true },
@@ -2905,11 +2910,7 @@ function stopPreview() {
  * Toggle preview microphone
  */
 async function togglePreviewMic() {
-    const accessRestriction = getMediaPermissionRestriction('audio');
-    if (accessRestriction) {
-        showNotification(accessRestriction, 'error');
-        return;
-    }
+    // No permission restrictions in the preview/lobby - users should freely test their devices
 
     if (!previewState.isAudioEnabled && previewState.audioPermission !== 'granted') {
         const granted = await requestDevicePermission('audio');
@@ -2942,11 +2943,7 @@ async function togglePreviewMic() {
  * Toggle preview camera
  */
 async function togglePreviewVideo() {
-    const accessRestriction = getMediaPermissionRestriction('video');
-    if (accessRestriction) {
-        showNotification(accessRestriction, 'error');
-        return;
-    }
+    // No permission restrictions in the preview/lobby - users should freely test their devices
 
     if (!previewState.isVideoEnabled && previewState.videoPermission !== 'granted') {
         const granted = await requestDevicePermission('video');
@@ -3009,9 +3006,11 @@ function updateMediaAvailabilityUI() {
     const videoUnavailable = !previewState.hasVideoInput;
     const audioPermissionDenied = previewState.audioPermission === 'denied';
     const videoPermissionDenied = previewState.videoPermission === 'denied';
+    // For in-conference buttons, check host restrictions
     const audioAccessRestricted = Boolean(getMediaPermissionRestriction('audio'));
     const videoAccessRestricted = Boolean(getMediaPermissionRestriction('video'));
 
+    // Preview buttons: NEVER restricted by host permissions (lobby is for testing devices)
     elements.previewToggleMic.disabled = false;
     elements.previewToggleVideo.disabled = false;
     elements.toggleAudioBtn.disabled = false;
@@ -3019,20 +3018,19 @@ function updateMediaAvailabilityUI() {
     elements.microphoneSelect.disabled = audioUnavailable;
     elements.cameraSelect.disabled = videoUnavailable;
 
+    // Preview button titles - only reflect device/permission issues, NOT host restrictions
     elements.previewToggleMic.title = audioUnavailable
         ? 'No microphone detected'
         : audioPermissionDenied
         ? 'Microphone permission denied'
-        : audioAccessRestricted
-        ? 'Microphone access is disabled by the host'
         : 'Toggle Microphone';
     elements.previewToggleVideo.title = videoUnavailable
         ? 'No camera detected'
         : videoPermissionDenied
         ? 'Camera permission denied'
-        : videoAccessRestricted
-        ? 'Camera access is disabled by the host'
         : 'Toggle Camera';
+
+    // In-conference button titles - these DO respect host restrictions
     elements.toggleAudioBtn.title = audioUnavailable
         ? 'No microphone detected'
         : audioPermissionDenied
@@ -3048,15 +3046,21 @@ function updateMediaAvailabilityUI() {
         ? 'Camera access is disabled by the host'
         : 'Toggle Camera';
 
-    elements.previewToggleMic.classList.toggle('muted', audioUnavailable || audioPermissionDenied || audioAccessRestricted || !previewState.isAudioEnabled);
-    elements.previewToggleVideo.classList.toggle('muted', videoUnavailable || videoPermissionDenied || videoAccessRestricted || !previewState.isVideoEnabled);
+    // Preview buttons: only show muted for device/permission issues or user choice
+    elements.previewToggleMic.classList.toggle('muted', audioUnavailable || audioPermissionDenied || !previewState.isAudioEnabled);
+    elements.previewToggleVideo.classList.toggle('muted', videoUnavailable || videoPermissionDenied || !previewState.isVideoEnabled);
 
-    if (audioUnavailable || audioPermissionDenied || audioAccessRestricted) {
+    // Update preview button icons to reflect actual state
+    if (audioUnavailable || audioPermissionDenied || !previewState.isAudioEnabled) {
         elements.previewToggleMic.innerHTML = '<i data-lucide="mic-off"></i>';
+    } else {
+        elements.previewToggleMic.innerHTML = '<i data-lucide="mic"></i>';
     }
 
-    if (videoUnavailable || videoPermissionDenied || videoAccessRestricted) {
+    if (videoUnavailable || videoPermissionDenied || !previewState.isVideoEnabled) {
         elements.previewToggleVideo.innerHTML = '<i data-lucide="video-off"></i>';
+    } else {
+        elements.previewToggleVideo.innerHTML = '<i data-lucide="video"></i>';
     }
 
     syncLocalMediaControlUi();
@@ -3429,6 +3433,42 @@ function showJoinForm() {
     // Restart preview when returning to join form
     initPreview();
     applyPermissionBasedUi();
+}
+
+/**
+ * Enumerate participants already in the LiveKit room when we first connect.
+ * ParticipantConnected only fires for participants who join AFTER us,
+ * so pre-existing participants need manual discovery.
+ */
+function enumerateExistingParticipants() {
+    const existingParticipants = livekitClient.getExistingParticipants();
+    logEvent('info', `Enumerating ${existingParticipants.length} existing participant(s) in room`);
+    
+    for (const participant of existingParticipants) {
+        const identity = participant.identity;
+        const metadata = JSON.parse(participant.metadata || '{}');
+        
+        if (!doesConnectionBelongToCurrentRoom(metadata)) continue;
+        if (metadata.rootParticipantId === getCurrentRootParticipantId()) continue;
+        if (metadata.isScreenShare) continue;
+        
+        // Create video element if not already present
+        const existingWrapper = document.getElementById(`video-${identity}`);
+        if (!existingWrapper) {
+            createRemoteVideoElement({ identity, metadata, participant });
+            logEvent('info', `Created video element for existing participant: ${identity} (${metadata.nickname})`);
+        }
+        
+        // Add to participants panel
+        if (!participantsData.has(identity)) {
+            addParticipantToPanel(identity, metadata.nickname || 'Participant', false, metadata.role);
+        }
+    }
+    
+    updateParticipantCount();
+    updateAudioTracksDebug();
+    updateInterpreterButtonState();
+    updateTranscriptionButtonState();
 }
 
 function updateParticipantCount() {
@@ -4683,6 +4723,7 @@ function addParticipantToPanel(connectionId, nickname, isLocal = false, role = n
         role: role || (isLocal ? (appState.authRole || 'participant') : 'participant'),
         isMuted: false,
         isVideoOff: false,
+        isHandRaised: false,
         permissions: getDefaultParticipantPermissionState(),
     });
     updateParticipantsCount();
@@ -4832,6 +4873,7 @@ function renderParticipantsList() {
                         <span class="participant-name-text">${escapeHtml(p.nickname)}</span>
                         ${roleLabel ? `<span class="participant-role-label">(${escapeHtml(roleLabel)})</span>` : ''}
                         ${isYou ? '<span class="participant-you-badge">You</span>' : ''}
+                        ${p.isHandRaised ? '<span class="participant-hand-badge">✋</span>' : ''}
                     </div>
                     <div class="participant-status ${p.isMuted ? 'muted' : ''}">
                         ${p.presence !== 'connected'
@@ -4850,8 +4892,11 @@ function renderParticipantsList() {
                             ${isAccessMenuOpen ? `
                                 <div class="participant-access-menu" data-connection-id="${p.connectionId}">
                                     ${canManageParticipantMedia() ? `
-                                        <button class="participant-access-menu-item" data-connection-id="${p.connectionId}" data-action="${participantPermissions.audioEnabled || participantPermissions.videoEnabled ? 'disableMedia' : 'enableMedia'}">
-                                            ${participantPermissions.audioEnabled || participantPermissions.videoEnabled ? 'Disable mic and camera' : 'Enable mic and camera'}
+                                        <button class="participant-access-menu-item" data-connection-id="${p.connectionId}" data-action="${participantPermissions.audioEnabled ? 'disableAudio' : 'enableAudio'}">
+                                            ${participantPermissions.audioEnabled ? 'Disable microphone' : 'Enable microphone'}
+                                        </button>
+                                        <button class="participant-access-menu-item" data-connection-id="${p.connectionId}" data-action="${participantPermissions.videoEnabled ? 'disableVideo' : 'enableVideo'}">
+                                            ${participantPermissions.videoEnabled ? 'Disable camera' : 'Enable camera'}
                                         </button>
                                         <button class="participant-access-menu-item" data-connection-id="${p.connectionId}" data-action="${participantPermissions.screenShareEnabled ? 'disableScreenShare' : 'enableScreenShare'}">
                                             ${participantPermissions.screenShareEnabled ? 'Disable screen sharing' : 'Enable screen sharing'}
@@ -4876,8 +4921,13 @@ function renderParticipantsList() {
                     <div class="participant-actions">
                         ${canMuteParticipant ? `<button class="participant-action-btn mute-btn" 
                                 data-connection-id="${p.mediaConnectionId || ''}" 
-                                title="Request mute">
+                                title="Request mute microphone">
                             <i data-lucide="mic-off"></i>
+                        </button>
+                        <button class="participant-action-btn video-off-btn" 
+                                data-connection-id="${p.mediaConnectionId || ''}" 
+                                title="Request camera off">
+                            <i data-lucide="video-off"></i>
                         </button>` : ''}
                         ${canRemoveParticipant ? `<button class="participant-action-btn kick-btn" 
                                 data-connection-id="${p.connectionId}" 
@@ -4893,24 +4943,62 @@ function renderParticipantsList() {
     const showBulkActions = canManageParticipantMedia() && sortedParticipants.filter(p => !p.isLocal && canManageTargetParticipantRole(p.role) && p.presence === 'connected').length > 1;
     const bulkActionsMarkup = showBulkActions ? `
         <div class="participants-bulk-actions">
-            <button class="bulk-action-btn bulk-enable-all" title="Enable mic & camera for all participants">
+            <button class="bulk-action-btn bulk-enable-mic" title="Enable microphone for all participants">
                 <i data-lucide="mic"></i>
                 <span>Enable all</span>
             </button>
-            <button class="bulk-action-btn bulk-disable-all" title="Disable mic & camera for all participants">
+            <button class="bulk-action-btn bulk-disable-mic" title="Disable microphone for all participants">
                 <i data-lucide="mic-off"></i>
+                <span>Disable all</span>
+            </button>
+            <span class="bulk-action-separator"></span>
+            <button class="bulk-action-btn bulk-enable-cam" title="Enable camera for all participants">
+                <i data-lucide="video"></i>
+                <span>Enable all</span>
+            </button>
+            <button class="bulk-action-btn bulk-disable-cam" title="Disable camera for all participants">
+                <i data-lucide="video-off"></i>
                 <span>Disable all</span>
             </button>
         </div>
     ` : '';
 
+    // Split participants into raised hands and others
+    const raisedHandParticipants = sortedParticipants.filter(p => p.isHandRaised);
+    const raisedHandIds = new Set(raisedHandParticipants.map(p => p.connectionId));
+    
+    const raisedHandMarkup = raisedHandParticipants.length > 0 ? `
+        <div class="participants-section raised-hands-section">
+            <div class="participants-section-title">
+                <span class="raised-hand-icon">✋</span>
+                Raised hands (${raisedHandParticipants.length})
+            </div>
+            ${raisedHandParticipants.map(p => {
+                // Find and return the already-generated markup for this participant
+                const idx = sortedParticipants.indexOf(p);
+                return participantMarkup.split('</div>\n        ')[idx] !== undefined
+                    ? `<div class="participant-item raised-hand-highlight" data-connection-id="${p.connectionId}">
+                        <div class="participant-avatar">${p.nickname.charAt(0).toUpperCase()}</div>
+                        <div class="participant-info">
+                            <div class="participant-name">
+                                <span class="participant-name-text">${escapeHtml(p.nickname)}</span>
+                                <span class="participant-hand-badge">✋</span>
+                            </div>
+                        </div>
+                    </div>`
+                    : '';
+            }).join('')}
+        </div>
+    ` : '';
+
     elements.participantsList.innerHTML = `
         ${bulkActionsMarkup}
+        ${raisedHandMarkup}
         ${waitingRoomMarkup}
         ${participantMarkup
             ? `
                 <div class="participants-section">
-                    ${waitingRoomMarkup ? '<div class="participants-section-title">In conference</div>' : ''}
+                    ${(waitingRoomMarkup || raisedHandMarkup) ? '<div class="participants-section-title">In conference</div>' : ''}
                     ${participantMarkup}
                 </div>
             `
@@ -4923,8 +5011,14 @@ function renderParticipantsList() {
     elements.participantsList.querySelectorAll('.mute-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
-            const connectionId = btn.dataset.connectionId;
-            requestMuteParticipant(connectionId);
+            requestMuteParticipant(btn.dataset.connectionId);
+        });
+    });
+
+    elements.participantsList.querySelectorAll('.video-off-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            requestDisableVideo(btn.dataset.connectionId);
         });
     });
     
@@ -4977,23 +5071,42 @@ function renderParticipantsList() {
         });
     });
 
-    // Bulk action handlers
-    const enableAllBtn = elements.participantsList.querySelector('.bulk-enable-all');
-    if (enableAllBtn) {
-        enableAllBtn.addEventListener('click', async (event) => {
+    // Bulk action handlers — mic
+    const enableMicBtn = elements.participantsList.querySelector('.bulk-enable-mic');
+    if (enableMicBtn) {
+        enableMicBtn.addEventListener('click', async (event) => {
             event.stopPropagation();
-            await withButtonProtection(enableAllBtn, async () => {
-                await bulkUpdateParticipantPermissions({ mediaEnabled: true });
+            await withButtonProtection(enableMicBtn, async () => {
+                await bulkUpdateParticipantPermissions({ audioEnabled: true });
+            });
+        });
+    }
+    const disableMicBtn = elements.participantsList.querySelector('.bulk-disable-mic');
+    if (disableMicBtn) {
+        disableMicBtn.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            await withButtonProtection(disableMicBtn, async () => {
+                await bulkUpdateParticipantPermissions({ audioEnabled: false });
             });
         });
     }
 
-    const disableAllBtn = elements.participantsList.querySelector('.bulk-disable-all');
-    if (disableAllBtn) {
-        disableAllBtn.addEventListener('click', async (event) => {
+    // Bulk action handlers — camera
+    const enableCamBtn = elements.participantsList.querySelector('.bulk-enable-cam');
+    if (enableCamBtn) {
+        enableCamBtn.addEventListener('click', async (event) => {
             event.stopPropagation();
-            await withButtonProtection(disableAllBtn, async () => {
-                await bulkUpdateParticipantPermissions({ mediaEnabled: false });
+            await withButtonProtection(enableCamBtn, async () => {
+                await bulkUpdateParticipantPermissions({ videoEnabled: true });
+            });
+        });
+    }
+    const disableCamBtn = elements.participantsList.querySelector('.bulk-disable-cam');
+    if (disableCamBtn) {
+        disableCamBtn.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            await withButtonProtection(disableCamBtn, async () => {
+                await bulkUpdateParticipantPermissions({ videoEnabled: false });
             });
         });
     }
@@ -5017,10 +5130,32 @@ function requestMuteParticipant(connectionId) {
         return;
     }
     
-    // Send data message to request mute
     livekitClient.sendData('requestMute', { fromNickname: appState.nickname }, [connectionId])
         .then(() => logEvent('info', `Sent mute request to ${participant.nickname}`))
         .catch(err => console.error('Error sending mute request:', err));
+}
+
+/**
+ * Request a participant to turn off their camera
+ */
+function requestDisableVideo(connectionId) {
+    if (!livekitClient.room) return;
+    if (!connectionId) return;
+    if (!canManageParticipantMedia()) {
+        showNotification('You do not have permission to manage participant media.', 'error');
+        return;
+    }
+    
+    const participant = getParticipantForModeration(connectionId);
+    if (!participant) return;
+    if (!canManageTargetParticipantRole(participant.role)) {
+        showNotification('Co-hosts cannot manage the host or other co-hosts.', 'error');
+        return;
+    }
+    
+    livekitClient.sendData('requestVideoOff', { fromNickname: appState.nickname }, [connectionId])
+        .then(() => logEvent('info', `Sent video-off request to ${participant.nickname}`))
+        .catch(err => console.error('Error sending video-off request:', err));
 }
 
 /**
@@ -5075,30 +5210,53 @@ async function handleMuteRequest(event) {
         const senderParticipant = getParticipantForModeration(event?.from?.connectionId);
         const senderRole = senderParticipant?.role || 'participant';
         const localRole = appState.authRole || 'participant';
-        const senderCanRequestMute =
+        const senderCanRequest =
             senderRole === 'host' ||
             (senderRole === 'co_host' && localRole !== 'host' && localRole !== 'co_host');
 
-        if (!senderCanRequestMute) {
+        if (!senderCanRequest) {
             logEvent('warn', `Ignored mute request from ${senderParticipant?.nickname || 'unknown participant'} due to insufficient moderation privileges`);
             return;
         }
 
-        // Show notification and auto-mute
         const message = `${data.fromNickname} has requested you to mute your microphone`;
-        
-        // Auto-mute the user
         if (isLocalAudioLive()) {
             await livekitClient.toggleAudio();
             appState.isAudioEnabled = false;
             syncLocalMediaControlUi();
         }
-        
-        // Show a brief notification
         showNotification(message, 'info');
         logEvent('info', message);
     } catch (e) {
         console.error('Error handling mute request:', e);
+    }
+}
+
+async function handleVideoOffRequest(event) {
+    try {
+        const data = JSON.parse(event.data);
+        const senderParticipant = getParticipantForModeration(event?.from?.connectionId);
+        const senderRole = senderParticipant?.role || 'participant';
+        const localRole = appState.authRole || 'participant';
+        const senderCanRequest =
+            senderRole === 'host' ||
+            (senderRole === 'co_host' && localRole !== 'host' && localRole !== 'co_host');
+
+        if (!senderCanRequest) {
+            logEvent('warn', `Ignored video-off request from ${senderParticipant?.nickname || 'unknown participant'} due to insufficient moderation privileges`);
+            return;
+        }
+
+        const message = `${data.fromNickname} has requested you to turn off your camera`;
+        if (isLocalVideoLive()) {
+            await livekitClient.toggleVideo();
+            appState.isVideoEnabled = false;
+            syncLocalMediaControlUi();
+        }
+        showNotification(message, 'info');
+        logEvent('info', message);
+    } catch (e) {
+        console.error('Error handling video-off request:', e);
     }
 }
 
@@ -5166,6 +5324,98 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// =============================================================================
+// Raise Hand
+// =============================================================================
+
+/**
+ * Toggle local raise hand state and broadcast to all participants
+ */
+function toggleRaiseHand() {
+    appState.isHandRaised = !appState.isHandRaised;
+    
+    // Update button state
+    elements.toggleRaiseHandBtn?.classList.toggle('active', appState.isHandRaised);
+    
+    // Update local participant data
+    const localParticipant = Array.from(participantsData.values()).find(p => p.isLocal);
+    if (localParticipant) {
+        localParticipant.isHandRaised = appState.isHandRaised;
+        participantsData.set(localParticipant.connectionId, localParticipant);
+    }
+    
+    // Update hand indicator on local video
+    updateHandRaisedIndicator('localVideoWrapper', appState.isHandRaised);
+    
+    // Broadcast to all participants
+    if (livekitClient.room) {
+        livekitClient.sendData('raiseHand', {
+            raised: appState.isHandRaised,
+            nickname: appState.nickname,
+        }).catch(err => console.error('Error sending raise hand signal:', err));
+    }
+    
+    // Re-render participants panel
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+    
+    logEvent('info', appState.isHandRaised ? 'Hand raised' : 'Hand lowered');
+}
+
+/**
+ * Handle incoming raise hand signal from another participant
+ */
+function handleRaiseHandSignal(data, senderIdentity) {
+    const participant = participantsData.get(senderIdentity);
+    if (participant) {
+        participant.isHandRaised = data.raised;
+        participantsData.set(senderIdentity, participant);
+    }
+    
+    // Update hand indicator on their video tile
+    updateHandRaisedIndicator(`video-${senderIdentity}`, data.raised);
+    
+    // Re-render participants panel
+    if (appState.isParticipantsOpen) {
+        renderParticipantsList();
+    }
+    
+    if (data.raised) {
+        logEvent('info', `${data.nickname} raised their hand`);
+    }
+}
+
+/**
+ * Show or hide the raised hand indicator on a video tile
+ */
+function updateHandRaisedIndicator(wrapperId, raised) {
+    const wrapper = document.getElementById(wrapperId);
+    if (!wrapper) return;
+    
+    let indicator = wrapper.querySelector('.hand-raised-indicator');
+    
+    if (raised && !indicator) {
+        indicator = document.createElement('div');
+        indicator.className = 'hand-raised-indicator';
+        indicator.innerHTML = '&#9995;';
+        wrapper.appendChild(indicator);
+        // Trigger entrance animation
+        requestAnimationFrame(() => indicator.classList.add('visible'));
+    } else if (!raised && indicator) {
+        indicator.classList.remove('visible');
+        setTimeout(() => indicator.remove(), 200);
+    }
+}
+
+/**
+ * Reset raise hand state (e.g. on leave)
+ */
+function resetRaiseHand() {
+    appState.isHandRaised = false;
+    elements.toggleRaiseHandBtn?.classList.remove('active');
 }
 
 // =============================================================================
@@ -5656,6 +5906,12 @@ function setupLiveKitCallbacks() {
                 case 'requestMute':
                     handleMuteRequest({ data, from: { connectionId: identity } });
                     break;
+                case 'requestVideoOff':
+                    handleVideoOffRequest({ data, from: { connectionId: identity } });
+                    break;
+                case 'raiseHand':
+                    handleRaiseHandSignal(parsed, identity);
+                    break;
                 case 'interpreter-active':
                     handleInterpreterActiveSignal(parsed, identity);
                     break;
@@ -5835,6 +6091,7 @@ async function reconnectToAssignedRoom() {
             onPersistState: persistWhiteboardState,
         });
         addParticipantToPanel(appState.currentParticipantId, appState.nickname, true, appState.authRole || 'participant');
+        enumerateExistingParticipants();
         await syncParticipantRolesFromSession();
         if (appState.isParticipantsOpen) {
             renderParticipantsList();
@@ -5987,6 +6244,12 @@ async function joinSession(sessionId, nickname, preferredLanguage, options = {})
         
         // Initialize participants panel with local user
         addParticipantToPanel(localConnectionId, nickname, true, appState.authRole || 'participant');
+        
+        // Enumerate participants already in the room
+        // ParticipantConnected only fires for participants who join AFTER us,
+        // so we must manually create video elements for pre-existing participants
+        enumerateExistingParticipants();
+        
         await syncParticipantRolesFromSession();
         connectPermissionsWebSocket();
         
@@ -6186,6 +6449,9 @@ function leaveSession() {
     stopWaitingRoomPolling();
     disconnectPermissionsWebSocket();
 
+    // Reset raise hand
+    resetRaiseHand();
+    
     // Stop screen sharing if active
     if (appState.isScreenSharing) {
         stopScreenShare();
@@ -6502,6 +6768,9 @@ elements.toggleWhiteboardMenuBtn?.addEventListener('click', toggleWhiteboardMenu
 elements.advancedWhiteboardLink?.addEventListener('click', () => {
     closeWhiteboardMenu();
 });
+
+// Raise hand
+elements.toggleRaiseHandBtn?.addEventListener('click', toggleRaiseHand);
 
 // Reactions controls
 elements.toggleReactionsBtn?.addEventListener('click', toggleReactionsPopup);
