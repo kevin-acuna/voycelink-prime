@@ -780,7 +780,7 @@ async function getAuthorizationContextForRequest(req) {
         chatEnabled: true,
         groupChatEnabled: false,
         whiteboardEnabled: true,
-        subtitlesEnabled: true,
+        subtitlesEnabled: false,
         aiInterpretationEnabled: false,
     };
 
@@ -2104,6 +2104,7 @@ app.post('/api/sessions/:sessionId/participants/:participantId/disconnect', requ
         }
         const participantRef = new ParticipantId(resolvedParticipantId);
 
+        const disconnectingRole = storedSession.getParticipantRole(participantRef);
         storedSession.markParticipantDisconnected(participantRef);
         await sessionRepository.save(storedSession);
         logger.info(
@@ -2111,6 +2112,7 @@ app.post('/api/sessions/:sessionId/participants/:participantId/disconnect', requ
                 sessionId,
                 resolvedParticipantId,
                 isSelfDisconnect,
+                disconnectingRole,
                 snapshot: summarizeStoredSessionForLogs(storedSession),
             },
             'Marked participant disconnected'
@@ -2123,6 +2125,27 @@ app.post('/api/sessions/:sessionId/participants/:participantId/disconnect', requ
             ...buildBreakoutSnapshot(storedSession),
         });
 
+        // If the host disconnected, notify all remaining participants
+        if (disconnectingRole === Role.HOST) {
+            // Find a connected co-host to auto-promote
+            const roles = storedSession.getParticipantRoles();
+            const presence = storedSession.getParticipantPresenceMap();
+            const connectedCoHost = Object.entries(roles).find(
+                ([pid, role]) => role === Role.CO_HOST && presence[pid] === 'connected'
+            );
+
+            broadcastPermissionUpdate(sessionId, {
+                type: 'host_disconnected',
+                sessionId,
+                hasCoHost: Boolean(connectedCoHost),
+                promotedParticipantId: connectedCoHost ? connectedCoHost[0] : null,
+            });
+            logger.info(
+                { sessionId, hasCoHost: Boolean(connectedCoHost), promotedCoHost: connectedCoHost?.[0] || null },
+                'Host disconnected — notified participants'
+            );
+        }
+
         return res.status(204).send();
     } catch (error) {
         logger.error({ err: error }, 'Failed to mark participant disconnected');
@@ -2130,6 +2153,117 @@ app.post('/api/sessions/:sessionId/participants/:participantId/disconnect', requ
             error: 'Failed to mark participant disconnected',
             details: getErrorMessage(error),
         });
+    }
+});
+
+// End meeting — host closes the session for everyone
+app.post('/api/sessions/:sessionId/end-meeting', requirePermission(Permission.END_SESSION), async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const presence = storedSession.getParticipantPresenceMap();
+        const mediaConnections = storedSession.getParticipantMediaConnections();
+        const roomTarget = getRoomTargetForParticipant(storedSession);
+        const targetRoomName = roomTarget?.livekitRoomName || sessionId;
+
+        // Remove all connected participants from LiveKit
+        const removalPromises = [];
+        for (const [pid, status] of Object.entries(presence)) {
+            if (status === 'connected') {
+                const mediaId = mediaConnections[pid];
+                if (mediaId) {
+                    removalPromises.push(
+                        removeLivekitParticipant(targetRoomName, mediaId).catch((err) =>
+                            logger.warn({ err, participantId: pid }, 'Failed to remove participant from LiveKit during end-meeting')
+                        )
+                    );
+                }
+                storedSession.markParticipantDisconnected(new ParticipantId(pid));
+            }
+        }
+        await Promise.allSettled(removalPromises);
+        await sessionRepository.save(storedSession);
+
+        broadcastPermissionUpdate(sessionId, {
+            type: 'meeting_ended',
+            sessionId,
+            reason: 'The host has ended the meeting.',
+        });
+
+        logger.info({ sessionId }, 'Meeting ended by host');
+        return res.status(204).send();
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to end meeting');
+        return sendServiceError(res, error, 'Failed to end the meeting');
+    }
+});
+
+// Transfer host role to a specific co-host
+app.post('/api/sessions/:sessionId/transfer-host', requirePermission(Permission.END_SESSION), async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        if (!validateRoomBinding(req, res, sessionId)) {
+            return;
+        }
+
+        const targetParticipantId = req.body?.participantId;
+        if (!targetParticipantId) {
+            return res.status(400).json({ error: 'Missing participantId', details: 'You must specify the co-host to promote.' });
+        }
+
+        const storedSession = await getConsistentStoredSession(sessionId);
+        const resolvedTargetId = resolveRootParticipantId(storedSession, targetParticipantId);
+        if (!resolvedTargetId) {
+            return res.status(404).json({ error: 'Participant not found', details: `Participant ${targetParticipantId} not found.` });
+        }
+
+        const targetRef = new ParticipantId(resolvedTargetId);
+        const targetRole = storedSession.getParticipantRole(targetRef);
+        if (targetRole !== Role.CO_HOST) {
+            return res.status(400).json({ error: 'Invalid target', details: 'Host can only be transferred to a co-host.' });
+        }
+
+        const targetPresence = storedSession.getParticipantPresence(targetRef);
+        if (targetPresence !== 'connected') {
+            return res.status(400).json({ error: 'Target not connected', details: 'The target co-host is not currently connected.' });
+        }
+
+        // Promote the co-host to host
+        storedSession.setParticipantRole(targetRef, Role.HOST);
+
+        // Demote current host to co-host (so they retain elevated access until they actually leave)
+        const currentHostId = getParticipantIdFromRequest(req);
+        const resolvedCurrentHostId = resolveRootParticipantId(storedSession, currentHostId);
+        if (resolvedCurrentHostId) {
+            storedSession.setParticipantRole(new ParticipantId(resolvedCurrentHostId), Role.CO_HOST);
+        }
+
+        await sessionRepository.save(storedSession);
+
+        broadcastPermissionUpdate(sessionId, {
+            type: 'host_transferred',
+            sessionId,
+            newHostParticipantId: resolvedTargetId,
+            previousHostParticipantId: resolvedCurrentHostId,
+            ...buildBreakoutSnapshot(storedSession),
+        });
+
+        logger.info(
+            { sessionId, newHost: resolvedTargetId, previousHost: resolvedCurrentHostId },
+            'Host role transferred'
+        );
+
+        return res.json({
+            transferred: true,
+            newHostParticipantId: resolvedTargetId,
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'Failed to transfer host role');
+        return sendServiceError(res, error, 'Failed to transfer host role');
     }
 });
 
@@ -2524,7 +2658,7 @@ app.post('/api/sessions', requirePermission(Permission.CREATE_SESSION), async (r
         subtitlesEnabled:
             typeof roomConfiguration.subtitlesEnabled === 'boolean'
                 ? roomConfiguration.subtitlesEnabled
-                : true,
+                : false,
         aiInterpretationEnabled:
             typeof roomConfiguration.aiInterpretationEnabled === 'boolean'
                 ? roomConfiguration.aiInterpretationEnabled

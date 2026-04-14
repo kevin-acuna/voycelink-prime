@@ -44,7 +44,9 @@ const CONFIG = {
         PARTICIPANT_PERMISSIONS: (sessionId, participantId) =>
             `/api/sessions/${sessionId}/participants/${participantId}/permissions`,
         PARTICIPANT_ROLE: (sessionId, participantId) =>
-            `/api/sessions/${sessionId}/participants/${participantId}/role`
+            `/api/sessions/${sessionId}/participants/${participantId}/role`,
+        END_MEETING: (sessionId) => `/api/sessions/${sessionId}/end-meeting`,
+        TRANSFER_HOST: (sessionId) => `/api/sessions/${sessionId}/transfer-host`
     },
     
     // Publisher Settings

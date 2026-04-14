@@ -209,7 +209,7 @@ const appState = {
         chatEnabled: true,
         groupChatEnabled: false,
         whiteboardEnabled: true,
-        subtitlesEnabled: true,
+        subtitlesEnabled: false,
         aiInterpretationEnabled: false,
     },
     currentPermissions: [],
@@ -820,8 +820,8 @@ function applyPermissionBasedUi() {
         setElementVisibility(elements.toggleWhiteboardBtn, canManageWhiteboard(), '');
         setElementVisibility(elements.toggleBreakoutsBtn, canManageBreakouts(), '');
         setElementVisibility(elements.whiteboardActions, canManageWhiteboard(), 'inline-flex');
-        setElementVisibility(elements.toggleWhiteboardMenuBtn, appState.authRole === 'host', 'inline-flex');
-        setElementVisibility(elements.advancedWhiteboardLink, appState.authRole === 'host', 'flex');
+        setElementVisibility(elements.toggleWhiteboardMenuBtn, appState.authRole === 'host' || appState.authRole === 'co_host', 'inline-flex');
+        setElementVisibility(elements.advancedWhiteboardLink, appState.authRole === 'host' || appState.authRole === 'co_host', 'flex');
         setElementVisibility(
             elements.groupChatToggleWrapper,
             hasPermission(Permission.UPDATE_ROOM_CONFIGURATION),
@@ -830,7 +830,7 @@ function applyPermissionBasedUi() {
         if (elements.groupChatToggle) {
             elements.groupChatToggle.checked = appState.sessionFeatures.groupChatEnabled === true;
         }
-        setElementVisibility(elements.toggleReactionsBtn, canSendGroupMessages(), '');
+        setElementVisibility(elements.toggleReactionsBtn, true, '');
         elements.sendChatBtn.disabled = !canSendAnyChatMessages();
         elements.chatInput.disabled = !canSendAnyChatMessages();
         if (elements.chatRecipientSelect) {
@@ -844,11 +844,8 @@ function applyPermissionBasedUi() {
             elements.chatInput.placeholder = 'Messaging is disabled for your access level';
         }
 
-        if (!canSendGroupMessages()) {
-            hideReactionsPopup();
-        }
 
-        if (appState.authRole !== 'host') {
+        if (appState.authRole !== 'host' && appState.authRole !== 'co_host') {
             closeWhiteboardMenu();
         }
 
@@ -1133,6 +1130,7 @@ function getGlobalParticipantsForPanels() {
                 isLocal,
                 isMuted: localParticipant?.isMuted ?? false,
                 isVideoOff: localParticipant?.isVideoOff ?? false,
+                isHandRaised: isLocal ? appState.isHandRaised : (localParticipant?.isHandRaised ?? false),
                 presence: getParticipantPresence(participantId),
                 location: appState.participantLocations?.[participantId] || {
                     type: 'main',
@@ -2343,6 +2341,68 @@ function connectPermissionsWebSocket() {
             const payload = JSON.parse(event.data);
             if (payload.type === 'connected') {
                 logEvent('info', 'Access updates channel connected');
+                return;
+            }
+
+            // Host ended the meeting — everyone gets kicked
+            if (payload.type === 'meeting_ended') {
+                logEvent('warn', `Meeting ended by host: ${payload.reason || ''}`);
+                showNotification(payload.reason || 'The meeting has been ended by the host.', 'error');
+                isLeavingSessionIntentional = true;
+                leaveSession();
+                return;
+            }
+
+            // Host disconnected (abruptly or intentionally without transferring)
+            if (payload.type === 'host_disconnected') {
+                logEvent('warn', `Host disconnected. hasCoHost=${payload.hasCoHost}, promotedId=${payload.promotedParticipantId}`);
+                
+                if (payload.hasCoHost && payload.promotedParticipantId) {
+                    // A co-host is present — they assume host privileges
+                    const isPromotedParticipant = payload.promotedParticipantId === appState.currentRootParticipantId;
+                    if (isPromotedParticipant) {
+                        appState.authRole = 'host';
+                        showNotification('The host has left. You have been promoted to host.', 'info');
+                    } else {
+                        showNotification('The host has left. A co-host has taken over.', 'info');
+                    }
+                    await refreshCurrentPermissions({ silent: true });
+                    applyPermissionBasedUi();
+                    if (appState.isParticipantsOpen) {
+                        renderParticipantsList();
+                    }
+                } else {
+                    // No co-host — disable all participants' mic and camera to prevent unsupervised communication
+                    showNotification('The host has left the meeting. Your microphone and camera have been disabled.', 'error');
+                    if (isLocalAudioLive()) {
+                        await livekitClient.toggleAudio();
+                        appState.isAudioEnabled = false;
+                    }
+                    if (isLocalVideoLive()) {
+                        await livekitClient.toggleVideo();
+                        appState.isVideoEnabled = false;
+                    }
+                    syncLocalMediaControlUi();
+                }
+                return;
+            }
+
+            // Host role transferred to another participant
+            if (payload.type === 'host_transferred') {
+                logEvent('info', `Host transferred: new=${payload.newHostParticipantId}, previous=${payload.previousHostParticipantId}`);
+                const isNewHost = payload.newHostParticipantId === appState.currentRootParticipantId;
+                if (isNewHost) {
+                    appState.authRole = 'host';
+                    showNotification('You are now the host of this meeting.', 'info');
+                } else {
+                    showNotification('The host role has been transferred.', 'info');
+                }
+                applyGlobalSessionSnapshot(payload);
+                await refreshCurrentPermissions({ silent: true });
+                applyPermissionBasedUi();
+                if (appState.isParticipantsOpen) {
+                    renderParticipantsList();
+                }
                 return;
             }
 
@@ -4963,10 +5023,8 @@ function renderParticipantsList() {
         </div>
     ` : '';
 
-    // Split participants into raised hands and others
+    // Raised hands section — compact summary cards at the top
     const raisedHandParticipants = sortedParticipants.filter(p => p.isHandRaised);
-    const raisedHandIds = new Set(raisedHandParticipants.map(p => p.connectionId));
-    
     const raisedHandMarkup = raisedHandParticipants.length > 0 ? `
         <div class="participants-section raised-hands-section">
             <div class="participants-section-title">
@@ -4974,19 +5032,19 @@ function renderParticipantsList() {
                 Raised hands (${raisedHandParticipants.length})
             </div>
             ${raisedHandParticipants.map(p => {
-                // Find and return the already-generated markup for this participant
-                const idx = sortedParticipants.indexOf(p);
-                return participantMarkup.split('</div>\n        ')[idx] !== undefined
-                    ? `<div class="participant-item raised-hand-highlight" data-connection-id="${p.connectionId}">
+                const roleLabel = getParticipantRoleListLabel(p.role);
+                return `
+                    <div class="participant-item raised-hand-highlight" data-connection-id="${p.connectionId}">
                         <div class="participant-avatar">${p.nickname.charAt(0).toUpperCase()}</div>
                         <div class="participant-info">
                             <div class="participant-name">
                                 <span class="participant-name-text">${escapeHtml(p.nickname)}</span>
+                                ${roleLabel ? `<span class="participant-role-label">(${escapeHtml(roleLabel)})</span>` : ''}
+                                ${p.isLocal ? '<span class="participant-you-badge">You</span>' : ''}
                                 <span class="participant-hand-badge">✋</span>
                             </div>
                         </div>
-                    </div>`
-                    : '';
+                    </div>`;
             }).join('')}
         </div>
     ` : '';
@@ -5426,10 +5484,6 @@ function resetRaiseHand() {
  * Toggle reactions popup visibility
  */
 function toggleReactionsPopup() {
-    if (!canSendGroupMessages()) {
-        showNotification('You do not have permission to send reactions.', 'error');
-        return;
-    }
 
     const willShow = !elements.reactionsPopup?.classList.contains('show');
     if (willShow) {
@@ -5478,11 +5532,6 @@ function positionReactionsPopup() {
  * Send a reaction to all participants
  */
 function sendReaction(reaction) {
-    if (!canSendGroupMessages()) {
-        showNotification('You do not have permission to send reactions.', 'error');
-        return;
-    }
-
     if (!livekitClient.room) {
         console.error('[Reactions] No room available');
         return;
@@ -6442,6 +6491,124 @@ function notifyParticipantDisconnected(options = {}) {
     }).catch(() => null);
 }
 
+/**
+ * Show the host leave dialog with options to transfer or end the meeting
+ */
+function showHostLeaveDialog() {
+    // Find connected co-hosts
+    const connectedCoHosts = getGlobalParticipantsForPanels().filter(
+        p => p.role === 'co_host' && p.presence === 'connected' && !p.isLocal
+    );
+
+    // Remove any existing dialog
+    document.getElementById('hostLeaveDialog')?.remove();
+
+    const dialog = document.createElement('div');
+    dialog.id = 'hostLeaveDialog';
+    dialog.className = 'host-leave-overlay';
+
+    const coHostOptions = connectedCoHosts.length > 0
+        ? `
+            <div class="host-leave-section">
+                <p class="host-leave-section-title">Transfer host role to a co-host:</p>
+                ${connectedCoHosts.map(c => `
+                    <button class="host-leave-btn host-leave-transfer" data-participant-id="${c.connectionId}">
+                        <i data-lucide="arrow-right-left"></i>
+                        <span>Transfer to ${escapeHtml(c.nickname)}</span>
+                    </button>
+                `).join('')}
+            </div>
+            <div class="host-leave-divider"><span>or</span></div>
+        `
+        : '';
+
+    dialog.innerHTML = `
+        <div class="host-leave-dialog">
+            <div class="host-leave-header">
+                <h3>Leave Meeting</h3>
+                <p>You are the host. What would you like to do?</p>
+            </div>
+            ${coHostOptions}
+            <div class="host-leave-section">
+                <button class="host-leave-btn host-leave-end" id="hostEndMeetingBtn">
+                    <i data-lucide="phone-off"></i>
+                    <span>End meeting for everyone</span>
+                </button>
+                <button class="host-leave-btn host-leave-cancel" id="hostLeaveCancelBtn">
+                    <span>Cancel</span>
+                </button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(dialog);
+    lucide.createIcons();
+
+    // Cancel
+    document.getElementById('hostLeaveCancelBtn').addEventListener('click', () => dialog.remove());
+    dialog.addEventListener('click', (e) => {
+        if (e.target === dialog) dialog.remove();
+    });
+
+    // End meeting
+    document.getElementById('hostEndMeetingBtn').addEventListener('click', async () => {
+        dialog.remove();
+        await endMeetingForEveryone();
+    });
+
+    // Transfer buttons
+    dialog.querySelectorAll('.host-leave-transfer').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const participantId = btn.dataset.participantId;
+            dialog.remove();
+            await transferHostAndLeave(participantId);
+        });
+    });
+}
+
+/**
+ * End the meeting for all participants (host action)
+ */
+async function endMeetingForEveryone() {
+    try {
+        const response = await apiFetch(
+            `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.END_MEETING(appState.sessionId)}`,
+            { method: 'POST', credentials: 'same-origin' }
+        );
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            throw new Error(err.details || 'Failed to end meeting');
+        }
+        leaveSession();
+    } catch (error) {
+        showNotification(error.message || 'Failed to end meeting.', 'error');
+    }
+}
+
+/**
+ * Transfer host role to a co-host then leave
+ */
+async function transferHostAndLeave(targetParticipantId) {
+    try {
+        const response = await apiFetch(
+            `${CONFIG.BACKEND_URL}${CONFIG.ENDPOINTS.TRANSFER_HOST(appState.sessionId)}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ participantId: targetParticipantId }),
+            }
+        );
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            throw new Error(err.details || 'Failed to transfer host role');
+        }
+        showNotification('Host role transferred. Leaving session...', 'info');
+        leaveSession();
+    } catch (error) {
+        showNotification(error.message || 'Failed to transfer host.', 'error');
+    }
+}
+
 function leaveSession() {
     notifyParticipantDisconnected();
     isLeavingSessionIntentional = true;
@@ -6522,7 +6689,7 @@ function leaveSession() {
         chatEnabled: true,
         groupChatEnabled: false,
         whiteboardEnabled: true,
-        subtitlesEnabled: true,
+        subtitlesEnabled: false,
         aiInterpretationEnabled: false,
     };
     appState.isScreenSharing = false;
@@ -6670,9 +6837,13 @@ elements.toggleVideoBtn.addEventListener('click', async () => {
     logEvent('info', appState.isVideoEnabled ? 'Camera enabled' : 'Camera disabled');
 });
 
-// Leave session
+// Leave session — host gets a special dialog
 elements.leaveSessionBtn.addEventListener('click', () => {
-    leaveSession();
+    if (appState.authRole === 'host') {
+        showHostLeaveDialog();
+    } else {
+        leaveSession();
+    }
 });
 
 // Screen share toggle

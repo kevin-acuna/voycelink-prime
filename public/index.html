@@ -81,7 +81,7 @@
                     <input type="hidden" id="sessionId">
                     <div class="form-group">
                         <div class="form-label-row">
-                            <label for="nickname">Your Name</label>
+                            <label for="nickname">Your Full Name</label>
                             <button type="button" class="btn-inline-edit" id="editNicknameBtn" title="Edit saved name" style="display: none;">
                                 <i data-lucide="pencil"></i>
                                 <span>Edit</span>
@@ -95,10 +95,10 @@
                             autocomplete="off"
                         >
                     </div>
-                    <div class="form-group">
+                    <div class="form-group" style="display: none;">
                         <label for="preferredLanguage">Your Language</label>
                         <select id="preferredLanguage">
-                            <option value="en">English</option>
+                            <option value="en" selected>English</option>
                             <option value="es">Spanish</option>
                             <option value="fr">French</option>
                             <option value="de">German</option>
@@ -242,7 +242,7 @@
                     <i data-lucide="languages"></i>
                     <span>AI Interpreter</span>
                 </button>
-                <button class="btn btn-captions" id="toggleTranscription" title="Toggle Live Transcription" disabled>
+                <button class="btn btn-captions" id="toggleTranscription" title="Toggle Live Transcription" disabled style="display: none;">
                     <i data-lucide="subtitles"></i>
                     <span>Subtitles</span>
                 </button>
@@ -330,8 +330,8 @@
                             <span class="toggle-slider"></span>
                             <span class="chat-global-toggle-label">Global</span>
                         </label>
-                        <label class="translate-toggle" title="Toggle auto-translation">
-                            <input type="checkbox" id="chatTranslateToggle" checked>
+                        <label class="translate-toggle" title="Toggle auto-translation" style="display: none;">
+                            <input type="checkbox" id="chatTranslateToggle">
                             <span class="toggle-slider"></span>
                             <span class="toggle-label"><i data-lucide="languages"></i></span>
                         </label>
@@ -344,7 +344,7 @@
                     <div class="chat-empty">
                         <i data-lucide="message-square-dashed"></i>
                         <p>No messages yet</p>
-                        <span>Messages will be translated to your language</span>
+                        <span>Start a conversation</span>
                     </div>
                 </div>
                 <div class="chat-input-container">
