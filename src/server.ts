@@ -2134,11 +2134,29 @@ app.post('/api/sessions/:sessionId/participants/:participantId/disconnect', requ
                 ([pid, role]) => role === Role.CO_HOST && presence[pid] === 'connected'
             );
 
+            // Actually promote the co-host to host in the stored session
+            if (connectedCoHost) {
+                storedSession.setParticipantRole(new ParticipantId(connectedCoHost[0]), Role.HOST);
+            } else {
+                // No co-host — revoke audio/video permissions for all connected participants
+                for (const [pid, status] of Object.entries(presence)) {
+                    if (status === 'connected' && roles[pid] === Role.PARTICIPANT) {
+                        storedSession.updateParticipantPermissions(new ParticipantId(pid), {
+                            audioEnabled: false,
+                            videoEnabled: false,
+                        });
+                    }
+                }
+                logger.info({ sessionId }, 'Revoked audio/video for all participants — no co-host available');
+            }
+            await sessionRepository.save(storedSession);
+
             broadcastPermissionUpdate(sessionId, {
                 type: 'host_disconnected',
                 sessionId,
                 hasCoHost: Boolean(connectedCoHost),
                 promotedParticipantId: connectedCoHost ? connectedCoHost[0] : null,
+                ...buildBreakoutSnapshot(storedSession),
             });
             logger.info(
                 { sessionId, hasCoHost: Boolean(connectedCoHost), promotedCoHost: connectedCoHost?.[0] || null },
@@ -2899,6 +2917,39 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
             }
         }
 
+        // Enforce single host: if this participant is connecting as host,
+        // demote any other connected host to co_host
+        if (!isAuxiliaryMedia && req.auth.role === Role.HOST) {
+            const joiningId = currentParticipantId || stableParticipantId;
+            const allRoles = storedSession.getParticipantRoles();
+            const allPresence = storedSession.getParticipantPresenceMap();
+            const demotedIds = [];
+            logger.info(
+                { sessionId, joiningId, allRoles, allPresence },
+                'Checking single-host enforcement'
+            );
+            for (const [pid, role] of Object.entries(allRoles)) {
+                if (role === Role.HOST && pid !== joiningId) {
+                    // Demote regardless of presence — there must be only one host
+                    storedSession.setParticipantRole(new ParticipantId(pid), Role.CO_HOST);
+                    demotedIds.push(pid);
+                    logger.info(
+                        { sessionId, demotedParticipant: pid, presence: allPresence[pid], returningHost: joiningId },
+                        'Demoted existing host to co_host — original host returned'
+                    );
+                }
+            }
+            if (demotedIds.length > 0) {
+                broadcastPermissionUpdate(sessionId, {
+                    type: 'host_transferred',
+                    sessionId,
+                    newHostParticipantId: joiningId,
+                    previousHostParticipantId: demotedIds[0],
+                    ...buildBreakoutSnapshot(storedSession),
+                });
+            }
+        }
+
         if (!isAuxiliaryMedia) {
             await sessionRepository.save(storedSession);
         }
@@ -3351,6 +3402,101 @@ function setupPermissionsWebSocket() {
             ws.on('close', () => {
                 removePermissionSubscription(roomId, ws);
                 wsLogger.info({ roomId, participantId }, 'Permissions WebSocket disconnected');
+
+                // Detect abrupt host disconnect — wait a few seconds then check
+                // if the host is still disconnected (the beacon may have already handled it)
+                if (participantId) {
+                    setTimeout(async () => {
+                        try {
+                            const storedSession = await sessionRepository.findById(roomId);
+                            if (!storedSession) return;
+
+                            const resolvedId = resolveRootParticipantId(storedSession, participantId);
+                            if (!resolvedId) return;
+
+                            const participantRef = new ParticipantId(resolvedId);
+                            const role = storedSession.getParticipantRole(participantRef);
+                            if (role !== Role.HOST) return;
+
+                            const presence = storedSession.getParticipantPresence(participantRef);
+                            if (presence === 'connected') {
+                                // Host is still marked connected — the beacon never arrived. Mark them disconnected now.
+                                storedSession.markParticipantDisconnected(participantRef);
+                                await sessionRepository.save(storedSession);
+                                wsLogger.info({ roomId, participantId: resolvedId }, 'Marked host disconnected via WebSocket close fallback');
+
+                                broadcastPermissionUpdate(roomId, {
+                                    type: 'participant_left_conference',
+                                    sessionId: roomId,
+                                    participantId: resolvedId,
+                                    ...buildBreakoutSnapshot(storedSession),
+                                });
+                            }
+
+                            // Check if promotion is still needed
+                            const currentRole = storedSession.getParticipantRole(participantRef);
+                            const currentPresence = storedSession.getParticipantPresence(participantRef);
+                            if (currentRole !== Role.HOST || currentPresence !== 'disconnected') return;
+
+                            // Check if any connected participant already has the host role
+                            const allRoles = storedSession.getParticipantRoles();
+                            const allPresence = storedSession.getParticipantPresenceMap();
+                            const hasActiveHost = Object.entries(allRoles).some(
+                                ([pid, r]) => r === Role.HOST && allPresence[pid] === 'connected'
+                            );
+                            if (hasActiveHost) return;
+
+                            // Find a connected co-host to promote
+                            const connectedCoHost = Object.entries(allRoles).find(
+                                ([pid, r]) => r === Role.CO_HOST && allPresence[pid] === 'connected'
+                            );
+
+                            if (connectedCoHost) {
+                                storedSession.setParticipantRole(new ParticipantId(connectedCoHost[0]), Role.HOST);
+                                await sessionRepository.save(storedSession);
+
+                                broadcastPermissionUpdate(roomId, {
+                                    type: 'host_disconnected',
+                                    sessionId: roomId,
+                                    hasCoHost: true,
+                                    promotedParticipantId: connectedCoHost[0],
+                                    ...buildBreakoutSnapshot(storedSession),
+                                });
+                                wsLogger.info(
+                                    { roomId, promotedCoHost: connectedCoHost[0] },
+                                    'Auto-promoted co-host to host after abrupt host disconnect (WebSocket fallback)'
+                                );
+                            } else {
+                                // No co-host — revoke audio/video permissions for all connected participants
+                                const wsAllRoles = storedSession.getParticipantRoles();
+                                const wsAllPresence = storedSession.getParticipantPresenceMap();
+                                for (const [pid, status] of Object.entries(wsAllPresence)) {
+                                    if (status === 'connected' && wsAllRoles[pid] === Role.PARTICIPANT) {
+                                        storedSession.updateParticipantPermissions(new ParticipantId(pid), {
+                                            audioEnabled: false,
+                                            videoEnabled: false,
+                                        });
+                                    }
+                                }
+                                await sessionRepository.save(storedSession);
+
+                                broadcastPermissionUpdate(roomId, {
+                                    type: 'host_disconnected',
+                                    sessionId: roomId,
+                                    hasCoHost: false,
+                                    promotedParticipantId: null,
+                                    ...buildBreakoutSnapshot(storedSession),
+                                });
+                                wsLogger.info(
+                                    { roomId },
+                                    'Host disconnected abruptly with no co-host — revoked audio/video and notified (WebSocket fallback)'
+                                );
+                            }
+                        } catch (error) {
+                            wsLogger.warn({ err: error, roomId, participantId }, 'Error in host disconnect fallback check');
+                        }
+                    }, 10_000);
+                }
             });
 
             ws.on('error', (error) => {

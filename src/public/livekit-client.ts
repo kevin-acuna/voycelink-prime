@@ -338,6 +338,48 @@ class LiveKitClient {
     }
 
     /**
+     * Switch active input/output device mid-call
+     * @param {'audioinput'|'audiooutput'|'videoinput'} kind
+     * @param {string} deviceId
+     * @param {HTMLVideoElement} [localVideoElement] - video element to re-attach camera track
+     */
+    async switchActiveDevice(kind, deviceId, localVideoElement = null) {
+        if (!this.room) return;
+        const lp = this.room.localParticipant;
+
+        if (kind === 'audioinput') {
+            if (this.isMicrophoneEnabled()) {
+                await this.room.switchActiveDevice(kind, deviceId);
+            }
+            // If mic is muted, just store the preference — it'll be used on next enable
+            const micPub = lp.getTrackPublication(LivekitClient.Track.Source.Microphone);
+            if (micPub?.track) this.localAudioTrack = micPub.track;
+        } else if (kind === 'videoinput') {
+            if (this.isCameraEnabled()) {
+                // Detach old track from video element
+                if (this.localVideoTrack && localVideoElement) {
+                    this.localVideoTrack.detach(localVideoElement);
+                }
+                await this.room.switchActiveDevice(kind, deviceId);
+                // Re-attach the new track
+                const camPub = lp.getTrackPublication(LivekitClient.Track.Source.Camera);
+                if (camPub?.track) {
+                    this.localVideoTrack = camPub.track;
+                    if (localVideoElement) {
+                        camPub.track.attach(localVideoElement);
+                    }
+                }
+            }
+            // If camera is off, just store the preference
+        } else {
+            // audiooutput
+            await this.room.switchActiveDevice(kind, deviceId);
+        }
+
+        this.log('info', `Switched ${kind} to ${deviceId}`);
+    }
+
+    /**
      * Disconnect and clean up
      */
     disconnect() {

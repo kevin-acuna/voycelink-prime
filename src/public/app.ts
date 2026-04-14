@@ -303,6 +303,14 @@ const elements = {
     advancedWhiteboardLink: document.getElementById('advancedWhiteboardLink'),
     whiteboardWrapper: document.getElementById('whiteboardWrapper'),
     closeWhiteboardBtn: document.getElementById('closeWhiteboardBtn'),
+    // In-call device pickers
+    audioDeviceCaret: document.getElementById('audioDeviceCaret'),
+    audioDevicePicker: document.getElementById('audioDevicePicker'),
+    inCallMicSelect: document.getElementById('inCallMicSelect'),
+    inCallSpeakerSelect: document.getElementById('inCallSpeakerSelect'),
+    videoDeviceCaret: document.getElementById('videoDeviceCaret'),
+    videoDevicePicker: document.getElementById('videoDevicePicker'),
+    inCallCameraSelect: document.getElementById('inCallCameraSelect'),
     // Raise hand
     toggleRaiseHandBtn: document.getElementById('toggleRaiseHand'),
     // Reactions elements
@@ -2366,7 +2374,9 @@ function connectPermissionsWebSocket() {
                     } else {
                         showNotification('The host has left. A co-host has taken over.', 'info');
                     }
+                    applyGlobalSessionSnapshot(payload);
                     await refreshCurrentPermissions({ silent: true });
+                    await syncParticipantRolesFromSession();
                     applyPermissionBasedUi();
                     if (appState.isParticipantsOpen) {
                         renderParticipantsList();
@@ -2383,6 +2393,10 @@ function connectPermissionsWebSocket() {
                         appState.isVideoEnabled = false;
                     }
                     syncLocalMediaControlUi();
+                    // Apply server-side permission revocation so user cannot re-enable
+                    applyGlobalSessionSnapshot(payload);
+                    await refreshCurrentPermissions({ silent: true });
+                    applyPermissionBasedUi();
                 }
                 return;
             }
@@ -2399,6 +2413,7 @@ function connectPermissionsWebSocket() {
                 }
                 applyGlobalSessionSnapshot(payload);
                 await refreshCurrentPermissions({ silent: true });
+                await syncParticipantRolesFromSession();
                 applyPermissionBasedUi();
                 if (appState.isParticipantsOpen) {
                     renderParticipantsList();
@@ -3246,6 +3261,130 @@ async function handleDeviceChange(type) {
     }
     // Update visible labels
     updateDeviceLabels();
+}
+
+// =============================================================================
+// In-Call Device Picker
+// =============================================================================
+
+/**
+ * Populate in-call device picker selects with current devices
+ */
+async function populateInCallDevicePickers() {
+    try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const microphones = devices.filter(d => d.kind === 'audioinput');
+        const speakers = devices.filter(d => d.kind === 'audiooutput');
+        const cameras = devices.filter(d => d.kind === 'videoinput');
+
+        elements.inCallMicSelect.innerHTML = microphones.length > 0
+            ? microphones.map((d, i) =>
+                `<option value="${d.deviceId}">${cleanDeviceLabel(d.label) || `Microphone ${i + 1}`}</option>`
+            ).join('')
+            : '<option value="">No microphone</option>';
+
+        elements.inCallSpeakerSelect.innerHTML = speakers.length > 0
+            ? speakers.map((d, i) =>
+                `<option value="${d.deviceId}">${cleanDeviceLabel(d.label) || `Speaker ${i + 1}`}</option>`
+            ).join('')
+            : '<option value="">Default speaker</option>';
+
+        elements.inCallCameraSelect.innerHTML = cameras.length > 0
+            ? cameras.map((d, i) =>
+                `<option value="${d.deviceId}">${cleanDeviceLabel(d.label) || `Camera ${i + 1}`}</option>`
+            ).join('')
+            : '<option value="">No camera</option>';
+
+        // Try to pre-select the currently active device
+        if (previewState.selectedMicId) elements.inCallMicSelect.value = previewState.selectedMicId;
+        if (previewState.selectedSpeakerId) elements.inCallSpeakerSelect.value = previewState.selectedSpeakerId;
+        if (previewState.selectedCameraId) elements.inCallCameraSelect.value = previewState.selectedCameraId;
+
+        lucide.createIcons();
+    } catch (e) {
+        console.error('Error populating in-call device pickers:', e);
+    }
+}
+
+function positionDevicePicker(popup, anchorBtn) {
+    const rect = anchorBtn.getBoundingClientRect();
+    popup.style.visibility = 'hidden';
+    popup.style.display = 'flex';
+    const popupRect = popup.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - popupRect.width / 2;
+    if (left < 8) left = 8;
+    if (left + popupRect.width > window.innerWidth - 8) left = window.innerWidth - 8 - popupRect.width;
+    popup.style.left = `${left}px`;
+    popup.style.top = `${rect.top - popupRect.height - 8}px`;
+    popup.style.visibility = '';
+}
+
+function toggleAudioDevicePicker() {
+    const isOpen = elements.audioDevicePicker.style.display !== 'none';
+    closeAllDevicePickers();
+    if (!isOpen) {
+        populateInCallDevicePickers();
+        positionDevicePicker(elements.audioDevicePicker, elements.audioDeviceCaret);
+        elements.audioDeviceCaret.classList.add('active');
+    }
+}
+
+function toggleVideoDevicePicker() {
+    const isOpen = elements.videoDevicePicker.style.display !== 'none';
+    closeAllDevicePickers();
+    if (!isOpen) {
+        populateInCallDevicePickers();
+        positionDevicePicker(elements.videoDevicePicker, elements.videoDeviceCaret);
+        elements.videoDeviceCaret.classList.add('active');
+    }
+}
+
+function closeAllDevicePickers() {
+    elements.audioDevicePicker.style.display = 'none';
+    elements.videoDevicePicker.style.display = 'none';
+    elements.audioDeviceCaret?.classList.remove('active');
+    elements.videoDeviceCaret?.classList.remove('active');
+}
+
+async function handleInCallMicChange() {
+    const deviceId = elements.inCallMicSelect.value;
+    if (!deviceId) return;
+    previewState.selectedMicId = deviceId;
+    try {
+        await livekitClient.switchActiveDevice('audioinput', deviceId);
+        syncLocalMediaControlUi();
+        logEvent('info', `Switched microphone to: ${deviceId}`);
+    } catch (e) {
+        showNotification('Failed to switch microphone.', 'error');
+        console.error('Error switching microphone:', e);
+    }
+}
+
+async function handleInCallSpeakerChange() {
+    const deviceId = elements.inCallSpeakerSelect.value;
+    if (!deviceId) return;
+    previewState.selectedSpeakerId = deviceId;
+    try {
+        await livekitClient.switchActiveDevice('audiooutput', deviceId);
+        logEvent('info', `Switched speaker to: ${deviceId}`);
+    } catch (e) {
+        showNotification('Failed to switch speaker.', 'error');
+        console.error('Error switching speaker:', e);
+    }
+}
+
+async function handleInCallCameraChange() {
+    const deviceId = elements.inCallCameraSelect.value;
+    if (!deviceId) return;
+    previewState.selectedCameraId = deviceId;
+    try {
+        await livekitClient.switchActiveDevice('videoinput', deviceId, elements.localVideo);
+        syncLocalMediaControlUi();
+        logEvent('info', `Switched camera to: ${deviceId}`);
+    } catch (e) {
+        showNotification('Failed to switch camera.', 'error');
+        console.error('Error switching camera:', e);
+    }
 }
 
 // =============================================================================
@@ -6875,6 +7014,13 @@ elements.microphoneSelect.addEventListener('change', () => handleDeviceChange('m
 elements.cameraSelect.addEventListener('change', () => handleDeviceChange('camera'));
 elements.speakerSelect.addEventListener('change', () => handleDeviceChange('speaker'));
 
+// In-call device pickers
+elements.audioDeviceCaret?.addEventListener('click', (e) => { e.stopPropagation(); toggleAudioDevicePicker(); });
+elements.videoDeviceCaret?.addEventListener('click', (e) => { e.stopPropagation(); toggleVideoDevicePicker(); });
+elements.inCallMicSelect?.addEventListener('change', handleInCallMicChange);
+elements.inCallSpeakerSelect?.addEventListener('change', handleInCallSpeakerChange);
+elements.inCallCameraSelect?.addEventListener('change', handleInCallCameraChange);
+
 // Meeting controls
 elements.createMeetingBtn.addEventListener('click', async () => {
     await withButtonProtection(elements.createMeetingBtn, async () => {
@@ -6967,6 +7113,10 @@ document.addEventListener('click', (e) => {
 
     if (!e.target.closest('.whiteboard-actions')) {
         closeWhiteboardMenu();
+    }
+
+    if (!e.target.closest('.device-control-group')) {
+        closeAllDevicePickers();
     }
 });
 

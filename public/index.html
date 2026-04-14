@@ -226,12 +226,38 @@
 
             <!-- Controls -->
             <div class="controls-bar">
-                <button class="btn btn-control" id="toggleAudio" title="Toggle Microphone">
-                    <i data-lucide="mic"></i>
-                </button>
-                <button class="btn btn-control" id="toggleVideo" title="Toggle Camera">
-                    <i data-lucide="video"></i>
-                </button>
+                <div class="device-control-group">
+                    <button class="btn btn-control" id="toggleAudio" title="Toggle Microphone">
+                        <i data-lucide="mic"></i>
+                    </button>
+                    <button class="btn btn-device-caret" id="audioDeviceCaret" title="Select microphone & speaker">
+                        <i data-lucide="chevron-up"></i>
+                    </button>
+                    <div class="device-picker-popup" id="audioDevicePicker" style="display: none;">
+                        <div class="device-picker-section">
+                            <div class="device-picker-label"><i data-lucide="mic"></i> Microphone</div>
+                            <select id="inCallMicSelect" class="device-picker-select"></select>
+                        </div>
+                        <div class="device-picker-section">
+                            <div class="device-picker-label"><i data-lucide="volume-2"></i> Speaker</div>
+                            <select id="inCallSpeakerSelect" class="device-picker-select"></select>
+                        </div>
+                    </div>
+                </div>
+                <div class="device-control-group">
+                    <button class="btn btn-control" id="toggleVideo" title="Toggle Camera">
+                        <i data-lucide="video"></i>
+                    </button>
+                    <button class="btn btn-device-caret" id="videoDeviceCaret" title="Select camera">
+                        <i data-lucide="chevron-up"></i>
+                    </button>
+                    <div class="device-picker-popup" id="videoDevicePicker" style="display: none;">
+                        <div class="device-picker-section">
+                            <div class="device-picker-label"><i data-lucide="video"></i> Camera</div>
+                            <select id="inCallCameraSelect" class="device-picker-select"></select>
+                        </div>
+                    </div>
+                </div>
                 <button class="btn btn-control" id="toggleScreenShare" title="Share Screen">
                     <i data-lucide="monitor-up"></i>
                 </button>
