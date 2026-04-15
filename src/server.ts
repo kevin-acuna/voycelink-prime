@@ -2948,6 +2948,36 @@ app.post('/api/sessions/:sessionId/connections', requirePermission(Permission.JO
                     ...buildBreakoutSnapshot(storedSession),
                 });
             }
+
+            // Restore participant audio/video permissions that were revoked
+            // during the host's absence (the host-disconnected mute-all logic)
+            const restoreRoles = storedSession.getParticipantRoles();
+            const restorePresence = storedSession.getParticipantPresenceMap();
+            let permissionsRestored = false;
+            for (const [pid, pRole] of Object.entries(restoreRoles)) {
+                if (pid === joiningId) continue;
+                if (restorePresence[pid] !== 'connected') continue;
+                const perms = storedSession.getParticipantPermissions(new ParticipantId(pid)) || {};
+                if (perms.audioEnabled === false || perms.videoEnabled === false) {
+                    // Remove the override — revert to role-based defaults
+                    const cleaned = { ...perms };
+                    delete cleaned.audioEnabled;
+                    delete cleaned.videoEnabled;
+                    storedSession.setParticipantPermissions(new ParticipantId(pid), cleaned);
+                    permissionsRestored = true;
+                    logger.info(
+                        { sessionId, participantId: pid },
+                        'Restored audio/video permissions for participant — host reconnected'
+                    );
+                }
+            }
+            if (permissionsRestored) {
+                broadcastPermissionUpdate(sessionId, {
+                    type: 'breakout_rooms_updated',
+                    sessionId,
+                    ...buildBreakoutSnapshot(storedSession),
+                });
+            }
         }
 
         if (!isAuxiliaryMedia) {
@@ -3403,10 +3433,24 @@ function setupPermissionsWebSocket() {
                 removePermissionSubscription(roomId, ws);
                 wsLogger.info({ roomId, participantId }, 'Permissions WebSocket disconnected');
 
-                // Detect abrupt host disconnect — wait a few seconds then check
-                // if the host is still disconnected (the beacon may have already handled it)
+                // Detect abrupt host disconnect — wait long enough to tolerate
+                // brief network micro-cuts before checking (30s is generous for reconnections)
                 if (participantId) {
-                    setTimeout(async () => {
+                    // Capture the current media connection at the time of disconnect
+                    // so we can detect if the host reconnected (new media connection)
+                    const captureSnapshotAndSchedule = async () => {
+                        let snapshotMediaConnectionId = null;
+                        try {
+                            const snapSession = await sessionRepository.findById(roomId);
+                            if (snapSession) {
+                                const snapResolved = resolveRootParticipantId(snapSession, participantId);
+                                if (snapResolved) {
+                                    snapshotMediaConnectionId = snapSession.getParticipantMediaConnection(new ParticipantId(snapResolved));
+                                }
+                            }
+                        } catch (_) {}
+
+                        setTimeout(async () => {
                         try {
                             const storedSession = await sessionRepository.findById(roomId);
                             if (!storedSession) return;
@@ -3418,9 +3462,21 @@ function setupPermissionsWebSocket() {
                             const role = storedSession.getParticipantRole(participantRef);
                             if (role !== Role.HOST) return;
 
+                            // Check if the host reconnected by comparing media connection IDs
+                            const currentMediaConnectionId = storedSession.getParticipantMediaConnection(participantRef);
                             const presence = storedSession.getParticipantPresence(participantRef);
+
+                            if (presence === 'connected' && currentMediaConnectionId && currentMediaConnectionId !== snapshotMediaConnectionId) {
+                                // Host reconnected with a new connection — abort, they're back
+                                wsLogger.info(
+                                    { roomId, participantId: resolvedId, oldConnection: snapshotMediaConnectionId, newConnection: currentMediaConnectionId },
+                                    'Host reconnected after WebSocket close — aborting disconnect fallback'
+                                );
+                                return;
+                            }
+
                             if (presence === 'connected') {
-                                // Host is still marked connected — the beacon never arrived. Mark them disconnected now.
+                                // Host is still marked connected with same/no media connection — beacon never arrived
                                 storedSession.markParticipantDisconnected(participantRef);
                                 await sessionRepository.save(storedSession);
                                 wsLogger.info({ roomId, participantId: resolvedId }, 'Marked host disconnected via WebSocket close fallback');
@@ -3495,7 +3551,11 @@ function setupPermissionsWebSocket() {
                         } catch (error) {
                             wsLogger.warn({ err: error, roomId, participantId }, 'Error in host disconnect fallback check');
                         }
-                    }, 10_000);
+                    }, 30_000);
+                    };
+                    captureSnapshotAndSchedule().catch((err) => {
+                        wsLogger.warn({ err, roomId, participantId }, 'Error in host disconnect snapshot capture');
+                    });
                 }
             });
 
