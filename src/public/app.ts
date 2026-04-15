@@ -1334,13 +1334,19 @@ async function enforceCurrentPermissions() {
         });
     }
 
-    if (!canPublishAudio() && isLocalAudioLive()) {
-        await livekitClient.toggleAudio();
+    if (!canPublishAudio()) {
+        if (isLocalAudioLive()) {
+            await livekitClient.toggleAudio();
+        }
+        // Always clear the flag so granting permission later won't auto-enable
         appState.isAudioEnabled = false;
     }
 
-    if (!canPublishVideo() && isLocalVideoLive()) {
-        await livekitClient.toggleVideo();
+    if (!canPublishVideo()) {
+        if (isLocalVideoLive()) {
+            await livekitClient.toggleVideo();
+        }
+        // Always clear the flag so granting permission later won't auto-enable
         appState.isVideoEnabled = false;
     }
 
@@ -5009,7 +5015,10 @@ function renderParticipantsList() {
     const waitingRoomMarkup = pendingWaitingRoomRequests.length > 0
         ? `
             <div class="participants-section waiting-room-section">
-                <div class="participants-section-title">Waiting room</div>
+                <div class="participants-section-title">
+                    Waiting room (${pendingWaitingRoomRequests.length})
+                    ${pendingWaitingRoomRequests.length >= 2 ? '<button class="admit-all-btn" id="admitAllBtn"><i data-lucide="check-check"></i> Admit all</button>' : ''}
+                </div>
                 ${pendingWaitingRoomRequests.map((request) => `
                     <div class="participant-item waiting-room-request-item" data-waiting-request-id="${request.id}">
                         <div class="participant-avatar">${escapeHtml((request.nickname || '?').charAt(0).toUpperCase())}</div>
@@ -5267,6 +5276,27 @@ function renderParticipantsList() {
             });
         });
     });
+
+    // Admit all waiting room requests
+    const admitAllBtn = document.getElementById('admitAllBtn');
+    if (admitAllBtn) {
+        admitAllBtn.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            await withButtonProtection(admitAllBtn, async () => {
+                const pending = (appState.waitingRoomRequests || []).filter(r => r.status === 'pending');
+                let admitted = 0;
+                for (const request of pending) {
+                    try {
+                        await approveWaitingRoomRequest(request.id);
+                        admitted++;
+                    } catch (e) {
+                        console.error(`Failed to admit ${request.nickname}:`, e);
+                    }
+                }
+                showNotification(`Admitted ${admitted} participant${admitted !== 1 ? 's' : ''} to the meeting.`, 'info');
+            });
+        });
+    }
 
     // Bulk action handlers — mic
     const enableMicBtn = elements.participantsList.querySelector('.bulk-enable-mic');
