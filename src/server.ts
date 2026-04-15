@@ -718,7 +718,9 @@ function requirePermission(permission) {
         try {
             let effectiveRole = req.auth?.role;
 
-            if (req.auth?.roomId && req.auth?.role !== Role.HOST) {
+            // Always check stored session role — the JWT role may be stale
+            // (e.g. host was demoted to co_host, or co_host was promoted to host)
+            if (req.auth?.roomId) {
                 const storedSession = await sessionRepository.findById(req.auth.roomId);
                 const participantId = resolveRootParticipantId(
                     storedSession,
@@ -2134,9 +2136,10 @@ app.post('/api/sessions/:sessionId/participants/:participantId/disconnect', requ
                 ([pid, role]) => role === Role.CO_HOST && presence[pid] === 'connected'
             );
 
-            // Actually promote the co-host to host in the stored session
+            // Promote co-host and demote the disconnecting host so there's never two hosts
             if (connectedCoHost) {
                 storedSession.setParticipantRole(new ParticipantId(connectedCoHost[0]), Role.HOST);
+                storedSession.setParticipantRole(new ParticipantId(resolvedParticipantId), Role.CO_HOST);
             } else {
                 // No co-host — revoke audio/video permissions for all connected participants
                 for (const [pid, status] of Object.entries(presence)) {
@@ -3509,6 +3512,8 @@ function setupPermissionsWebSocket() {
 
                             if (connectedCoHost) {
                                 storedSession.setParticipantRole(new ParticipantId(connectedCoHost[0]), Role.HOST);
+                                // Demote the disconnected host so there's never two hosts
+                                storedSession.setParticipantRole(participantRef, Role.CO_HOST);
                                 await sessionRepository.save(storedSession);
 
                                 broadcastPermissionUpdate(roomId, {

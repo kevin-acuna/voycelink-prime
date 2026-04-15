@@ -2411,9 +2411,13 @@ function connectPermissionsWebSocket() {
             if (payload.type === 'host_transferred') {
                 logEvent('info', `Host transferred: new=${payload.newHostParticipantId}, previous=${payload.previousHostParticipantId}`);
                 const isNewHost = payload.newHostParticipantId === appState.currentRootParticipantId;
+                const isPreviousHost = payload.previousHostParticipantId === appState.currentRootParticipantId;
                 if (isNewHost) {
                     appState.authRole = 'host';
                     showNotification('You are now the host of this meeting.', 'info');
+                } else if (isPreviousHost) {
+                    appState.authRole = 'co_host';
+                    showNotification('The host role has been transferred. You are now a co-host.', 'info');
                 } else {
                     showNotification('The host role has been transferred.', 'info');
                 }
@@ -4971,9 +4975,38 @@ function renderParticipantsList() {
     const pendingWaitingRoomRequests = canAdmitWaitingRoom()
         ? (appState.waitingRoomRequests || []).filter((request) => request.status === 'pending')
         : [];
-    const roster = shouldUseGlobalRosterView()
-        ? getGlobalParticipantsForPanels().filter((participant) => participant.presence === 'connected')
-        : Array.from(participantsData.values()).map((participant) => {
+
+    // Build roster by merging both data sources:
+    // 1. Global roster from server snapshots (participantProfiles, participantRoles, etc.)
+    // 2. Local participantsData from LiveKit track events
+    // This ensures the list is complete even if one source is lagging behind.
+    let roster;
+    if (shouldUseGlobalRosterView()) {
+        const globalRoster = getGlobalParticipantsForPanels().filter((p) => p.presence === 'connected');
+        const globalIds = new Set(globalRoster.map((p) => p.mediaConnectionId).filter(Boolean));
+        globalIds.add(appState.currentParticipantId);
+
+        // Add any locally-known participants missing from the global roster
+        for (const [connId, localP] of participantsData) {
+            if (!globalIds.has(connId)) {
+                const rootPid = localP.isLocal
+                    ? getCurrentRootParticipantId()
+                    : getRootParticipantIdForMediaConnection(connId);
+                globalRoster.push({
+                    ...localP,
+                    connectionId: rootPid || connId,
+                    participantId: rootPid || connId,
+                    mediaConnectionId: connId,
+                    presence: 'connected',
+                    location: { type: 'main', breakoutRoomId: null },
+                    locationLabel: 'Main room',
+                    permissions: localP.permissions || getDefaultParticipantPermissionState(),
+                });
+            }
+        }
+        roster = globalRoster;
+    } else {
+        roster = Array.from(participantsData.values()).map((participant) => {
             const rootParticipantId = participant.isLocal
                 ? getCurrentRootParticipantId()
                 : getRootParticipantIdForMediaConnection(participant.connectionId);
@@ -4997,6 +5030,7 @@ function renderParticipantsList() {
                     : (participant.permissions || getDefaultParticipantPermissionState()),
             };
         });
+    }
 
     if (roster.length === 0 && pendingWaitingRoomRequests.length === 0) {
         elements.participantsList.innerHTML = `
