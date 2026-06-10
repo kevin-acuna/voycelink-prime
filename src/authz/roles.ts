@@ -5,7 +5,7 @@ export const Role = {
   PARTICIPANT: 'participant',
 } as const;
 
-export type Role = typeof Role[keyof typeof Role];
+export type Role = (typeof Role)[keyof typeof Role];
 
 export const ALL_ROLES = Object.values(Role);
 

@@ -1,4 +1,4 @@
-import { Session } from './Session';
+import type { Session } from './Session';
 
 export interface SessionRepository {
   findById(sessionId: string): Promise<Session | null>;

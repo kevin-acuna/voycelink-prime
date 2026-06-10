@@ -1,6 +1,6 @@
-import { cosmos } from '../cosmos-client';
 import { Session, type SessionPrimitives } from '../../session/Session';
 import type { SessionRepository } from '../../session/SessionRepository';
+import { cosmos } from '../cosmos-client';
 
 type CosmosSessionDocument = SessionPrimitives & {
   entityType: 'session';
@@ -9,7 +9,9 @@ type CosmosSessionDocument = SessionPrimitives & {
 export class CosmosSessionRepository implements SessionRepository {
   async findById(sessionId: string): Promise<Session | null> {
     try {
-      const response = await cosmos.containers.rooms.item(sessionId, sessionId).read<CosmosSessionDocument>();
+      const response = await cosmos.containers.rooms
+        .item(sessionId, sessionId)
+        .read<CosmosSessionDocument>();
 
       if (!response.resource) {
         return null;
