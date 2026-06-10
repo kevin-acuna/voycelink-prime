@@ -1,10 +1,10 @@
 {
-  "name": "ai-dubbing-backend",
+  "name": "voycelink-prime",
   "version": "1.0.0",
   "description": "Backend BFF for AI Live Dubbing Platform - LiveKit Session/Token management",
   "main": "dist/server.js",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0"
   },
   "scripts": {
     "build": "shx rm -rf dist && tsc && shx mkdir -p dist/public && shx cp public/index.html public/styles.css dist/public/ && node scripts/obfuscate.js",
