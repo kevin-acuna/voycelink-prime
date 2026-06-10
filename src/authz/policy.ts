@@ -1,12 +1,12 @@
 import { Permission, type Permission as PermissionType } from './permissions';
 import { ROLE_PERMISSIONS } from './role-permissions';
 import { Role } from './roles';
-import type {
-  AuthorizationContext,
-  AuthorizationResult,
-} from './types';
+import type { AuthorizationContext, AuthorizationResult } from './types';
 
-function hasBasePermission(role: AuthorizationContext['role'], permission: PermissionType): boolean {
+function hasBasePermission(
+  role: AuthorizationContext['role'],
+  permission: PermissionType,
+): boolean {
   return ROLE_PERMISSIONS[role].includes(permission);
 }
 
@@ -17,7 +17,9 @@ function isChatPermission(permission: PermissionType): boolean {
   );
 }
 
-function isConferenceConfigurationPermission(permission: PermissionType): boolean {
+function isConferenceConfigurationPermission(
+  permission: PermissionType,
+): boolean {
   return permission === Permission.UPDATE_ROOM_CONFIGURATION;
 }
 
@@ -30,13 +32,17 @@ function isCustomGrantPermission(permission: PermissionType): boolean {
   );
 }
 
-export function getEffectivePermissions(context: AuthorizationContext): PermissionType[] {
-  return Object.values(Permission).filter((permission) => canPerform(context, permission).allowed);
+export function getEffectivePermissions(
+  context: AuthorizationContext,
+): PermissionType[] {
+  return Object.values(Permission).filter(
+    (permission) => canPerform(context, permission).allowed,
+  );
 }
 
 export function canPerform(
   context: AuthorizationContext,
-  permission: PermissionType
+  permission: PermissionType,
 ): AuthorizationResult {
   const { role, session, grants } = context;
   const requiresParticipantGrant = role !== Role.HOST && role !== Role.CO_HOST;
@@ -62,7 +68,10 @@ export function canPerform(
     };
   }
 
-  if (permission === Permission.USE_WHITEBOARD && session?.whiteboardEnabled === false) {
+  if (
+    permission === Permission.USE_WHITEBOARD &&
+    session?.whiteboardEnabled === false
+  ) {
     return {
       allowed: false,
       reason: 'whiteboard is not currently enabled for the session',
@@ -170,7 +179,10 @@ export function canPerform(
     }
   }
 
-  if (permission === Permission.ASSIGN_COHOST || permission === Permission.REMOVE_COHOST) {
+  if (
+    permission === Permission.ASSIGN_COHOST ||
+    permission === Permission.REMOVE_COHOST
+  ) {
     return role === Role.HOST
       ? { allowed: true, reason: 'host manages co-host role assignments' }
       : { allowed: false, reason: 'only the host can manage co-host roles' };
@@ -179,7 +191,10 @@ export function canPerform(
   if (isConferenceConfigurationPermission(permission)) {
     return role === Role.HOST
       ? { allowed: true, reason: 'host can update room configuration' }
-      : { allowed: false, reason: 'only the host can update room configuration' };
+      : {
+          allowed: false,
+          reason: 'only the host can update room configuration',
+        };
   }
 
   return {

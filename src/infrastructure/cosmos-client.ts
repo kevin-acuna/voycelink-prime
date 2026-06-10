@@ -10,7 +10,9 @@ export const cosmos = {
   database,
   containers: {
     rooms: database.container(config.cosmos.roomsContainerName),
-    participantPermissions: database.container(config.cosmos.participantPermissionsContainerName),
+    participantPermissions: database.container(
+      config.cosmos.participantPermissionsContainerName,
+    ),
   },
 };
 
@@ -21,9 +23,10 @@ export async function verifyCosmosConnection() {
     {
       databaseId: response.resource?.id,
       roomsContainer: config.cosmos.roomsContainerName,
-      participantPermissionsContainer: config.cosmos.participantPermissionsContainerName,
+      participantPermissionsContainer:
+        config.cosmos.participantPermissionsContainerName,
     },
-    'Cosmos DB connection verified'
+    'Cosmos DB connection verified',
   );
 
   return response.resource;

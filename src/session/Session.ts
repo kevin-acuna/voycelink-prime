@@ -18,7 +18,8 @@ export const BreakoutRoomStatus = {
   CLOSED: 'closed',
 } as const;
 
-export type BreakoutRoomStatus = typeof BreakoutRoomStatus[keyof typeof BreakoutRoomStatus];
+export type BreakoutRoomStatus =
+  (typeof BreakoutRoomStatus)[keyof typeof BreakoutRoomStatus];
 
 export type ParticipantProfile = {
   nickname: string;
@@ -63,7 +64,7 @@ export const WaitingRoomRequestStatus = {
 } as const;
 
 export type WaitingRoomRequestStatus =
-  typeof WaitingRoomRequestStatus[keyof typeof WaitingRoomRequestStatus];
+  (typeof WaitingRoomRequestStatus)[keyof typeof WaitingRoomRequestStatus];
 
 export type WaitingRoomRequestPrimitives = {
   id: string;
@@ -106,7 +107,9 @@ type BreakoutRoomState = {
 
 type WaitingRoomRequestState = WaitingRoomRequestPrimitives;
 
-function normalizeLocation(location?: ParticipantLocation | null): ParticipantLocation {
+function normalizeLocation(
+  location?: ParticipantLocation | null,
+): ParticipantLocation {
   if (!location || location.type !== 'breakout' || !location.breakoutRoomId) {
     return {
       type: 'main',
@@ -129,16 +132,18 @@ function createDefaultWhiteboardRoomState(): WhiteboardRoomState {
 }
 
 function normalizeWhiteboardState(
-  whiteboardState?: Partial<WhiteboardStatePrimitives> | null
+  whiteboardState?: Partial<WhiteboardStatePrimitives> | null,
 ): WhiteboardStatePrimitives {
   const breakoutStates = Object.fromEntries(
-    Object.entries(whiteboardState?.breakouts || {}).map(([breakoutRoomId, roomState]) => [
-      breakoutRoomId,
-      {
-        ...createDefaultWhiteboardRoomState(),
-        ...(roomState || {}),
-      },
-    ])
+    Object.entries(whiteboardState?.breakouts || {}).map(
+      ([breakoutRoomId, roomState]) => [
+        breakoutRoomId,
+        {
+          ...createDefaultWhiteboardRoomState(),
+          ...(roomState || {}),
+        },
+      ],
+    ),
   );
 
   return {
@@ -161,10 +166,16 @@ export class Session {
     private participantPermissions: Map<string, PermissionGrantSet> = new Map(),
     private participantProfiles: Map<string, ParticipantProfile> = new Map(),
     private participantLocations: Map<string, ParticipantLocation> = new Map(),
-    private participantPresence: Map<string, 'connected' | 'disconnected'> = new Map(),
+    private participantPresence: Map<
+      string,
+      'connected' | 'disconnected'
+    > = new Map(),
     private breakoutRooms: Map<string, BreakoutRoomState> = new Map(),
     private whiteboardState: WhiteboardStatePrimitives = normalizeWhiteboardState(),
-    private waitingRoomRequests: Map<string, WaitingRoomRequestState> = new Map()
+    private waitingRoomRequests: Map<
+      string,
+      WaitingRoomRequestState
+    > = new Map(),
   ) {
     if (!sessionId) {
       throw new Error('Session id cannot be empty');
@@ -183,7 +194,7 @@ export class Session {
           ...room,
           participantIds: new Set(room.participantIds || []),
         },
-      ])
+      ]),
     );
 
     return new Session(
@@ -196,10 +207,12 @@ export class Session {
       new Map(Object.entries(primitives.participantPermissions || {})),
       new Map(Object.entries(primitives.participantProfiles || {})),
       new Map(
-        Object.entries(primitives.participantLocations || {}).map(([participantId, location]) => [
-          participantId,
-          normalizeLocation(location),
-        ])
+        Object.entries(primitives.participantLocations || {}).map(
+          ([participantId, location]) => [
+            participantId,
+            normalizeLocation(location),
+          ],
+        ),
       ),
       new Map(Object.entries(primitives.participantPresence || {})),
       breakoutRooms,
@@ -210,8 +223,8 @@ export class Session {
           {
             ...request,
           },
-        ])
-      )
+        ]),
+      ),
     );
   }
 
@@ -280,9 +293,15 @@ export class Session {
     return Object.fromEntries(this.participantRoles.entries());
   }
 
-  setParticipantMediaConnection(participantId: ParticipantId, mediaConnectionId: string | null) {
+  setParticipantMediaConnection(
+    participantId: ParticipantId,
+    mediaConnectionId: string | null,
+  ) {
     this.ensureParticipantExists(participantId);
-    this.participantMediaConnections.set(participantId.value, mediaConnectionId || null);
+    this.participantMediaConnections.set(
+      participantId.value,
+      mediaConnectionId || null,
+    );
   }
 
   getParticipantMediaConnection(participantId: ParticipantId): string | null {
@@ -298,7 +317,10 @@ export class Session {
       return null;
     }
 
-    for (const [participantId, connectionId] of this.participantMediaConnections.entries()) {
+    for (const [
+      participantId,
+      connectionId,
+    ] of this.participantMediaConnections.entries()) {
       if (connectionId === mediaConnectionId) {
         return participantId;
       }
@@ -307,14 +329,21 @@ export class Session {
     return null;
   }
 
-  setParticipantPermissions(participantId: ParticipantId, permissions: PermissionGrantSet) {
+  setParticipantPermissions(
+    participantId: ParticipantId,
+    permissions: PermissionGrantSet,
+  ) {
     this.participantPermissions.set(participantId.value, {
       ...permissions,
     });
   }
 
-  updateParticipantPermissions(participantId: ParticipantId, permissions: PermissionGrantSet) {
-    const currentPermissions = this.participantPermissions.get(participantId.value) || {};
+  updateParticipantPermissions(
+    participantId: ParticipantId,
+    permissions: PermissionGrantSet,
+  ) {
+    const currentPermissions =
+      this.participantPermissions.get(participantId.value) || {};
     this.participantPermissions.set(participantId.value, {
       ...currentPermissions,
       ...permissions,
@@ -329,14 +358,19 @@ export class Session {
     return Object.fromEntries(this.participantPermissions.entries());
   }
 
-  setParticipantProfile(participantId: ParticipantId, profile: ParticipantProfile) {
+  setParticipantProfile(
+    participantId: ParticipantId,
+    profile: ParticipantProfile,
+  ) {
     this.participantProfiles.set(participantId.value, {
       nickname: profile.nickname,
       preferredLanguage: profile.preferredLanguage || 'en',
     });
   }
 
-  getParticipantProfile(participantId: ParticipantId): ParticipantProfile | null {
+  getParticipantProfile(
+    participantId: ParticipantId,
+  ): ParticipantProfile | null {
     return this.participantProfiles.get(participantId.value) || null;
   }
 
@@ -345,19 +379,25 @@ export class Session {
   }
 
   getParticipantLocation(participantId: ParticipantId): ParticipantLocation {
-    return normalizeLocation(this.participantLocations.get(participantId.value));
+    return normalizeLocation(
+      this.participantLocations.get(participantId.value),
+    );
   }
 
   getParticipantLocations(): Record<string, ParticipantLocation> {
     return Object.fromEntries(
-      Array.from(this.participantLocations.entries()).map(([participantId, location]) => [
-        participantId,
-        normalizeLocation(location),
-      ])
+      Array.from(this.participantLocations.entries()).map(
+        ([participantId, location]) => [
+          participantId,
+          normalizeLocation(location),
+        ],
+      ),
     );
   }
 
-  getParticipantPresence(participantId: ParticipantId): 'connected' | 'disconnected' {
+  getParticipantPresence(
+    participantId: ParticipantId,
+  ): 'connected' | 'disconnected' {
     return this.participantPresence.get(participantId.value) || 'connected';
   }
 
@@ -370,10 +410,16 @@ export class Session {
     this.participantPresence.set(participantId.value, 'connected');
   }
 
-  connectParticipant(participantId: ParticipantId, mediaConnectionId: string | null) {
+  connectParticipant(
+    participantId: ParticipantId,
+    mediaConnectionId: string | null,
+  ) {
     this.ensureParticipantExists(participantId);
     this.participantPresence.set(participantId.value, 'connected');
-    this.participantMediaConnections.set(participantId.value, mediaConnectionId || null);
+    this.participantMediaConnections.set(
+      participantId.value,
+      mediaConnectionId || null,
+    );
   }
 
   markParticipantDisconnected(participantId: ParticipantId) {
@@ -387,7 +433,10 @@ export class Session {
     this.participantMediaConnections.set(participantId.value, null);
   }
 
-  setParticipantLocation(participantId: ParticipantId, location: ParticipantLocation) {
+  setParticipantLocation(
+    participantId: ParticipantId,
+    location: ParticipantLocation,
+  ) {
     this.ensureParticipantExists(participantId);
     this.removeParticipantFromAllBreakouts(participantId.value);
 
@@ -395,9 +444,13 @@ export class Session {
     this.participantLocations.set(participantId.value, normalizedLocation);
 
     if (normalizedLocation.type === 'breakout') {
-      const breakoutRoom = this.breakoutRooms.get(normalizedLocation.breakoutRoomId);
+      const breakoutRoom = this.breakoutRooms.get(
+        normalizedLocation.breakoutRoomId,
+      );
       if (!breakoutRoom) {
-        throw new Error(`Breakout room ${normalizedLocation.breakoutRoomId} does not exist`);
+        throw new Error(
+          `Breakout room ${normalizedLocation.breakoutRoomId} does not exist`,
+        );
       }
 
       breakoutRoom.participantIds.add(participantId.value);
@@ -457,7 +510,7 @@ export class Session {
     breakoutRoom.participantIds.clear();
     this.updateWhiteboardRoomState(
       { type: 'breakout', breakoutRoomId: id },
-      { isOpen: false, updatedAt: closedAt }
+      { isOpen: false, updatedAt: closedAt },
     );
   }
 
@@ -476,7 +529,10 @@ export class Session {
     delete this.whiteboardState.breakouts[id];
   }
 
-  assignParticipantToBreakout(participantId: ParticipantId, breakoutRoomId: string) {
+  assignParticipantToBreakout(
+    participantId: ParticipantId,
+    breakoutRoomId: string,
+  ) {
     this.setParticipantLocation(participantId, {
       type: 'breakout',
       breakoutRoomId,
@@ -493,16 +549,23 @@ export class Session {
   replaceParticipant(
     previousParticipantId: ParticipantId,
     nextParticipantId: ParticipantId,
-    profileOverride?: ParticipantProfile
+    profileOverride?: ParticipantProfile,
   ) {
     if (!this.participantIds.has(previousParticipantId.value)) {
-      throw new Error(`Participant ${previousParticipantId.value} is not registered in session ${this.sessionId}`);
+      throw new Error(
+        `Participant ${previousParticipantId.value} is not registered in session ${this.sessionId}`,
+      );
     }
 
     const previousRole = this.getParticipantRole(previousParticipantId);
-    const previousMediaConnection = this.getParticipantMediaConnection(previousParticipantId);
-    const previousPermissions = this.getParticipantPermissions(previousParticipantId);
-    const previousProfile = profileOverride || this.getParticipantProfile(previousParticipantId);
+    const previousMediaConnection = this.getParticipantMediaConnection(
+      previousParticipantId,
+    );
+    const previousPermissions = this.getParticipantPermissions(
+      previousParticipantId,
+    );
+    const previousProfile =
+      profileOverride || this.getParticipantProfile(previousParticipantId);
     const previousLocation = this.getParticipantLocation(previousParticipantId);
 
     this.removeParticipant(previousParticipantId);
@@ -522,7 +585,10 @@ export class Session {
 
     this.setParticipantLocation(nextParticipantId, previousLocation);
     this.participantPresence.set(nextParticipantId.value, 'connected');
-    this.participantMediaConnections.set(nextParticipantId.value, previousMediaConnection);
+    this.participantMediaConnections.set(
+      nextParticipantId.value,
+      previousMediaConnection,
+    );
   }
 
   removeParticipant(participantId: ParticipantId) {
@@ -546,12 +612,19 @@ export class Session {
   }
 
   getBreakoutRooms(): BreakoutRoomPrimitives[] {
-    return Array.from(this.breakoutRooms.values()).map((room) => this.toBreakoutRoomPrimitives(room));
+    return Array.from(this.breakoutRooms.values()).map((room) =>
+      this.toBreakoutRoomPrimitives(room),
+    );
   }
 
-  getWhiteboardRoomState(location?: ParticipantLocation | null): WhiteboardRoomState {
+  getWhiteboardRoomState(
+    location?: ParticipantLocation | null,
+  ): WhiteboardRoomState {
     const normalizedLocation = normalizeLocation(location);
-    if (normalizedLocation.type !== 'breakout' || !normalizedLocation.breakoutRoomId) {
+    if (
+      normalizedLocation.type !== 'breakout' ||
+      !normalizedLocation.breakoutRoomId
+    ) {
       return {
         ...createDefaultWhiteboardRoomState(),
         ...this.whiteboardState.main,
@@ -560,7 +633,8 @@ export class Session {
 
     return {
       ...createDefaultWhiteboardRoomState(),
-      ...(this.whiteboardState.breakouts[normalizedLocation.breakoutRoomId] || {}),
+      ...(this.whiteboardState.breakouts[normalizedLocation.breakoutRoomId] ||
+        {}),
     };
   }
 
@@ -570,7 +644,7 @@ export class Session {
 
   updateWhiteboardRoomState(
     location: ParticipantLocation,
-    updates: Partial<WhiteboardRoomState>
+    updates: Partial<WhiteboardRoomState>,
   ) {
     const normalizedLocation = normalizeLocation(location);
     const nextRoomState = {
@@ -578,21 +652,30 @@ export class Session {
       ...updates,
     };
 
-    if (normalizedLocation.type !== 'breakout' || !normalizedLocation.breakoutRoomId) {
+    if (
+      normalizedLocation.type !== 'breakout' ||
+      !normalizedLocation.breakoutRoomId
+    ) {
       this.whiteboardState.main = nextRoomState;
       return;
     }
 
-    this.whiteboardState.breakouts[normalizedLocation.breakoutRoomId] = nextRoomState;
+    this.whiteboardState.breakouts[normalizedLocation.breakoutRoomId] =
+      nextRoomState;
   }
 
-  upsertWaitingRoomRequest(request: Omit<WaitingRoomRequestPrimitives, 'updatedAt'> & { updatedAt?: string }) {
+  upsertWaitingRoomRequest(
+    request: Omit<WaitingRoomRequestPrimitives, 'updatedAt'> & {
+      updatedAt?: string;
+    },
+  ) {
     if (!request.id) {
       throw new Error('Waiting room request id cannot be empty');
     }
 
     const existingRequest = this.waitingRoomRequests.get(request.id);
-    const updatedAt = request.updatedAt || request.decidedAt || request.requestedAt;
+    const updatedAt =
+      request.updatedAt || request.decidedAt || request.requestedAt;
 
     this.waitingRoomRequests.set(request.id, {
       ...existingRequest,
@@ -601,23 +684,29 @@ export class Session {
     });
   }
 
-  getWaitingRoomRequest(requestId: string): WaitingRoomRequestPrimitives | null {
+  getWaitingRoomRequest(
+    requestId: string,
+  ): WaitingRoomRequestPrimitives | null {
     return this.waitingRoomRequests.get(requestId) || null;
   }
 
   getWaitingRoomRequests(): WaitingRoomRequestPrimitives[] {
     return Array.from(this.waitingRoomRequests.values()).sort((a, b) =>
-      (a.requestedAt || '').localeCompare(b.requestedAt || '')
+      (a.requestedAt || '').localeCompare(b.requestedAt || ''),
     );
   }
 
   getPendingWaitingRoomRequests(): WaitingRoomRequestPrimitives[] {
     return this.getWaitingRoomRequests().filter(
-      (request) => request.status === WaitingRoomRequestStatus.PENDING
+      (request) => request.status === WaitingRoomRequestStatus.PENDING,
     );
   }
 
-  approveWaitingRoomRequest(requestId: string, decidedAt: string, decidedByRole: Role) {
+  approveWaitingRoomRequest(
+    requestId: string,
+    decidedAt: string,
+    decidedByRole: Role,
+  ) {
     const request = this.getWaitingRoomRequestStateOrFail(requestId);
     request.status = WaitingRoomRequestStatus.APPROVED;
     request.updatedAt = decidedAt;
@@ -625,7 +714,11 @@ export class Session {
     request.decidedByRole = decidedByRole;
   }
 
-  rejectWaitingRoomRequest(requestId: string, decidedAt: string, decidedByRole: Role) {
+  rejectWaitingRoomRequest(
+    requestId: string,
+    decidedAt: string,
+    decidedByRole: Role,
+  ) {
     const request = this.getWaitingRoomRequestStateOrFail(requestId);
     request.status = WaitingRoomRequestStatus.REJECTED;
     request.updatedAt = decidedAt;
@@ -646,7 +739,9 @@ export class Session {
       participantIds: this.getParticipantIds(),
       participantMediaConnections: this.getParticipantMediaConnections(),
       participantRoles: this.getParticipantRoles(),
-      participantPermissions: Object.fromEntries(this.participantPermissions.entries()),
+      participantPermissions: Object.fromEntries(
+        this.participantPermissions.entries(),
+      ),
       participantProfiles: this.getParticipantProfiles(),
       participantLocations: this.getParticipantLocations(),
       participantPresence: this.getParticipantPresenceMap(),
@@ -658,7 +753,9 @@ export class Session {
 
   private ensureParticipantExists(participantId: ParticipantId) {
     if (!this.participantIds.has(participantId.value)) {
-      throw new Error(`Participant ${participantId.value} is not registered in session ${this.sessionId}`);
+      throw new Error(
+        `Participant ${participantId.value} is not registered in session ${this.sessionId}`,
+      );
     }
   }
 
@@ -677,7 +774,9 @@ export class Session {
     }
   }
 
-  private toBreakoutRoomPrimitives(room: BreakoutRoomState): BreakoutRoomPrimitives {
+  private toBreakoutRoomPrimitives(
+    room: BreakoutRoomState,
+  ): BreakoutRoomPrimitives {
     return {
       id: room.id,
       name: room.name,
@@ -689,7 +788,9 @@ export class Session {
     };
   }
 
-  private getWaitingRoomRequestStateOrFail(requestId: string): WaitingRoomRequestState {
+  private getWaitingRoomRequestStateOrFail(
+    requestId: string,
+  ): WaitingRoomRequestState {
     const request = this.waitingRoomRequests.get(requestId);
     if (!request) {
       throw new Error(`Waiting room request ${requestId} does not exist`);

@@ -23,10 +23,12 @@ export const Permission = {
   ADMIT_WAITING_ROOM: 'admit_waiting_room',
 } as const;
 
-export type Permission = typeof Permission[keyof typeof Permission];
+export type Permission = (typeof Permission)[keyof typeof Permission];
 
 export const ALL_PERMISSIONS = Object.values(Permission);
 
 export function isPermission(value: unknown): value is Permission {
-  return typeof value === 'string' && ALL_PERMISSIONS.includes(value as Permission);
+  return (
+    typeof value === 'string' && ALL_PERMISSIONS.includes(value as Permission)
+  );
 }

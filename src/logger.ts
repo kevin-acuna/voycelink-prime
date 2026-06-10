@@ -21,5 +21,5 @@ export const logger = pino(
           ignore: 'pid,hostname',
         },
       })
-    : undefined
+    : undefined,
 );
